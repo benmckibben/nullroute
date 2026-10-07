@@ -11,7 +11,10 @@
 //!    the namespace), so it can't add interfaces or routes to get back out.
 //!
 //! Inside, there is no route to anything but loopback: connections to other
-//! hosts fail immediately with "network unreachable", and DNS fails.
+//! hosts fail immediately with "network unreachable", and DNS fails. Local
+//! resolver sockets that would resolve on the host's behalf (systemd-resolved's
+//! varlink socket, nscd, the system D-Bus) are masked in a private mount
+//! namespace; see dns.rs and hide.rs.
 //!
 //! Loopback inside is the namespace's own, so services on the host's 127.0.0.1
 //! (a local Postgres, a published Docker port) are only reachable through
@@ -87,10 +90,12 @@ pub fn run_hermetic(
     };
 
     // Bind mounts for the private mount namespace: socket decoys, then the
-    // sinkhole's resolv.conf and resolver-socket masks. dns_files must outlive
-    // the child (it deletes the sources on drop).
-    let dns_files = dns.map(|_| dns::Files::create()).transpose()?;
-    let need_mount_ns = hide.is_some() || dns.is_some();
+    // sinkhole's resolv.conf (with --allow) and the resolver-socket masks
+    // (always: systemd-resolved's varlink socket and nscd would otherwise
+    // resolve names on the host's network). dns_files must outlive the child
+    // (it deletes the sources on drop).
+    let dns_files = Some(dns::Files::create(dns.is_some())?).filter(|f| !f.mounts.is_empty());
+    let need_mount_ns = hide.is_some() || dns_files.is_some();
     let mounts = if need_mount_ns {
         let mut m = hide
             .map(|h| h.mount_list())
@@ -192,8 +197,8 @@ pub fn run_hermetic(
 }
 
 /// The namespaces the child unshares: always user + net, plus a mount
-/// namespace when there are sockets to hide or the DNS sinkhole needs its
-/// resolv.conf. Shared with `--inspect`.
+/// namespace when there are sockets to hide or resolver sockets to mask, or
+/// the DNS sinkhole needs its resolv.conf. Shared with `--inspect`.
 pub fn namespace_flags(mount_ns: bool) -> libc::c_int {
     libc::CLONE_NEWUSER | libc::CLONE_NEWNET | if mount_ns { libc::CLONE_NEWNS } else { 0 }
 }
