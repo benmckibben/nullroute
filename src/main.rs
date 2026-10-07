@@ -6,6 +6,7 @@ compile_error!("nullroute currently supports Linux only (it uses network namespa
 mod docker;
 mod forward;
 mod hide;
+mod inspect;
 mod proxy;
 mod report;
 mod sandbox;
@@ -83,6 +84,12 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
 
+        /// Print the sandbox topology (namespaces, loopback, bridged ports,
+        /// blocked/sealed sockets, proxy) to stderr before running the command.
+        /// With --dry-run, print it and exit without running anything.
+        #[arg(long)]
+        inspect: bool,
+
         /// The command and its arguments (put them after --).
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
@@ -103,6 +110,7 @@ fn main() -> ExitCode {
             quiet,
             report_json,
             dry_run,
+            inspect,
             argv,
         } => {
             let allowlist = match proxy::Allowlist::parse(&allow) {
@@ -129,6 +137,15 @@ fn main() -> ExitCode {
                     return ExitCode::from(125);
                 }
             };
+            let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
+            if inspect {
+                let proxy = (!allowlist.is_empty())
+                    .then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
+                eprint!(
+                    "{}",
+                    inspect::Topology::new(&ports, plan.as_ref(), proxy).render()
+                );
+            }
             if dry_run {
                 match &plan {
                     None => println!("hidden sockets: none"),
@@ -142,11 +159,8 @@ fn main() -> ExitCode {
                 for p in &ports {
                     println!("forwarded port: {p}");
                 }
-                for h in &allow {
-                    println!(
-                        "allowed host: {}",
-                        h.trim().trim_end_matches('.').to_ascii_lowercase()
-                    );
+                for h in &allowed_hosts {
+                    println!("allowed host: {h}");
                 }
                 if !allowlist.is_empty() {
                     println!("proxy: http://127.0.0.1:{}", proxy::pick_port(&ports));
@@ -167,6 +181,11 @@ fn main() -> ExitCode {
             run(&argv, &ports, plan.as_ref(), proxy, &report, &opts)
         }
     }
+}
+
+/// How an --allow value is displayed: trimmed, no trailing dot, lowercase.
+fn normalize_host(h: &str) -> String {
+    h.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 struct RunOpts {
