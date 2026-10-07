@@ -3,6 +3,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("nullroute currently supports Linux only (it uses network namespaces)");
 
+mod dns;
 mod docker;
 mod forward;
 mod hide;
@@ -60,11 +61,24 @@ enum Cmd {
         #[arg(long = "seal-docker-socket", value_name = "PATH")]
         seal_docker_sockets: Vec<std::path::PathBuf>,
 
-        /// Let HTTP(S) to this host through (repeatable or comma-separated):
-        /// api.github.com, *.stripe.dev (subdomains only), or an IP. Works for
-        /// clients that honour HTTP(S)_PROXY; everything else stays sealed.
+        /// Let this host through (repeatable or comma-separated):
+        /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
+        /// optionally :PORT. Proxy-aware clients go through an HTTP(S) proxy;
+        /// other clients resolve allowed names via nullroute's DNS sinkhole and
+        /// are relayed on the allowed ports (80/443 without :PORT).
         #[arg(short, long = "allow", value_name = "HOST", value_delimiter = ',')]
         allow: Vec<String>,
+
+        /// Dial this allowed host at IP instead of resolving it on the host,
+        /// like curl's --resolve (repeatable): --resolve db.internal:10.0.0.5.
+        /// Loopback addresses are still refused.
+        #[arg(long = "resolve", value_name = "HOST:IP")]
+        resolve: Vec<String>,
+
+        /// Don't run the DNS sinkhole for --allow: names don't resolve inside
+        /// and only proxy-aware clients can reach allowed hosts.
+        #[arg(long = "no-dns")]
+        no_dns: bool,
 
         /// Fail (exit 1) if anything was blocked, even if the command succeeded.
         /// A command that already failed keeps its own exit code.
@@ -106,6 +120,8 @@ fn main() -> ExitCode {
             seal_docker,
             seal_docker_sockets,
             allow,
+            resolve,
+            no_dns,
             strict,
             quiet,
             report_json,
@@ -120,8 +136,33 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            let overrides = match proxy::parse_overrides(&resolve, &allowlist) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("nullroute: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            let dns_plan = if no_dns {
+                None
+            } else {
+                match dns::Plan::new(&allowlist) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("nullroute: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
+            };
             ports.sort_unstable();
             ports.dedup();
+            if dns_plan.is_some() && ports.contains(&dns::PORT) {
+                eprintln!(
+                    "nullroute: --port {} clashes with the DNS sinkhole for --allow; add --no-dns to bridge it",
+                    dns::PORT
+                );
+                return ExitCode::from(2);
+            }
             if ports.len() > forward::MAX_PORTS {
                 eprintln!("nullroute: at most {} --port values", forward::MAX_PORTS);
                 return ExitCode::from(125);
@@ -143,7 +184,8 @@ fn main() -> ExitCode {
                     .then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
                 eprint!(
                     "{}",
-                    inspect::Topology::new(&ports, plan.as_ref(), proxy).render()
+                    inspect::Topology::new(&ports, plan.as_ref(), proxy, dns_plan.as_ref())
+                        .render()
                 );
             }
             if dry_run {
@@ -165,20 +207,35 @@ fn main() -> ExitCode {
                 if !allowlist.is_empty() {
                     println!("proxy: http://127.0.0.1:{}", proxy::pick_port(&ports));
                 }
+                if let Some(d) = &dns_plan {
+                    println!("dns sinkhole: 127.0.0.1:{}", dns::PORT);
+                    for l in d.describe() {
+                        println!("synthetic address: {l}");
+                    }
+                }
                 return ExitCode::SUCCESS;
             }
             let report = report::Report::new(quiet);
             let proxy = (!allowlist.is_empty()).then(|| {
                 (
                     proxy::pick_port(&ports),
-                    proxy::Proxy::new(allowlist, report.clone()),
+                    proxy::Proxy::new(allowlist.clone(), overrides.clone(), report.clone()),
                 )
             });
+            let dns = dns_plan.map(|p| dns::Sinkhole::new(p, allowlist, overrides, report.clone()));
             let opts = RunOpts {
                 strict,
                 report_json,
             };
-            run(&argv, &ports, plan.as_ref(), proxy, &report, &opts)
+            run(
+                &argv,
+                &ports,
+                plan.as_ref(),
+                proxy,
+                dns.as_ref(),
+                &report,
+                &opts,
+            )
         }
     }
 }
@@ -198,10 +255,11 @@ fn run(
     ports: &[u16],
     hide: Option<&hide::Plan>,
     proxy: Option<(u16, std::sync::Arc<proxy::Proxy>)>,
+    dns: Option<&std::sync::Arc<dns::Sinkhole>>,
     report: &std::sync::Arc<report::Report>,
     opts: &RunOpts,
 ) -> ExitCode {
-    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, report) {
+    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("nullroute: failed to run {:?}: {e}", argv[0]);
