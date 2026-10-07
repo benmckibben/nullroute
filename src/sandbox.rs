@@ -233,12 +233,13 @@ fn loopback_up() -> io::Result<()> {
         for (dst, src) in ifr.ifr_name.iter_mut().zip(b"lo\0") {
             *dst = *src as libc::c_char;
         }
+        // `as _`: the request argument is c_ulong on glibc but c_int on musl.
         let result = (|| {
-            if libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) < 0 {
+            if libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) < 0 {
                 return Err(io::Error::last_os_error());
             }
             ifr.ifr_ifru.ifru_flags |= libc::IFF_UP as libc::c_short;
-            if libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) < 0 {
+            if libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
