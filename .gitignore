@@ -1,1 +1,9 @@
 /target
+
+# OpenClaw agent workspace files
+/AGENTS.md
+/IDENTITY.md
+/SOUL.md
+/USER.md
+/BOOTSTRAP.md
+/.openclaw/
