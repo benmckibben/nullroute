@@ -505,7 +505,7 @@ fn strict_fails_on_a_blocked_pull() {
         "--",
         "sh",
         "-c",
-        "docker pull ghcr.io/nonexistent/x; docker pull docker.io/library/alpine; true",
+        "docker pull ghcr.io/nonexistent/x; docker pull alpine; true",
     ]);
     assert_eq!(o.status.code(), Some(1), "strict should fail: {o:?}");
     let err = String::from_utf8_lossy(&o.stderr);
@@ -514,17 +514,15 @@ fn strict_fails_on_a_blocked_pull() {
         err.contains("--seal-docker-pulls=none doesn't let the Docker daemon"),
         "{err}"
     );
-    // (Hub images are named in full: some Docker CLIs send `alpine` as
-    // typed, others normalise it to docker.io/library/alpine.)
-    for target in [
-        "pull ghcr.io/nonexistent/x",
-        "pull docker.io/library/alpine",
-    ] {
-        assert!(
-            err.contains(&format!("docker  {target}")),
-            "{target}: {err}"
-        );
-    }
+    assert!(err.contains("docker  pull ghcr.io/nonexistent/x"), "{err}");
+    // Docker CLIs differ in how they name a Hub image to the daemon: older
+    // ones send `alpine` (whatever was typed), newer ones
+    // docker.io/library/alpine. Both are Docker Hub to nullroute.
+    assert!(
+        err.contains("docker  pull alpine")
+            || err.contains("docker  pull docker.io/library/alpine"),
+        "{err}"
+    );
 }
 
 #[test]
