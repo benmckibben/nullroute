@@ -243,3 +243,141 @@ fn dry_run_distinguishes_sealed_from_hidden() {
         );
     }
 }
+
+fn have_buildx() -> bool {
+    Command::new("docker")
+        .args(["buildx", "version"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// A build context whose RUN step reports whether it had network.
+fn net_probe_context(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("nr-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Dockerfile"),
+        "FROM alpine\nRUN wget -q -T5 -O- http://1.1.1.1 >/dev/null 2>&1 && echo HASNET || echo NONET\n",
+    )
+    .unwrap();
+    dir
+}
+
+#[test]
+fn classic_build_with_host_network_is_forced_to_none() {
+    if !docker_ok() || !have_alpine() {
+        return eprintln!("skipping: docker/alpine unavailable");
+    }
+    let dir = net_probe_context("build");
+    let image = format!("nr-build-{}", std::process::id());
+    // --network host arrives as networkmode=host in the /build query string.
+    let script = format!(
+        "DOCKER_BUILDKIT=0 docker build --network host --no-cache --force-rm -t {image} {}",
+        dir.display()
+    );
+    let o = nr(&["--seal-docker", "--", "sh", "-c", &script]);
+    let _ = Command::new("docker").args(["rmi", "-f", &image]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+    let text = out(&o);
+    assert!(o.status.success(), "{o:?}");
+    // (The step's command line is echoed too, so match whole lines.)
+    let said = |w: &str| text.lines().any(|l| l.trim() == w);
+    assert!(said("NONET") && !said("HASNET"), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("forced networkmode=none"), "{err}");
+}
+
+#[test]
+fn buildkit_build_is_refused_without_side_effects() {
+    if !docker_ok() || !have_alpine() || !have_buildx() {
+        return eprintln!("skipping: docker/alpine/buildx unavailable");
+    }
+    let dir = net_probe_context("buildx");
+    let image = format!("nr-buildx-{}", std::process::id());
+    let ctx = dir.display().to_string();
+    let o = nr(&[
+        "--seal-docker",
+        "--",
+        "docker",
+        "buildx",
+        "build",
+        "--builder",
+        "default",
+        "--no-cache",
+        "-t",
+        &image,
+        &ctx,
+    ]);
+    let _ = Command::new("docker").args(["rmi", "-f", &image]).output();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!o.status.success(), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    // buildx prints the gRPC error nullroute answers with...
+    assert!(err.contains("DOCKER_BUILDKIT=0"), "{err}");
+    // ...instead of silently falling back to a docker-container builder.
+    assert!(!err.contains("booting buildkit"), "{err}");
+}
+
+#[test]
+fn swarm_service_create_is_blocked() {
+    if !docker_ok() || !have_alpine() {
+        return eprintln!("skipping");
+    }
+    let name = format!("nr-svc-{}", std::process::id());
+    let o = nr(&[
+        "--seal-docker",
+        "--",
+        "docker",
+        "service",
+        "create",
+        "--no-resolve-image",
+        "--name",
+        &name,
+        "alpine",
+        "true",
+    ]);
+    assert!(!o.status.success(), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("nullroute blocked a Docker Swarm service"),
+        "{err}"
+    );
+    // Recorded in the report, whether or not this daemon is a swarm manager.
+    assert!(
+        err.contains("services") && err.contains("swarm service tasks get networks"),
+        "{err}"
+    );
+}
+
+#[test]
+fn swarm_and_build_paths_are_matched_however_they_are_spelled() {
+    if !docker_ok() || !have_alpine() {
+        return eprintln!("skipping");
+    }
+    // Raw requests on one connection: an encoded/dotted services create, a
+    // non-canonical classic build with networkmode=host, then a ping.
+    let script = r#"
+import socket
+s = socket.socket(socket.AF_UNIX); s.settimeout(20)
+s.connect('/var/run/docker.sock')
+def send(method, path, body=b'', extra=''):
+    s.sendall(f'{method} {path} HTTP/1.1\r\nHost: docker\r\n{extra}Content-Length: {len(body)}\r\n\r\n'.encode() + body)
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        c = s.recv(65536)
+        if not c: raise SystemExit('closed')
+        buf += c
+    head, rest = buf.split(b'\r\n\r\n', 1)
+    lines = head.decode().split('\r\n')
+    n = next((int(l.split(':')[1]) for l in lines if l.lower().startswith('content-length:')), 0)
+    while len(rest) < n: rest += s.recv(65536)
+    print(method, path, lines[0])
+send('POST', '/v1.43//services/%2E/create', b'{}', 'Content-Type: application/json\r\n')
+send('POST', '/v1.43/swarm%2Fjoin', b'{}', 'Content-Type: application/json\r\n')
+send('POST', '/v1.43/build?version=2', b'', 'Content-Type: application/x-tar\r\n')
+"#;
+    let o = nr(&["--seal-docker", "--", "python3", "-c", script]);
+    let text = out(&o);
+    assert_eq!(text.matches("HTTP/1.1 403").count(), 3, "{o:?}");
+}

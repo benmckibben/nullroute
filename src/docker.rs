@@ -17,23 +17,46 @@
 //! - `POST /.../containers/create`: force HostConfig.NetworkMode = "none" and
 //!   drop NetworkingConfig, then fix Content-Length. A body that isn't a single
 //!   JSON object is refused (400) rather than passed through.
-//! - `POST /.../networks/{id}/connect`: refuse with 403 (it would undo the above).
+//! - `POST /.../build` (the classic builder): force the `networkmode` query
+//!   parameter to `none`, so every `RUN` step gets no network. BuildKit builds
+//!   (`version=2`) and form-encoded parameters are refused. The build context
+//!   is streamed through, never buffered.
+//! - refused with 403, because they would give something a network that
+//!   sealing can't take away:
+//!   - `POST /networks/{id}/connect` (it would undo the create rewrite);
+//!   - `POST /grpc` and `POST /session`: tunnels to BuildKit, whose builds
+//!     choose their own network inside a gRPC stream nullroute can't rewrite
+//!     (this is what `docker build` with buildx uses);
+//!   - Swarm: `services/create`, `services/{id}/update` (tasks get networks),
+//!     `swarm/init`, `swarm/join` (a manager could schedule such tasks here);
+//!   - plugins: `plugins/pull`, `plugins/create`, `plugins/{name}/enable` and
+//!     `/upgrade` (plugins can run with host networking).
 //! - anything else: forwarded unchanged, and its response copied by its
 //!   framing; keep-alive connections keep being parsed request by request.
 //!
+//! Matching is done on the path as the daemon's router sees it: query
+//! stripped, percent-decoded, `.`/`..`/empty segments resolved like Go's
+//! path.Clean, and an optional `/vX.Y` prefix removed. Sensitive endpoints
+//! are matched by suffix, so an extra prefix still counts. Paths that can't
+//! be reduced unambiguously (not starting with `/`, invalid or double
+//! percent-encoding, control characters, `#`) are refused (400).
+//!
 //! The connection only becomes a plain two-way relay on a genuine protocol
-//! switch: a `101 Switching Protocols` (attach/exec with Upgrade), or a raw
-//! stream answering `POST` attach / exec-start. A 404 or any other ordinary
-//! response never ends parsing, so a probe can't be used to slip an unrewritten
-//! create through on the same connection. Requests whose bodies can't be framed
-//! exactly (Transfer-Encoding, duplicate Content-Length, non-HTTP/1.x) are
-//! refused.
+//! switch: a `101 Switching Protocols` answering attach or exec-start (the
+//! only endpoints allowed to upgrade), or a raw stream answering `POST`
+//! attach / exec-start. A 404 or any other ordinary response never ends
+//! parsing, so a probe can't be used to slip an unrewritten create through on
+//! the same connection. Requests whose bodies can't be framed exactly
+//! (Transfer-Encoding other than a strictly parsed chunked build upload,
+//! duplicate Content-Length, non-HTTP/1.x) are refused.
 //!
 //! Scope: this is not a Docker security boundary. It stops the common ways a
-//! container gets a network through the CLI; it does not try to cover every
-//! Docker API path, and --privileged containers can still escape. It's "CI
-//! tests can use throwaway containers without those containers phoning home",
-//! not "run hostile images safely".
+//! container gets a network through the API; --privileged containers can still
+//! escape, and the daemon itself still reaches registries when asked to (image
+//! pull/push/import, `docker login`, build `remote=`/`pull=`), which a
+//! command can use to leak data in a registry host name or image path. It's
+//! "CI tests can use throwaway containers without those containers phoning
+//! home", not "run hostile images safely".
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -46,6 +69,8 @@ use crate::report::{Kind, Report};
 const MAX_HEAD: usize = 32 * 1024;
 /// Container-create bodies are small; cap to avoid buffering a huge upload.
 const MAX_BODY: usize = 4 * 1024 * 1024;
+/// Longest chunk-size line accepted in a chunked build upload (Go's limit).
+const MAX_CHUNK_LINE: u64 = 4096;
 
 pub const SEAL_REASON: &str = "sealed with --seal-docker: containers forced to no network";
 
@@ -72,36 +97,46 @@ fn proxy(client: UnixStream, upstream: &Path, report: &Arc<Report>) -> io::Resul
     // is always rewritten. The only way out of parsing is a genuine protocol
     // switch (see Hijack); anything else ends with the connection.
     loop {
-        let Some(req) = read_request(&mut client_r)? else {
+        let Some(mut req) = read_request(&mut client_r)? else {
             return Ok(()); // client closed cleanly
         };
+        // A streamed (build) body is still in client_r: refusing such a
+        // request must close the connection, or its body would be parsed as
+        // the next request.
+        let body_unread = req.stream.is_some();
 
         // Bodies we can't frame exactly could smuggle a second request past
         // the parser (and a chunked create body past the rewrite): refuse.
         if let Some(why) = req.unframeable() {
-            report.record(Kind::Docker, "request", why, || {
-                format!("nullroute: --seal-docker: refused a request ({why})")
-            });
-            write_error(
-                &mut client_w,
-                400,
-                &format!("nullroute --seal-docker refused this request: {why}."),
-                true,
-            )?;
+            refuse(&mut client_w, report, 400, "request", why, true)?;
             return Ok(());
         }
 
-        // Refuse attaching a network to an existing container; it would undo sealing.
-        if req.is_network_connect() {
-            report.record(Kind::Docker, "networks/connect", "would attach a network to a container", || {
-                "nullroute: --seal-docker: refused a request to connect a container to a network".into()
+        // Match on the path the daemon will route; if that's ambiguous, refuse.
+        if let Err(why) = req.route {
+            refuse(&mut client_w, report, 400, "request", why, body_unread)?;
+            if body_unread {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if let Some(b) = req.blocked() {
+            report.record(Kind::Docker, b.target, b.why, || {
+                format!("nullroute: --seal-docker: refused {} ({})", b.target, b.why)
             });
-            write_error(
-                &mut client_w,
-                403,
-                "nullroute blocked docker network connect: it would give a container network access that --seal-docker removed.",
-                false,
-            )?;
+            if b.target == "buildkit"
+                && ends_with(req.segs(), &["grpc"])
+                && req.header("upgrade").is_some()
+            {
+                client_w.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+                refuse_grpc(&mut client_r, &mut client_w, b.message)?;
+                return Ok(());
+            }
+            write_error(&mut client_w, 403, b.message, body_unread)?;
+            if body_unread {
+                return Ok(());
+            }
             continue;
         }
 
@@ -121,13 +156,51 @@ fn proxy(client: UnixStream, upstream: &Path, report: &Arc<Report>) -> io::Resul
                     continue;
                 }
             }
+        } else if req.is_build() {
+            match rewrite_build(&req) {
+                Ok(target) => {
+                    report.record(Kind::Docker, "build", "forced networkmode=none", || {
+                        "nullroute: --seal-docker: forcing the build's RUN steps onto no network"
+                            .into()
+                    });
+                    req.forward_target = Some(target);
+                    Vec::new()
+                }
+                Err(why) => {
+                    refuse(&mut client_w, report, 403, "build", why, body_unread)?;
+                    if body_unread {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
         } else {
             req.body.clone()
         };
-        up_w.write_all(&req.render_head(body.len()))?;
-        up_w.write_all(&body)?;
+        if let Some(framing) = req.stream {
+            up_w.write_all(&req.render_head(None))?;
+            forward_body(&mut client_r, &mut up_w, framing)?;
+        } else {
+            up_w.write_all(&req.render_head(Some(body.len())))?;
+            up_w.write_all(&body)?;
+        }
 
         let resp = read_response_head(&mut up_r)?;
+        if resp.status == 101 && !req.may_upgrade() {
+            // Only attach and exec-start may become raw streams. Anything
+            // else that switches protocols is a tunnel we can't parse
+            // (BuildKit's /grpc and /session are refused above; this catches
+            // the rest).
+            refuse(
+                &mut client_w,
+                report,
+                502,
+                "upgrade",
+                "protocol switch on an endpoint other than attach or exec",
+                true,
+            )?;
+            return Ok(());
+        }
         client_w.write_all(&resp.head)?;
         if resp.is_hijack(&req) {
             // Attach/exec stream: hand over whatever each side has buffered,
@@ -152,6 +225,111 @@ fn proxy(client: UnixStream, upstream: &Path, report: &Arc<Report>) -> io::Resul
             return Ok(());
         }
     }
+}
+
+/// Refuse a BuildKit gRPC tunnel in a way buildx reports.
+///
+/// buildx probes `/grpc` to pick its driver: if the upgrade fails it quietly
+/// falls back to a "docker-container" builder, pulling moby/buildkit and
+/// leaving a privileged container behind (which then fails anyway), and a
+/// closed connection just makes gRPC reconnect in a loop. So nullroute (not
+/// the daemon) accepts the upgrade and speaks just enough HTTP/2 to answer
+/// every gRPC call with PERMISSION_DENIED and `message`, which buildx prints.
+/// Nothing on this connection reaches the daemon.
+fn refuse_grpc<R: Read, W: Write>(r: &mut R, w: &mut W, message: &str) -> io::Result<()> {
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    const MAX_FRAMES: usize = 256;
+    const MAX_PAYLOAD: usize = 1 << 20;
+    let frame = |kind: u8, flags: u8, stream: u32, payload: &[u8]| {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend_from_slice(&[kind, flags]);
+        f.extend_from_slice(&(stream & 0x7fff_ffff).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    };
+    // Trailers-only gRPC response, HPACK-encoded without indexing or Huffman.
+    let mut trailers = vec![0x88]; // :status 200 (static table)
+    for (name, value) in [
+        ("content-type", "application/grpc"),
+        ("grpc-status", "7"), // PERMISSION_DENIED
+        ("grpc-message", message),
+    ] {
+        trailers.push(0x00);
+        hpack_string(&mut trailers, name.as_bytes());
+        hpack_string(&mut trailers, value.as_bytes());
+    }
+
+    w.write_all(
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n",
+    )?;
+    w.write_all(&frame(0x4, 0, 0, &[]))?; // our SETTINGS
+    let mut preface = [0u8; PREFACE.len()];
+    if r.read_exact(&mut preface).is_err() || preface != PREFACE {
+        return Ok(()); // a probe that hung up, or not HTTP/2: nothing to answer
+    }
+    for _ in 0..MAX_FRAMES {
+        let mut head = [0u8; 9];
+        if r.read_exact(&mut head).is_err() {
+            return Ok(());
+        }
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+        let (kind, flags) = (head[3], head[4]);
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7fff_ffff;
+        if len > MAX_PAYLOAD {
+            return Ok(());
+        }
+        let mut payload = vec![0u8; len];
+        r.read_exact(&mut payload)?;
+        match kind {
+            // SETTINGS (not an ACK): acknowledge.
+            0x4 if flags & 0x1 == 0 => w.write_all(&frame(0x4, 0x1, 0, &[]))?,
+            // HEADERS opening a call: answer it, ending the stream.
+            0x1 if stream % 2 == 1 => w.write_all(&frame(0x1, 0x4 | 0x1, stream, &trailers))?,
+            // PING: echo back with ACK.
+            0x6 if flags & 0x1 == 0 => w.write_all(&frame(0x6, 0x1, 0, &payload))?,
+            // GOAWAY: the client is done.
+            0x7 => return Ok(()),
+            _ => {} // DATA, WINDOW_UPDATE, RST_STREAM, CONTINUATION...
+        }
+    }
+    Ok(())
+}
+
+/// Append an HPACK string literal (no Huffman): 7-bit-prefix length, bytes.
+fn hpack_string(out: &mut Vec<u8>, s: &[u8]) {
+    let mut n = s.len();
+    if n < 127 {
+        out.push(n as u8);
+    } else {
+        out.push(127);
+        n -= 127;
+        while n >= 128 {
+            out.push((n % 128) as u8 | 0x80);
+            n /= 128;
+        }
+        out.push(n as u8);
+    }
+    out.extend_from_slice(s);
+}
+
+/// Record a refused request and answer it with a Docker-style error.
+fn refuse(
+    client: &mut UnixStream,
+    report: &Arc<Report>,
+    code: u16,
+    target: &str,
+    why: &str,
+    close: bool,
+) -> io::Result<()> {
+    report.record(Kind::Docker, target, why, || {
+        format!("nullroute: --seal-docker: refused a request ({why})")
+    });
+    write_error(
+        client,
+        code,
+        &format!("nullroute --seal-docker refused this request: {why}."),
+        close,
+    )
 }
 
 /// A parsed response head plus how its body is framed.
@@ -300,23 +478,58 @@ fn copy_body(
     Err(io::ErrorKind::UnexpectedEof.into()) // signals "connection ended"
 }
 
+/// How a streamed (not buffered) request body is framed on the wire.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Framing {
+    Length(u64),
+    Chunked,
+}
+
+/// A request --seal-docker refuses outright: report target, reason, and the
+/// message the Docker CLI prints.
+struct Block {
+    target: &'static str,
+    why: &'static str,
+    message: &'static str,
+}
+
+const BUILDKIT_MSG: &str = "nullroute blocked a BuildKit build: --seal-docker can't take network away from BuildKit (buildx) builds. Use the classic builder instead (DOCKER_BUILDKIT=0 docker build ...); nullroute runs its RUN steps with no network.";
+
 struct Request {
     method: String,
+    /// The request target exactly as received (path and query).
     path: String,
     version: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// Set for docker build uploads, which are streamed rather than
+    /// buffered: `body` is empty and the caller forwards the body.
+    stream: Option<Framing>,
+    /// The path segments the daemon routes on (see canonical_route), or why
+    /// they can't be determined.
+    route: Result<Vec<String>, &'static str>,
+    /// A rewritten request target to forward instead of `path`.
+    forward_target: Option<String>,
 }
 
 impl Request {
-    fn path_no_query(&self) -> &str {
-        self.path.split('?').next().unwrap_or(&self.path)
+    fn new(method: &str, path: &str, version: &str, headers: Vec<(String, String)>) -> Request {
+        Request {
+            method: method.into(),
+            path: path.into(),
+            version: version.into(),
+            headers,
+            body: Vec::new(),
+            stream: None,
+            route: canonical_route(path),
+            forward_target: None,
+        }
     }
 
-    /// The path as the daemon's router sees it: query stripped and
-    /// percent-decoded (`/containers/creat%65` is a create too).
-    fn route(&self) -> String {
-        percent_decode(self.path_no_query())
+    /// Canonical path segments, empty if the path couldn't be normalised
+    /// (such requests are refused before anything else looks at them).
+    fn segs(&self) -> &[String] {
+        self.route.as_deref().unwrap_or(&[])
     }
 
     fn is_post(&self) -> bool {
@@ -327,52 +540,121 @@ impl Request {
         self.method.eq_ignore_ascii_case("HEAD")
     }
 
-    /// `POST /[vX.Y/]containers/create`.
+    /// `POST /[vX.Y/]containers/create` (or anything ending in it).
     fn is_create(&self) -> bool {
-        self.is_post() && self.route().ends_with("/containers/create")
+        self.is_post() && ends_with(self.segs(), &["containers", "create"])
+    }
+
+    /// `POST /[vX.Y/]build` (or anything ending in it).
+    fn is_build(&self) -> bool {
+        self.is_post() && ends_with(self.segs(), &["build"])
     }
 
     /// `POST /networks/{id}/connect`, ignoring any query string.
+    #[cfg(test)]
     fn is_network_connect(&self) -> bool {
-        let path = self.route();
-        self.is_post() && path.contains("/networks/") && path.ends_with("/connect")
+        self.blocked()
+            .is_some_and(|b| b.target == "networks/connect")
+    }
+
+    /// Requests refused outright, because what they set up would have a
+    /// network that sealing can't remove. Matched by suffix on the canonical
+    /// path: refusing a path the daemon would 404 anyway costs nothing.
+    fn blocked(&self) -> Option<Block> {
+        if !self.is_post() {
+            return None;
+        }
+        let s = self.segs();
+        if ends_with(s, &["networks", "*", "connect"]) {
+            return Some(Block {
+                target: "networks/connect",
+                why: "would attach a network to a container",
+                message: "nullroute blocked docker network connect: it would give a container network access that --seal-docker removed.",
+            });
+        }
+        if ends_with(s, &["grpc"]) || ends_with(s, &["session"]) {
+            return Some(Block {
+                target: "buildkit",
+                why: "BuildKit builds choose their own network",
+                message: BUILDKIT_MSG,
+            });
+        }
+        if ends_with(s, &["services", "create"]) || ends_with(s, &["services", "*", "update"]) {
+            return Some(Block {
+                target: "services",
+                why: "swarm service tasks get networks",
+                message: "nullroute blocked a Docker Swarm service create/update: service tasks get networks that --seal-docker can't remove.",
+            });
+        }
+        if ends_with(s, &["swarm", "init"]) || ends_with(s, &["swarm", "join"]) {
+            return Some(Block {
+                target: "swarm",
+                why: "a swarm can run tasks with networks",
+                message: "nullroute blocked docker swarm init/join: a swarm can schedule tasks with networks that --seal-docker can't remove.",
+            });
+        }
+        let plugin_action = s.len() >= 3
+            && matches!(s[s.len() - 1].as_str(), "enable" | "upgrade")
+            && s[..s.len() - 2].iter().any(|x| x == "plugins");
+        if plugin_action
+            || ends_with(s, &["plugins", "pull"])
+            || ends_with(s, &["plugins", "create"])
+        {
+            return Some(Block {
+                target: "plugins",
+                why: "plugins can run with host networking",
+                message: "nullroute blocked installing or enabling a Docker plugin: plugins can run with host networking that --seal-docker can't remove.",
+            });
+        }
+        None
     }
 
     /// `POST /containers/{id}/attach` or `POST /exec/{id}/start`: the only
-    /// endpoints whose response may become a raw stream.
+    /// endpoints whose response may become a raw stream without a 101.
     fn is_stream_endpoint(&self) -> bool {
-        if !self.is_post() {
-            return false;
-        }
-        let route = self.route();
-        let segs: Vec<&str> = route.split('/').filter(|s| !s.is_empty()).collect();
-        // Optional leading API version (v1.43).
-        let segs = match segs.first() {
-            Some(v)
-                if v.starts_with('v') && v[1..].chars().all(|c| c.is_ascii_digit() || c == '.') =>
-            {
-                &segs[1..]
-            }
-            _ => &segs[..],
-        };
-        matches!(segs, ["containers", _, "attach"] | ["exec", _, "start"])
+        self.is_post()
+            && (matches_exactly(self.segs(), &["containers", "*", "attach"])
+                || matches_exactly(self.segs(), &["exec", "*", "start"]))
     }
 
-    /// Why this request's body can't be framed by Content-Length alone, if so.
+    /// May the daemon answer this with `101 Switching Protocols`? Attach,
+    /// exec start, and the attach websocket; never a tunnel to another API.
+    fn may_upgrade(&self) -> bool {
+        self.is_stream_endpoint()
+            || (self.method.eq_ignore_ascii_case("GET")
+                && matches_exactly(self.segs(), &["containers", "*", "attach", "ws"]))
+    }
+
+    /// Why this request's body can't be framed exactly, if so.
     fn unframeable(&self) -> Option<&'static str> {
         if !matches!(self.version.as_str(), "HTTP/1.1" | "HTTP/1.0") {
             return Some("only HTTP/1.x is supported");
         }
-        if self.header("transfer-encoding").is_some() {
-            return Some("Transfer-Encoding request bodies are not supported");
-        }
-        let lengths = self
-            .headers
-            .iter()
-            .filter(|(n, _)| n.eq_ignore_ascii_case("content-length"))
-            .count();
+        let count = |name: &str| {
+            self.headers
+                .iter()
+                .filter(|(n, _)| n.eq_ignore_ascii_case(name))
+                .count()
+        };
+        let (lengths, encodings) = (count("content-length"), count("transfer-encoding"));
         if lengths > 1 {
             return Some("more than one Content-Length");
+        }
+        if encodings > 0 {
+            // Only a build upload may be chunked (the classic builder streams
+            // its context that way), and only in the one form Go's server
+            // reads exactly as we do. Go ignores Transfer-Encoding on
+            // HTTP/1.0, so a chunked 1.0 body would be read as requests.
+            let chunked_build = self.stream == Some(Framing::Chunked)
+                && self.version == "HTTP/1.1"
+                && encodings == 1
+                && lengths == 0
+                && self
+                    .header("transfer-encoding")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
+            if !chunked_build {
+                return Some("Transfer-Encoding request bodies are not supported");
+            }
         }
         None
     }
@@ -389,27 +671,47 @@ impl Request {
             .is_some_and(|v| v.eq_ignore_ascii_case("close"))
     }
 
-    /// Rebuild the request head, replacing Content-Length with `body_len`.
-    fn render_head(&self, body_len: usize) -> Vec<u8> {
-        let mut s = format!("{} {} {}\r\n", self.method, self.path, self.version);
+    /// Rebuild the request head with the (possibly rewritten) target. With
+    /// `Some(len)` Content-Length is replaced by `len`; with `None` (a streamed
+    /// body) the framing headers are kept as they are.
+    fn render_head(&self, body_len: Option<usize>) -> Vec<u8> {
+        let target = self.forward_target.as_deref().unwrap_or(&self.path);
+        let mut s = format!("{} {} {}\r\n", self.method, target, self.version);
         let mut wrote_len = false;
         for (name, value) in &self.headers {
-            if name.eq_ignore_ascii_case("content-length") {
-                s.push_str(&format!("Content-Length: {body_len}\r\n"));
-                wrote_len = true;
-            } else {
-                s.push_str(&format!("{name}: {value}\r\n"));
+            match body_len {
+                Some(len) if name.eq_ignore_ascii_case("content-length") => {
+                    s.push_str(&format!("Content-Length: {len}\r\n"));
+                    wrote_len = true;
+                }
+                _ => s.push_str(&format!("{name}: {value}\r\n")),
             }
         }
-        if !wrote_len && body_len > 0 {
-            s.push_str(&format!("Content-Length: {body_len}\r\n"));
+        if let Some(len) = body_len
+            && !wrote_len
+            && len > 0
+        {
+            s.push_str(&format!("Content-Length: {len}\r\n"));
         }
         s.push_str("\r\n");
         s.into_bytes()
     }
 }
 
-fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request>> {
+/// Does `segs` end with `pat`? `"*"` in the pattern matches any one segment.
+fn ends_with(segs: &[String], pat: &[&str]) -> bool {
+    segs.len() >= pat.len()
+        && segs[segs.len() - pat.len()..]
+            .iter()
+            .zip(pat)
+            .all(|(s, p)| *p == "*" || s == p)
+}
+
+fn matches_exactly(segs: &[String], pat: &[&str]) -> bool {
+    segs.len() == pat.len() && ends_with(segs, pat)
+}
+
+fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
         return Ok(None);
@@ -423,7 +725,7 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request
     }
 
     let mut headers = Vec::new();
-    let mut content_length = 0usize;
+    let mut content_length = 0u64;
     let mut total = line.len();
     loop {
         let mut h = String::new();
@@ -441,6 +743,10 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request
         if let Some((name, value)) = trimmed.split_once(':') {
             let (name, value) = (name.trim().to_string(), value.trim().to_string());
             if name.eq_ignore_ascii_case("content-length") {
+                // Digits only, like Go (Rust's parser would also take "+5").
+                if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(io::Error::other("bad Content-Length"));
+                }
                 content_length = value
                     .parse()
                     .map_err(|_| io::Error::other("bad Content-Length"))?;
@@ -448,18 +754,78 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request
             headers.push((name, value));
         }
     }
-    if content_length > MAX_BODY {
+    let mut req = Request::new(&method, &path, &version, headers);
+    if req.is_build() {
+        // The build context can be large and the classic builder sends it
+        // chunked: stream it instead of buffering. (Whether a chunked body is
+        // acceptable is decided by unframeable().)
+        req.stream = Some(if req.header("transfer-encoding").is_some() {
+            Framing::Chunked
+        } else {
+            Framing::Length(content_length)
+        });
+        return Ok(Some(req));
+    }
+    if content_length > MAX_BODY as u64 {
         return Err(io::Error::other("request body too large for --seal-docker"));
     }
-    let mut body = vec![0u8; content_length];
+    let mut body = vec![0u8; content_length as usize];
     reader.read_exact(&mut body)?;
-    Ok(Some(Request {
-        method,
-        path,
-        version,
-        headers,
-        body,
-    }))
+    req.body = body;
+    Ok(Some(req))
+}
+
+/// Copy a streamed request body from the client to the daemon, exactly as
+/// framed. Chunked bodies are parsed strictly (hex size, CRLF everywhere, no
+/// trailers) so that where we think the body ends is where Go's server
+/// thinks it ends; anything else is an error, and the connection is dropped
+/// mid-body rather than resynchronised.
+fn forward_body<R: BufRead, W: Write>(r: &mut R, w: &mut W, framing: Framing) -> io::Result<()> {
+    let copy_exact = |r: &mut R, w: &mut W, n: u64| -> io::Result<()> {
+        if io::copy(&mut r.take(n), w)? == n {
+            Ok(())
+        } else {
+            Err(io::ErrorKind::UnexpectedEof.into())
+        }
+    };
+    let bad = |why: &str| io::Error::other(format!("malformed chunked body: {why}"));
+    match framing {
+        Framing::Length(n) => copy_exact(r, w, n),
+        Framing::Chunked => loop {
+            let mut line = Vec::new();
+            r.take(MAX_CHUNK_LINE).read_until(b'\n', &mut line)?;
+            let Some(l) = line.strip_suffix(b"\r\n") else {
+                return Err(bad("size line not ended by CRLF"));
+            };
+            let (size_hex, ext) = match l.iter().position(|&b| b == b';') {
+                Some(i) => (&l[..i], &l[i..]),
+                None => (l, &[][..]),
+            };
+            if size_hex.is_empty()
+                || size_hex.len() > 15
+                || !size_hex.iter().all(u8::is_ascii_hexdigit)
+                || ext.iter().any(|&b| b.is_ascii_control() && b != b'\t')
+            {
+                return Err(bad("bad chunk size"));
+            }
+            let size = u64::from_str_radix(std::str::from_utf8(size_hex).unwrap_or("x"), 16)
+                .map_err(|_| bad("bad chunk size"))?;
+            w.write_all(&line)?;
+            copy_exact(r, w, size)?;
+            let mut crlf = [0u8; 2];
+            r.read_exact(&mut crlf)?;
+            if &crlf != b"\r\n" {
+                // After the last chunk this is where trailers would start.
+                return Err(bad(
+                    "chunk not followed by CRLF (trailers are not supported)",
+                ));
+            }
+            w.write_all(&crlf)?;
+            if size == 0 {
+                return Ok(());
+            }
+        },
+    }
 }
 
 /// Force a container-create body onto no network: set HostConfig.NetworkMode to
@@ -546,28 +912,125 @@ fn go_fold_eq(key: &str, ascii_name: &str) -> bool {
         .eq(ascii_name.chars().map(|c| c.to_ascii_lowercase()))
 }
 
-/// Decode %XX escapes (invalid ones are kept as-is), like Go's URL.Path.
-fn percent_decode(s: &str) -> String {
+/// Reduce a request target to the path segments the daemon's router matches
+/// on, or say why that can't be done unambiguously.
+///
+/// Go's server percent-decodes the path (`%2F` included) and gorilla/mux
+/// cleans it (`//`, `.`, `..`; a non-clean path is redirected to the clean
+/// one), then routes with an optional `/v{version}` prefix. We do the same and
+/// drop that prefix. A trailing slash is dropped too: the daemon 404s such a
+/// path, so treating it like the slash-less one only errs on the safe side.
+fn canonical_route(target: &str) -> Result<Vec<String>, &'static str> {
+    if !target.starts_with('/') {
+        return Err("request target is not an absolute path");
+    }
+    if target.contains('#') {
+        return Err("request target contains '#'");
+    }
+    let raw = target.split('?').next().unwrap_or(target);
+    let decoded = percent_decode_strict(raw, false).ok_or("invalid percent-encoding in path")?;
+    let decoded = String::from_utf8(decoded).map_err(|_| "path is not UTF-8")?;
+    if decoded.chars().any(char::is_control) {
+        return Err("control character in path");
+    }
+    // Docker decodes once; a path that is still encoded after that is
+    // ambiguous (and nothing the Docker CLI sends looks like it).
+    if percent_decode_strict(&decoded, false).is_some_and(|d| d != decoded.as_bytes()) {
+        return Err("path is percent-encoded more than once");
+    }
+    let mut segs: Vec<String> = Vec::new();
+    for seg in decoded.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segs.pop();
+            }
+            s => segs.push(s.to_string()),
+        }
+    }
+    if segs.first().is_some_and(|v| is_api_version(v)) {
+        segs.remove(0);
+    }
+    Ok(segs)
+}
+
+/// `v1.43` and friends: Docker's `/v{version:[0-9.]+}` route prefix.
+fn is_api_version(seg: &str) -> bool {
+    seg.strip_prefix('v')
+        .is_some_and(|v| !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+}
+
+/// Decode %XX escapes like Go's url package: None for an invalid escape
+/// (Go refuses those with 400). `plus_is_space` for query components.
+fn percent_decode_strict(s: &str, plus_is_space: bool) -> Option<Vec<u8>> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
-        {
-            out.push(h << 4 | l);
-            i += 3;
-        } else {
-            out.push(b[i]);
-            i += 1;
+        match b[i] {
+            b'%' => {
+                let h = hex(*b.get(i + 1)?)?;
+                let l = hex(*b.get(i + 2)?)?;
+                out.push(h << 4 | l);
+                i += 3;
+            }
+            b'+' if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Some(out)
 }
 
 fn hex(c: u8) -> Option<u8> {
     (c as char).to_digit(16).map(|d| d as u8)
+}
+
+/// The request target to forward for a classic-builder `POST /build`: every
+/// `networkmode` parameter dropped and `networkmode=none` appended, so it's the
+/// only value the daemon sees. Refuses what can't be rewritten safely:
+/// - `version` other than 1: a BuildKit build, whose Dockerfile frontend
+///   (or a custom `# syntax=` one) decides each step's network itself;
+/// - form-encoded bodies: Go's FormValue lets body parameters override the
+///   query, so a `networkmode=host` there would win;
+/// - query strings Go would parse differently from us (`;`, bad escapes).
+fn rewrite_build(req: &Request) -> Result<String, &'static str> {
+    let form_body = req
+        .headers
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+        .any(|v| v.starts_with("application/x-www-form-urlencoded") || v.starts_with("multipart/"));
+    if form_body {
+        return Err("form-encoded build parameters can't be sealed");
+    }
+    let (path, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
+    let mut kept = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        if pair.contains(';') {
+            return Err("';' in the build query string");
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let bad = "invalid percent-encoding in the build query string";
+        let key = percent_decode_strict(k, true).ok_or(bad)?;
+        let value = percent_decode_strict(v, true).ok_or(bad)?;
+        if key.eq_ignore_ascii_case(b"networkmode") {
+            continue;
+        }
+        if key == b"version" && !(value.is_empty() || value == b"1") {
+            return Err(
+                "BuildKit builds can't be sealed; use the classic builder (DOCKER_BUILDKIT=0)",
+            );
+        }
+        kept.push(pair);
+    }
+    kept.push("networkmode=none");
+    Ok(format!("{path}?{}", kept.join("&")))
 }
 
 /// An HTTP error with a JSON `{"message": ...}` the Docker CLI prints.
@@ -577,6 +1040,7 @@ fn write_error(client: &mut UnixStream, code: u16, msg: &str, close: bool) -> io
     let body = format!("{{\"message\":{}}}", crate::report::json_string(msg));
     let reason = match code {
         400 => "Bad Request",
+        502 => "Bad Gateway",
         _ => "Forbidden",
     };
     let conn = if close { "Connection: close\r\n" } else { "" };
@@ -718,8 +1182,10 @@ mod tests {
         assert!(req("post", "/containers/create").is_create());
         assert!(!req("GET", "/containers/create").is_create());
         assert!(req("POST", "/v1.43/networks/abc/conn%65ct").is_network_connect());
-        assert_eq!(percent_decode("/a%2"), "/a%2");
-        assert_eq!(percent_decode("%zz%41"), "%zzA");
+        assert_eq!(percent_decode_strict("/a%2", false), None);
+        assert_eq!(percent_decode_strict("%zz%41", false), None);
+        assert_eq!(percent_decode_strict("a+b%41", false).unwrap(), b"a+bA");
+        assert_eq!(percent_decode_strict("a+b%41", true).unwrap(), b"a bA");
     }
 
     #[test]
@@ -779,9 +1245,21 @@ mod tests {
                     thread::spawn(move || {
                         let mut w = conn.try_clone().unwrap();
                         let mut r = BufReader::new(conn);
-                        while let Ok(Some(req)) = read_request(&mut r) {
+                        while let Ok(Some(mut req)) = read_request(&mut r) {
+                            if let Some(f) = req.stream {
+                                let mut body = Vec::new();
+                                if forward_body(&mut r, &mut body, f).is_err() {
+                                    return;
+                                }
+                                req.body = body;
+                            }
                             let _ =
                                 tx.send((req.method.clone(), req.path.clone(), req.body.clone()));
+                            if req.path.contains("fake-101") {
+                                let _ = w.write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n");
+                                let _ = io::copy(r.get_mut(), &mut w);
+                                return;
+                            }
                             if req.path.contains("attach") && req.header("upgrade").is_some() {
                                 let _ = w.write_all(b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\nContent-Type: application/vnd.docker.raw-stream\r\n\r\n");
                                 let buffered = r.buffer().to_vec();
@@ -873,7 +1351,10 @@ mod tests {
     fn assert_creates_sealed(reqs: &[(String, String, Vec<u8>)]) {
         let creates: Vec<_> = reqs
             .iter()
-            .filter(|(m, p, _)| m == "POST" && percent_decode(p).contains("/containers/create"))
+            .filter(|(m, p, _)| {
+                m == "POST"
+                    && canonical_route(p).is_ok_and(|s| ends_with(&s, &["containers", "create"]))
+            })
             .collect();
         assert!(
             !creates.is_empty(),
@@ -1030,17 +1511,16 @@ mod tests {
 
     #[test]
     fn render_head_fixes_content_length() {
-        let req = Request {
-            method: "POST".into(),
-            path: "/v1.43/containers/create?name=x".into(),
-            version: "HTTP/1.1".into(),
-            headers: vec![
+        let req = Request::new(
+            "POST",
+            "/v1.43/containers/create?name=x",
+            "HTTP/1.1",
+            vec![
                 ("Host".into(), "docker".into()),
                 ("Content-Length".into(), "999".into()),
             ],
-            body: vec![],
-        };
-        let head = String::from_utf8(req.render_head(7)).unwrap();
+        );
+        let head = String::from_utf8(req.render_head(Some(7))).unwrap();
         assert!(head.starts_with("POST /v1.43/containers/create?name=x HTTP/1.1\r\n"));
         assert!(head.contains("Content-Length: 7\r\n"));
         assert!(!head.contains("999"));
@@ -1048,25 +1528,25 @@ mod tests {
     }
 
     #[test]
-    fn path_no_query_strips_query() {
-        let req = Request {
-            method: "POST".into(),
-            path: "/v1.43/containers/create?name=x".into(),
-            version: "HTTP/1.1".into(),
-            headers: vec![],
-            body: vec![],
-        };
-        assert!(req.path_no_query().ends_with("/containers/create"));
+    fn render_head_keeps_framing_of_streamed_body_and_uses_rewritten_target() {
+        let mut req = Request::new(
+            "POST",
+            "/build?networkmode=host",
+            "HTTP/1.1",
+            vec![("Transfer-Encoding".into(), "chunked".into())],
+        );
+        req.forward_target = Some("/build?networkmode=none".into());
+        let head = String::from_utf8(req.render_head(None)).unwrap();
+        assert!(
+            head.starts_with("POST /build?networkmode=none HTTP/1.1\r\n"),
+            "{head}"
+        );
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"), "{head}");
+        assert!(!head.contains("Content-Length"), "{head}");
     }
 
     fn req(method: &str, path: &str) -> Request {
-        Request {
-            method: method.into(),
-            path: path.into(),
-            version: "HTTP/1.1".into(),
-            headers: vec![],
-            body: vec![],
-        }
+        Request::new(method, path, "HTTP/1.1", vec![])
     }
 
     #[test]
@@ -1093,5 +1573,415 @@ mod tests {
         let v = rewrite(r#"{"Image":"x","HostConfig":"bridge"}"#);
         assert_eq!(v["HostConfig"]["NetworkMode"], "none");
         assert!(v["HostConfig"].is_object());
+    }
+
+    // ---- path normalisation and endpoint matching ----------------------------
+
+    fn route(p: &str) -> Vec<String> {
+        canonical_route(p).unwrap_or_else(|e| panic!("{p}: {e}"))
+    }
+
+    #[test]
+    fn canonical_route_normalises_like_the_daemon_router() {
+        let want = ["containers", "create"];
+        for p in [
+            "/containers/create",
+            "/v1.43/containers/create",
+            "/v1.43/containers/create?name=x&y=/../build",
+            "//containers//create",
+            "/v1.43//containers/./create/",
+            "/v1.43/../containers/create",
+            "/images/../containers/x/../create",
+            "/v1.43/containers%2Fcreate",
+            "/v1.43/%63ontainers/%2e%2e/containers/cre%61te",
+            "/../../containers/create",
+        ] {
+            assert_eq!(route(p), want, "{p}");
+        }
+        // Only one leading version prefix, and only a real one, is dropped.
+        assert_eq!(route("/v1.43/v1.43/build"), ["v1.43", "build"]);
+        assert_eq!(route("/v/build"), ["v", "build"]);
+        assert_eq!(route("/vx1/build"), ["vx1", "build"]);
+        assert_eq!(route("/"), Vec::<String>::new());
+        // '+' is not a space in a path; ';' is not a separator.
+        assert_eq!(route("/a+b;c"), ["a+b;c"]);
+    }
+
+    #[test]
+    fn ambiguous_paths_are_rejected() {
+        for p in [
+            "containers/create",
+            "http://docker/containers/create",
+            "*",
+            "/containers/create%",
+            "/containers/creat%6",
+            "/containers/%zzcreate",
+            "/containers/create#frag",
+            "/containers/%00create",
+            "/containers/create%0a",
+            "/containers/%ff",
+            "/containers%252Fcreate",
+            "/v1.43/services%252Fcreate",
+        ] {
+            assert!(canonical_route(p).is_err(), "{p} should be rejected");
+        }
+        // A literal % that doesn't form an escape after decoding is fine.
+        assert!(canonical_route("/images/50%25off/json").is_ok());
+    }
+
+    fn blocked_target(method: &str, p: &str) -> Option<&'static str> {
+        req(method, p).blocked().map(|b| b.target)
+    }
+
+    #[test]
+    fn network_granting_endpoints_are_blocked() {
+        for (p, target) in [
+            ("/v1.43/networks/abc/connect", "networks/connect"),
+            ("/networks//abc/./connect?x=1", "networks/connect"),
+            ("/grpc", "buildkit"),
+            ("/v1.43/session", "buildkit"),
+            ("/services/create", "services"),
+            ("/v1.43/services/create?x", "services"),
+            ("/v1.43/services%2Fcreate", "services"),
+            ("/v1.43//services/abc/update?version=3", "services"),
+            ("/v1.43/services/abc/../create", "services"),
+            ("/swarm/init", "swarm"),
+            ("/v1.43/swarm/join", "swarm"),
+            ("/plugins/pull?remote=x", "plugins"),
+            ("/v1.43/plugins/create?name=x", "plugins"),
+            ("/v1.43/plugins/vieux/sshfs:latest/enable", "plugins"),
+            ("/plugins/foo/upgrade?remote=x", "plugins"),
+        ] {
+            assert_eq!(blocked_target("POST", p), Some(target), "{p}");
+            assert_eq!(blocked_target("post", p), Some(target), "{p}");
+        }
+        for (m, p) in [
+            ("GET", "/services/create"),
+            ("GET", "/v1.43/services"),
+            ("GET", "/v1.43/swarm"),
+            ("POST", "/v1.43/swarm/update"),
+            ("POST", "/v1.43/swarm/leave"),
+            ("POST", "/v1.43/networks/create"),
+            ("POST", "/v1.43/networks/abc/disconnect"),
+            ("POST", "/v1.43/plugins/foo/disable"),
+            ("POST", "/v1.43/plugins/enable"),
+            ("POST", "/v1.43/containers/abc/update"),
+            ("POST", "/v1.43/containers/create"),
+            ("POST", "/v1.43/build"),
+            ("POST", "/v1.43/images/create?fromImage=alpine"),
+            ("GET", "/grpc"),
+        ] {
+            assert_eq!(blocked_target(m, p), None, "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn build_route_matching() {
+        assert!(req("POST", "/v1.56/build?t=x").is_build());
+        assert!(req("POST", "//build/").is_build());
+        assert!(req("POST", "/v1.56/bu%69ld").is_build());
+        assert!(!req("GET", "/build").is_build());
+        assert!(!req("POST", "/build/prune").is_build());
+        assert!(!req("POST", "/images/build/json").is_build());
+    }
+
+    #[test]
+    fn upgrades_only_allowed_on_attach_and_exec() {
+        assert!(req("POST", "/v1.43/containers/abc/attach?stream=1").may_upgrade());
+        assert!(req("POST", "/v1.43/exec/abc/start").may_upgrade());
+        assert!(req("GET", "/v1.43/containers/abc/attach/ws").may_upgrade());
+        assert!(!req("POST", "/grpc").may_upgrade());
+        assert!(!req("POST", "/session").may_upgrade());
+        assert!(!req("POST", "/v1.43/containers/abc/start").may_upgrade());
+        assert!(!req("GET", "/v1.43/containers/abc/attach").may_upgrade());
+    }
+
+    fn build_with(path: &str, headers: &[(&str, &str)]) -> Result<String, &'static str> {
+        let h = headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        rewrite_build(&Request::new("POST", path, "HTTP/1.1", h))
+    }
+
+    #[test]
+    fn build_network_mode_is_forced_to_none() {
+        let tar = [("Content-Type", "application/x-tar")];
+        for (path, want) in [
+            (
+                "/v1.56/build?t=x&networkmode=host",
+                "/v1.56/build?t=x&networkmode=none",
+            ),
+            ("/build", "/build?networkmode=none"),
+            ("/build?", "/build?networkmode=none"),
+            (
+                "/build?networkmode=host&networkmode=bridge&NetworkMode=host&network%6dode=host&version=1",
+                "/build?version=1&networkmode=none",
+            ),
+            ("/build?networkmode", "/build?networkmode=none"),
+            (
+                "/build?t=a%2Bb&&q=x+y",
+                "/build?t=a%2Bb&q=x+y&networkmode=none",
+            ),
+        ] {
+            assert_eq!(build_with(path, &tar).unwrap(), want, "{path}");
+        }
+    }
+
+    #[test]
+    fn unsealable_builds_are_refused() {
+        for path in [
+            "/build?version=2",
+            "/build?version=2&networkmode=none",
+            "/build?vers%69on=2",
+            "/build?version=1&version=2",
+            "/build?networkmode=host;x=1",
+            "/build?networkmode=ho%zzst",
+            "/build?n%etworkmode=host",
+        ] {
+            assert!(build_with(path, &[]).is_err(), "{path}");
+        }
+        for ct in [
+            "application/x-www-form-urlencoded",
+            " Application/X-WWW-Form-Urlencoded; charset=utf-8",
+            "multipart/form-data; boundary=x",
+        ] {
+            assert!(
+                build_with("/build", &[("Content-Type", ct)]).is_err(),
+                "{ct}"
+            );
+        }
+    }
+
+    // ---- chunked build uploads ---------------------------------------------------
+
+    fn forward(body: &[u8], framing: Framing) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let mut r = BufReader::new(body);
+        let mut out = Vec::new();
+        forward_body(&mut r, &mut out, framing)?;
+        let mut rest = Vec::new();
+        r.read_to_end(&mut rest)?;
+        Ok((out, rest))
+    }
+
+    #[test]
+    fn chunked_body_is_forwarded_exactly_and_stops_at_its_end() {
+        let body =
+            b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\nPOST /containers/create HTTP/1.1\r\n";
+        let (out, rest) = forward(body, Framing::Chunked).unwrap();
+        assert_eq!(out, b"5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\n\r\n");
+        assert_eq!(rest, b"POST /containers/create HTTP/1.1\r\n");
+        let (out, rest) = forward(b"abcdeXYZ", Framing::Length(5)).unwrap();
+        assert_eq!((&out[..], &rest[..]), (&b"abcde"[..], &b"XYZ"[..]));
+        assert!(forward(b"abc", Framing::Length(5)).is_err());
+    }
+
+    #[test]
+    fn malformed_chunked_bodies_are_errors() {
+        for body in [
+            &b"5\nhello\r\n0\r\n\r\n"[..],   // bare LF
+            b"5 \r\nhello\r\n0\r\n\r\n",     // whitespace in size
+            b"+5\r\nhello\r\n0\r\n\r\n",     // sign
+            b"0x5\r\nhello\r\n0\r\n\r\n",    // 0x prefix
+            b"\r\nhello\r\n0\r\n\r\n",       // empty size
+            b"5\r\nhelloXX0\r\n\r\n",        // missing CRLF after data
+            b"0\r\nTrailer: x\r\n\r\n",      // trailers
+            b"5\r\nhel",                     // truncated
+            b"1000000000000000\r\n",         // too large
+            b"5;\x00\r\nhello\r\n0\r\n\r\n", // control char in extension
+        ] {
+            assert!(
+                forward(body, Framing::Chunked).is_err(),
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn chunked_transfer_encoding_is_only_accepted_for_builds_over_http_1_1() {
+        let te = |path: &str, version: &str, extra: &[(&str, &str)]| {
+            let mut h = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
+            h.extend(extra.iter().map(|(n, v)| (n.to_string(), v.to_string())));
+            let mut r = Request::new("POST", path, version, h);
+            if r.is_build() {
+                r.stream = Some(Framing::Chunked);
+            }
+            r.unframeable()
+        };
+        assert_eq!(te("/v1.56/build", "HTTP/1.1", &[]), None);
+        assert!(te("/v1.56/build", "HTTP/1.0", &[]).is_some());
+        assert!(te("/v1.56/build", "HTTP/1.1", &[("Content-Length", "5")]).is_some());
+        assert!(
+            te(
+                "/v1.56/build",
+                "HTTP/1.1",
+                &[("Transfer-Encoding", "chunked")]
+            )
+            .is_some()
+        );
+        assert!(te("/v1.56/containers/create", "HTTP/1.1", &[]).is_some());
+        assert!(te("/v1.56/containers/x/archive", "HTTP/1.1", &[]).is_some());
+    }
+
+    // ---- the refusals end-to-end through the proxy ---------------------------
+
+    #[test]
+    fn build_with_host_network_is_rewritten_and_framing_kept() {
+        for chunked in [false, true] {
+            let d = FakeDaemon::start("build");
+            let mut c = d.client();
+            let build = if chunked {
+                "POST /v1.56/build?t=x&networkmode=host HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nTARS\r\n0\r\n\r\n".to_string()
+            } else {
+                http(
+                    "POST",
+                    "/v1.56/build?t=x&networkmode=host",
+                    "Content-Type: application/x-tar\r\n",
+                    "TARS",
+                )
+            };
+            // A create right behind it on the same connection must still be
+            // parsed (and sealed): the body ended where we said it did.
+            let both = build + &http("POST", "/containers/create", "", HOST_CREATE);
+            c.write_all(both.as_bytes()).unwrap();
+            let out = read_responses(&mut c, 2);
+            assert_eq!(out.matches("HTTP/1.1 404").count(), 2, "{out}");
+            drop(c);
+            let reqs = d.requests();
+            let builds: Vec<_> = reqs
+                .iter()
+                .filter(|(_, p, _)| p.contains("build"))
+                .collect();
+            assert_eq!(builds.len(), 1, "{reqs:?}");
+            assert_eq!(builds[0].1, "/v1.56/build?t=x&networkmode=none");
+            // Forwarded exactly as framed (the fake daemon keeps the raw chunks).
+            let want: &[u8] = if chunked {
+                b"4\r\nTARS\r\n0\r\n\r\n"
+            } else {
+                b"TARS"
+            };
+            assert_eq!(builds[0].2, want);
+            assert_creates_sealed(&reqs);
+        }
+    }
+
+    #[test]
+    fn buildkit_build_is_refused_and_connection_closed() {
+        let d = FakeDaemon::start("bk");
+        let mut c = d.client();
+        let both = http(
+            "POST",
+            "/v1.56/build?version=2&networkmode=none",
+            "",
+            "TARS",
+        ) + &http("POST", "/containers/create", "", HOST_CREATE);
+        c.write_all(both.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 2);
+        assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+        assert!(out.contains("DOCKER_BUILDKIT=0"), "{out}");
+        assert!(out.contains("Connection: close"), "{out}");
+        drop(c);
+        assert!(d.requests().is_empty());
+    }
+
+    #[test]
+    fn swarm_and_plugin_requests_never_reach_the_daemon() {
+        let d = FakeDaemon::start("swarm");
+        let mut c = d.client();
+        let all = http("POST", "/v1.43/services/create", "", r#"{"Name":"x"}"#)
+            + &http("POST", "/v1.43/services//abc/update?version=1", "", "{}")
+            + &http("POST", "/v1.43/swarm/join", "", "{}")
+            + &http("POST", "/v1.43/plugins/pull?remote=x", "", "[]")
+            + &http("POST", "/v1.43/../grpc", "", "")
+            + &http("GET", "/_ping", "", "");
+        c.write_all(all.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 6);
+        assert_eq!(out.matches("HTTP/1.1 403").count(), 5, "{out}");
+        assert_eq!(out.matches("HTTP/1.1 404").count(), 1, "{out}");
+        drop(c);
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert_eq!(reqs[0].1, "/_ping");
+    }
+
+    #[test]
+    fn unnormalisable_path_is_refused_and_connection_stays_usable() {
+        let d = FakeDaemon::start("badpath");
+        let mut c = d.client();
+        let both = http("POST", "/containers%252Fcreate", "", HOST_CREATE)
+            + &http("POST", "/containers/create", "", HOST_CREATE);
+        c.write_all(both.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 2);
+        assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+        drop(c);
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert_creates_sealed(&reqs);
+    }
+
+    #[test]
+    fn unexpected_101_is_not_relayed() {
+        let d = FakeDaemon::start("up");
+        let mut c = d.client();
+        let both = http(
+            "POST",
+            "/v1.43/fake-101",
+            "Connection: Upgrade\r\nUpgrade: h2c\r\n",
+            "",
+        ) + &http("POST", "/containers/create", "", HOST_CREATE);
+        c.write_all(both.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 2);
+        assert!(out.starts_with("HTTP/1.1 502"), "{out}");
+        assert!(!out.contains("101"), "{out}");
+        drop(c);
+        // The create was never relayed raw (the daemon would see it as part
+        // of the tunnel, or not at all).
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+    }
+
+    #[test]
+    fn grpc_tunnel_gets_a_grpc_permission_denied() {
+        let (mut ours, mut theirs) = UnixStream::pair().unwrap();
+        ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let t = thread::spawn(move || {
+            let mut tr = theirs.try_clone().unwrap();
+            refuse_grpc(&mut tr, &mut theirs, BUILDKIT_MSG)
+        });
+        let mut client = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        client.extend_from_slice(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0]); // SETTINGS
+        client.extend_from_slice(&[0, 0, 1, 0x1, 0x4, 0, 0, 0, 1, 0x83]); // HEADERS s1
+        client.extend_from_slice(&[0, 0, 8, 0x7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0]); // GOAWAY
+        ours.write_all(&client).unwrap();
+        let mut got = Vec::new();
+        let _ = ours.read_to_end(&mut got);
+        t.join().unwrap().unwrap();
+        let text = String::from_utf8_lossy(&got);
+        assert!(text.starts_with("HTTP/1.1 101 "), "{text}");
+        assert!(text.contains("grpc-status"), "{text}");
+        assert!(text.contains(BUILDKIT_MSG), "{text}");
+        // The answer is a HEADERS frame on stream 1 with END_STREAM|END_HEADERS.
+        let i = got
+            .windows(5)
+            .position(|w| w == [0x1, 0x5, 0, 0, 0])
+            .unwrap();
+        assert_eq!(got[i + 5], 1);
+    }
+
+    #[test]
+    fn hpack_lengths_use_the_7_bit_prefix_encoding() {
+        let mut out = Vec::new();
+        hpack_string(&mut out, &[b'a'; 126]);
+        assert_eq!(out[0], 126);
+        let mut out = Vec::new();
+        hpack_string(&mut out, &[b'a'; 127]);
+        assert_eq!(&out[..2], &[127, 0]);
+        let mut out = Vec::new();
+        hpack_string(&mut out, &[b'a'; 1337]);
+        // RFC 7541 C.1.2: 1337 with a 5-bit prefix; here 7-bit: 1337-127 = 1210.
+        assert_eq!(&out[..3], &[127, 0xba, 0x09]);
+        assert_eq!(out.len(), 3 + 1337);
     }
 }

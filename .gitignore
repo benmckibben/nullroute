@@ -7,3 +7,10 @@
 /USER.md
 /BOOTSTRAP.md
 /.openclaw/
+
+# OpenClaw agent memory & dreaming state (symlinked to central workspace)
+/DREAMS.md
+/memory/
+/memory
+/avatars/
+/avatars
