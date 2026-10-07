@@ -169,7 +169,7 @@ nullroute: blocked 7 attempts to reach 2 targets:
 | `proxy` | a proxy request to a host that isn't allowed | yes |
 | `dns` | a lookup of a name that isn't allowed, or a relay the sinkhole refused | yes |
 | `docker` | a Docker API request `--seal-docker` refused | yes |
-| `rewritten` | a request `--seal-docker` changed and let through (a container create forced onto `NetworkMode=none`) | no |
+| `rewritten` | a request `--seal-docker` changed and let through (a container create forced onto `NetworkMode=none`, or a classic `docker build` forced onto `networkmode=none`) | no |
 
 `rewritten` entries are listed after the blocks, under their own heading
 (`nullroute: rewrote N requests and let them through (not blocks; --strict
@@ -182,7 +182,7 @@ CLI reconnects).
 
 | Flag | Effect |
 |---|---|
-| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors. A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers. |
+| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors. A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
 | `-q`, `--quiet` | Skip the live lines; keep the summary. |
 | `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
 

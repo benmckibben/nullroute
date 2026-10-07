@@ -276,16 +276,19 @@ fn classic_build_with_host_network_is_forced_to_none() {
         "DOCKER_BUILDKIT=0 docker build --network host --no-cache --force-rm -t {image} {}",
         dir.display()
     );
-    let o = nr(&["--seal-docker", "--", "sh", "-c", &script]);
+    // --strict: forcing the build onto no network is a rewrite, not a block.
+    let o = nr(&["--seal-docker", "--strict", "--", "sh", "-c", &script]);
     let _ = Command::new("docker").args(["rmi", "-f", &image]).output();
     let _ = std::fs::remove_dir_all(&dir);
     let text = out(&o);
-    assert!(o.status.success(), "{o:?}");
+    assert!(o.status.success(), "a rewrite isn't a block: {o:?}");
     // (The step's command line is echoed too, so match whole lines.)
     let said = |w: &str| text.lines().any(|l| l.trim() == w);
     assert!(said("NONET") && !said("HASNET"), "{o:?}");
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("forced networkmode=none"), "{err}");
+    assert!(err.contains("rewritten  build"), "{err}");
+    assert!(!err.contains("--strict: failing"), "{err}");
 }
 
 #[test]

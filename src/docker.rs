@@ -159,7 +159,7 @@ fn proxy(client: UnixStream, upstream: &Path, report: &Arc<Report>) -> io::Resul
         } else if req.is_build() {
             match rewrite_build(&req) {
                 Ok(target) => {
-                    report.record(Kind::Docker, "build", "forced networkmode=none", || {
+                    report.record(Kind::Rewritten, "build", "forced networkmode=none", || {
                         "nullroute: --seal-docker: forcing the build's RUN steps onto no network"
                             .into()
                     });
