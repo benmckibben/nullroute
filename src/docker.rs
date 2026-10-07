@@ -473,7 +473,7 @@ fn read_request(reader: &mut BufReader<UnixStream>) -> io::Result<Option<Request
 /// after it.
 fn rewrite_create(body: &[u8], report: &Arc<Report>) -> Option<Vec<u8>> {
     report.record(
-        Kind::Docker,
+        Kind::Rewritten,
         "containers/create",
         "forced NetworkMode=none",
         || "nullroute: --seal-docker: forcing the new container onto no network".into(),
