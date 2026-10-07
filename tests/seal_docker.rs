@@ -384,3 +384,178 @@ send('POST', '/v1.43/build?version=2', b'', 'Content-Type: application/x-tar\r\n
     let text = out(&o);
     assert_eq!(text.matches("HTTP/1.1 403").count(), 3, "{o:?}");
 }
+
+// ---- --seal-docker-pulls ------------------------------------------------------
+// None of these need registry access: refused pulls never reach the daemon,
+// and the one let through goes to a closed port on this machine.
+
+#[test]
+fn seal_docker_pulls_without_seal_docker_is_a_usage_error() {
+    for mode in ["any", "allowlisted", "none"] {
+        let o = nr(&["--seal-docker-pulls", mode, "--", "true"]);
+        assert_eq!(o.status.code(), Some(2), "{mode}: {o:?}");
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            err.contains("nullroute: --seal-docker-pulls") && err.contains("--seal-docker"),
+            "{err}"
+        );
+    }
+    let o = nr(&[
+        "--seal-docker",
+        "--seal-docker-pulls",
+        "sometimes",
+        "--",
+        "true",
+    ]);
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
+}
+
+#[test]
+fn allowlisted_refuses_a_pull_from_a_registry_not_in_allow() {
+    if !docker_ok() {
+        return eprintln!("skipping: docker unavailable");
+    }
+    let o = nr(&[
+        "--seal-docker",
+        "--seal-docker-pulls",
+        "allowlisted",
+        "--",
+        "docker",
+        "pull",
+        "ghcr.io/nonexistent/x",
+    ]);
+    assert!(!o.status.success(), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    // The Docker CLI prints nullroute's refusal...
+    assert!(
+        err.contains("Error response from daemon: nullroute blocked pulling ghcr.io/nonexistent/x: --seal-docker-pulls=allowlisted"),
+        "{err}"
+    );
+    assert!(err.contains("Add --allow ghcr.io"), "{err}");
+    // ...and it's a docker block in the report.
+    assert!(
+        err.contains("docker  pull ghcr.io/nonexistent/x")
+            && err.contains("ghcr.io not in --allow; --seal-docker-pulls=allowlisted"),
+        "{err}"
+    );
+}
+
+#[test]
+fn allowlisted_lets_a_bridged_localhost_registry_through() {
+    if !docker_ok() {
+        return eprintln!("skipping: docker unavailable");
+    }
+    // localhost:1 is allowed by --port 1; nothing listens there, so the daemon
+    // itself fails the pull (proof it got the request).
+    let o = nr(&[
+        "--seal-docker",
+        "--seal-docker-pulls",
+        "allowlisted",
+        "--port",
+        "1",
+        "--",
+        "docker",
+        "pull",
+        "localhost:1/nullroute-no-such-image",
+    ]);
+    assert!(!o.status.success(), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("nullroute blocked"), "{err}");
+    assert!(!err.contains("--seal-docker-pulls"), "{err}");
+    assert!(err.contains("Error response from daemon"), "{err}");
+}
+
+#[test]
+fn none_still_runs_an_image_that_is_already_present() {
+    if !docker_ok() || !have_alpine() {
+        return eprintln!("skipping: docker/alpine unavailable");
+    }
+    // docker run only creates the container (no pull request) when the image
+    // is there; --strict proves nothing was refused.
+    let o = nr(&[
+        "--seal-docker",
+        "--seal-docker-pulls",
+        "none",
+        "--strict",
+        "--",
+        "docker",
+        "run",
+        "--rm",
+        "alpine",
+        "echo",
+        "ran",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(out(&o), "ran", "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!err.contains("nullroute blocked"), "{err}");
+}
+
+#[test]
+fn strict_fails_on_a_blocked_pull() {
+    if !docker_ok() {
+        return eprintln!("skipping: docker unavailable");
+    }
+    // The script swallows the failed pull and exits 0; --strict doesn't.
+    let o = nr(&[
+        "--seal-docker",
+        "--seal-docker-pulls",
+        "none",
+        "--strict",
+        "--",
+        "sh",
+        "-c",
+        "docker pull ghcr.io/nonexistent/x; docker pull alpine; true",
+    ]);
+    assert_eq!(o.status.code(), Some(1), "strict should fail: {o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(err.contains("--strict: failing"), "{err}");
+    assert!(
+        err.contains("--seal-docker-pulls=none doesn't let the Docker daemon"),
+        "{err}"
+    );
+    // (The CLI sends Hub images by their full name.)
+    for target in [
+        "pull ghcr.io/nonexistent/x",
+        "pull docker.io/library/alpine",
+    ] {
+        assert!(
+            err.contains(&format!("docker  {target}")),
+            "{target}: {err}"
+        );
+    }
+}
+
+#[test]
+fn inspect_and_dry_run_show_the_pull_policy_for_sealed_sockets() {
+    // A stand-in socket, so this doesn't need Docker.
+    let dir = std::env::temp_dir().join(format!("nr-pulls-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("docker.sock");
+    let _l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_nullroute"))
+        .args(["run", "--inspect", "--dry-run", "--seal-docker-socket"])
+        .arg(&sock)
+        .args(["--seal-docker-pulls", "allowlisted", "--", "true"])
+        .output()
+        .unwrap();
+    let plain = Command::new(env!("CARGO_BIN_EXE_nullroute"))
+        .args(["run", "--inspect", "--dry-run", "--", "true"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("\n  docker pulls:    allowlisted (pulls, logins and lookups only from registries in --allow"),
+        "{err}"
+    );
+    assert!(out(&o).contains("docker pulls: allowlisted"), "{o:?}");
+    // Nothing sealed, nothing shown (unless this host has a Docker socket,
+    // which --seal-docker isn't asking for here either).
+    assert!(
+        !String::from_utf8_lossy(&plain.stderr).contains("docker pulls"),
+        "{plain:?}"
+    );
+    assert!(!out(&plain).contains("docker pulls"), "{plain:?}");
+}

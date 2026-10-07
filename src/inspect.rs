@@ -8,7 +8,7 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use crate::{dns, hide, sandbox};
+use crate::{dns, docker, hide, sandbox};
 
 /// Everything `--inspect` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +28,8 @@ pub struct Topology {
     pub proxy: Option<(u16, Vec<String>)>,
     /// DNS sinkhole mapping lines (host -> synthetic address, ports), if on.
     pub dns: Option<Vec<String>>,
+    /// `--seal-docker-pulls`, when a Docker socket is sealed.
+    pub docker_pulls: Option<docker::PullPolicy>,
 }
 
 impl Topology {
@@ -55,7 +57,14 @@ impl Topology {
             masked: masked.to_vec(),
             proxy,
             dns: dns.map(dns::Plan::describe),
+            docker_pulls: None,
         }
+    }
+
+    /// Show the --seal-docker-pulls policy (only if a socket is sealed).
+    pub fn with_docker_pulls(mut self, pulls: docker::PullPolicy) -> Self {
+        self.docker_pulls = (!self.sealed.is_empty()).then_some(pulls);
+        self
     }
 
     /// Names of the namespaces in `ns_flags`, in a fixed order.
@@ -95,6 +104,9 @@ impl Topology {
         list(&mut s, "blocked (403 decoy)", &self.blocked);
         list(&mut s, "sealed (--seal-docker proxy)", &self.sealed);
         list(&mut s, "masked (resolver bypass)", &self.masked);
+        if let Some(p) = self.docker_pulls {
+            let _ = writeln!(s, "  docker pulls:    {}", p.describe());
+        }
         match &self.proxy {
             None => {
                 let _ = writeln!(s, "  upstream proxy:  none");
@@ -150,6 +162,7 @@ mod tests {
             masked: vec![],
             proxy: None,
             dns: None,
+            docker_pulls: None,
         }
     }
 
@@ -215,6 +228,7 @@ mod tests {
             masked: vec![],
             proxy: Some((3128, vec!["api.github.com".into(), "*.stripe.dev".into()])),
             dns: Some(vec!["api.github.com -> 127.77.0.1 (ports 80, 443)".into()]),
+            docker_pulls: Some(docker::PullPolicy::Allowlisted),
         };
         let out = t.render();
         assert!(
@@ -237,6 +251,26 @@ mod tests {
                 "  upstream proxy:  http://127.0.0.1:3128 (allow: api.github.com, *.stripe.dev)\n"
             ),
             "{out}"
+        );
+        assert!(
+            out.contains("\n  docker pulls:    allowlisted (pulls, logins and lookups only from registries in --allow;"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn docker_pulls_only_shown_when_a_socket_is_sealed() {
+        let t = bare().with_docker_pulls(docker::PullPolicy::Never);
+        assert!(!t.render().contains("docker pulls"), "{}", t.render());
+        let t = Topology {
+            sealed: vec!["/run/docker.sock".into()],
+            ..bare()
+        }
+        .with_docker_pulls(docker::PullPolicy::Never);
+        assert!(
+            t.render().contains("  docker pulls:    none (no registry"),
+            "{}",
+            t.render()
         );
     }
 
