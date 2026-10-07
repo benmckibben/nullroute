@@ -1,16 +1,33 @@
 //! nullroute: run a command with no network access except its own loopback.
 
+// nullroute is Linux-only. On other targets the modules and the real main()
+// are cfg'd out, so the build stops with this one error instead of dozens of
+// missing-libc-symbol errors; allow(unused) keeps the leftovers quiet.
+#![cfg_attr(not(target_os = "linux"), allow(unused))]
 #[cfg(not(target_os = "linux"))]
-compile_error!("nullroute currently supports Linux only (it uses network namespaces)");
+compile_error!(
+    "nullroute only supports Linux (it relies on Linux network namespaces); build it for a Linux target"
+);
+#[cfg(not(target_os = "linux"))]
+fn main() {}
 
+#[cfg(target_os = "linux")]
 mod dns;
+#[cfg(target_os = "linux")]
 mod docker;
+#[cfg(target_os = "linux")]
 mod forward;
+#[cfg(target_os = "linux")]
 mod hide;
+#[cfg(target_os = "linux")]
 mod inspect;
+#[cfg(target_os = "linux")]
 mod proxy;
+#[cfg(target_os = "linux")]
 mod report;
+#[cfg(target_os = "linux")]
 mod sandbox;
+#[cfg(target_os = "linux")]
 mod signals;
 
 use clap::{Parser, Subcommand};
@@ -118,6 +135,7 @@ enum Cmd {
     },
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -277,6 +295,7 @@ struct RunOpts {
     report_json: Option<std::path::PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
 fn run(
     argv: &[String],
     ports: &[u16],

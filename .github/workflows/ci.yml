@@ -86,3 +86,88 @@ jobs:
       # --show-output keeps the "skipping: ..." lines visible, so a test that
       # quietly skipped on the runner is visible in the log.
       - run: cargo test --locked --no-fail-fast -- --show-output
+
+  # The release targets beyond x86_64 glibc: musl's libc types differ (e.g. the
+  # ioctl request is c_int, not c_ulong), so keep them compiling.
+  cross-check:
+    name: check (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo check --locked --target ${{ matrix.target }}
+      - run: cargo clippy --all-targets --locked --target ${{ matrix.target }} -- -D warnings
+
+  # Runs the whole suite against a static musl binary on the x86_64 runner.
+  test-musl:
+    name: test (x86_64-unknown-linux-musl)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-unknown-linux-musl
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --net --map-current-user true
+      - name: Pull alpine for --seal-docker tests
+        run: docker pull alpine
+      - run: cargo test --locked --no-fail-fast --target x86_64-unknown-linux-musl -- --show-output
+
+  # Non-Linux builds must stop at the single compile_error! in main.rs, not
+  # bury it under dozens of missing-libc errors.
+  unsupported-targets:
+    name: non-Linux build fails cleanly
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: x86_64-apple-darwin
+      - name: cargo check --target x86_64-apple-darwin gives one clear error
+        run: |
+          if cargo check --locked --color never --target x86_64-apple-darwin > check.log 2>&1; then
+            cat check.log
+            echo "::error::cargo check for x86_64-apple-darwin unexpectedly succeeded"
+            exit 1
+          fi
+          cat check.log
+          grep -q '^error: nullroute only supports Linux' check.log
+          # Every compiler error, minus cargo's own "could not compile" summary.
+          errors=$(grep '^error' check.log | grep -vc '^error: could not compile' || true)
+          if [ "$errors" -ne 1 ]; then
+            echo "::error::expected exactly 1 error, got $errors"
+            exit 1
+          fi
