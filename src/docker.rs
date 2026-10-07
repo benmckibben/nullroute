@@ -838,12 +838,6 @@ fn forward_body<R: BufRead, W: Write>(r: &mut R, w: &mut W, framing: Framing) ->
 /// and are merged into the one we rewrite, rather than left for Go to apply
 /// after it.
 fn rewrite_create(body: &[u8], report: &Arc<Report>) -> Option<Vec<u8>> {
-    report.record(
-        Kind::Rewritten,
-        "containers/create",
-        "forced NetworkMode=none",
-        || "nullroute: --seal-docker: forcing the new container onto no network".into(),
-    );
     let mut v = match serde_json::from_slice::<serde_json::Value>(body) {
         Ok(v) if v.is_object() => v,
         _ => {
@@ -890,7 +884,14 @@ fn rewrite_create(body: &[u8], report: &Arc<Report>) -> Option<Vec<u8>> {
     }
     obj.insert("HostConfig".into(), serde_json::Value::Object(hc));
     // ExposedPorts is harmless without bindings; leave it.
-    serde_json::to_vec(&v).ok()
+    let out = serde_json::to_vec(&v).ok()?;
+    report.record(
+        Kind::Rewritten,
+        "containers/create",
+        "forced NetworkMode=none",
+        || "nullroute: --seal-docker: forcing the new container onto no network".into(),
+    );
+    Some(out)
 }
 
 /// Keys of `m` that Go's encoding/json would match to the field `name`.
@@ -1095,6 +1096,11 @@ mod tests {
     fn rewrite(json: &str) -> serde_json::Value {
         let r = Report::new(true);
         let out = rewrite_create(json.as_bytes(), &r).expect("rewritable");
+        let entries = r.entries();
+        assert!(
+            entries.iter().all(|e| e.kind == Kind::Rewritten) && entries.len() == 1,
+            "a successful create rewrite is a rewrite, not a block: {entries:?}"
+        );
         serde_json::from_slice(&out).unwrap()
     }
 
@@ -1136,6 +1142,12 @@ mod tests {
         ] {
             assert!(rewrite_create(body, &r).is_none(), "{body:?}");
         }
+        let entries = r.entries();
+        assert!(
+            entries.iter().all(|e| e.kind == Kind::Docker) && entries.len() == 1,
+            "a refused create must not also be listed as rewritten: {entries:?}"
+        );
+        assert_eq!(entries[0].count, 6, "{entries:?}");
     }
 
     #[test]
