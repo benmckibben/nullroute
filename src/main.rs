@@ -68,13 +68,15 @@ enum Cmd {
         /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
         /// optionally :PORT. Proxy-aware clients go through an HTTP(S) proxy;
         /// other clients resolve allowed names via nullroute's DNS sinkhole and
-        /// are relayed on the allowed ports (80/443 without :PORT).
+        /// are relayed on the allowed ports (80/443 without :PORT). localhost and
+        /// loopback, link-local and cloud-metadata IPs are refused (use --port
+        /// for local services).
         #[arg(short, long = "allow", value_name = "HOST", value_delimiter = ',')]
         allow: Vec<String>,
 
         /// Dial this allowed host at IP instead of resolving it on the host,
         /// like curl's --resolve (repeatable): --resolve db.internal:10.0.0.5.
-        /// Loopback addresses are still refused.
+        /// Loopback, link-local and cloud-metadata addresses are still refused.
         #[arg(long = "resolve", value_name = "HOST:IP")]
         resolve: Vec<String>,
 

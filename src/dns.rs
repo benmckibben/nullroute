@@ -479,9 +479,7 @@ impl Sinkhole {
         }
         match proxy::dial(&host, port, &self.overrides) {
             Ok(outer) => crate::forward::relay(inner, outer),
-            Err(DialError::Loopback) => {
-                block("resolves to loopback; use --port for local services")
-            }
+            Err(DialError::Forbidden(why)) => block(why.reason()),
             Err(DialError::Io(e)) => {
                 let first = self
                     .warned

@@ -71,7 +71,14 @@ Other details:
 
 - `NO_PROXY=localhost,127.0.0.1,::1`, so `--port` services are reached directly.
 - Host names are resolved on the host. A name that resolves to a loopback
-  address is refused even if allowed (use `--port` for local services).
+  address (`127.0.0.0/8`, `::1`, `0.0.0.0/8`, `::`, or an IPv6 form wrapping
+  one, like `::ffff:127.0.0.1`) is refused even if allowed (use `--port` for
+  local services). So is a link-local address (`169.254.0.0/16`, `fe80::/10`),
+  which covers the `169.254.169.254` cloud metadata service, and the other
+  known metadata endpoints (`fd00:ec2::254`, `100.100.100.200`).
+- `--allow` entries that can never be reached this way are rejected up front
+  (exit 2): `localhost`, `*.localhost`, loopback IPs (with a pointer to
+  `--port`), and link-local/metadata IPs.
 - Plain-HTTP requests are sent with `Connection: close`: one request per
   proxied connection.
 - The proxy listens on `127.0.0.1:3128` inside the sandbox (or the next port
