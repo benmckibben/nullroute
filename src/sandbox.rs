@@ -111,6 +111,11 @@ pub fn run_hermetic(
     let flags = namespace_flags(need_mount_ns);
     let pool_address = dns.is_some();
 
+    // From here until the handlers are installed, SIGINT/SIGQUIT/SIGTERM/SIGHUP
+    // stay pending instead of hitting nullroute's default action (see signals.rs).
+    let blocked = signals::block()?;
+    let child_mask = blocked.child_mask();
+
     let mut cmd = Command::new(program);
     cmd.args(args);
     if let Some((pp, _)) = &proxy {
@@ -137,6 +142,8 @@ pub fn run_hermetic(
             if let Some(c) = child_side.as_mut() {
                 c.listen_and_send()?;
             }
+            // Last: unblock, so nothing is delivered before setup is done.
+            child_mask.restore()?;
             Ok(())
         });
     }
@@ -146,7 +153,7 @@ pub fn run_hermetic(
     // the child's socket end.
     drop(cmd);
     let mut child = spawned?;
-    signals::install(child.id());
+    blocked.install(child.id());
     if let Some(h) = hide
         && let Err(e) = h.start(report)
     {
