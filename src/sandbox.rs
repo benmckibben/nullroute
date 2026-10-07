@@ -70,13 +70,7 @@ pub fn run_hermetic(
     };
 
     let mounts = hide.map(|h| h.mount_list()).transpose()?;
-    let flags = libc::CLONE_NEWUSER
-        | libc::CLONE_NEWNET
-        | if mounts.is_some() {
-            libc::CLONE_NEWNS
-        } else {
-            0
-        };
+    let flags = namespace_flags(mounts.is_some());
 
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -138,6 +132,12 @@ pub fn run_hermetic(
         }
     }
     child.wait()
+}
+
+/// The namespaces the child unshares: always user + net, plus a mount
+/// namespace when there are sockets to hide. Shared with `--inspect`.
+pub fn namespace_flags(hide_sockets: bool) -> libc::c_int {
+    libc::CLONE_NEWUSER | libc::CLONE_NEWNET | if hide_sockets { libc::CLONE_NEWNS } else { 0 }
 }
 
 /// open + write + close with raw syscalls (safe to call in pre_exec).

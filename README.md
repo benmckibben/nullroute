@@ -104,6 +104,40 @@ sockets are listed.
 SIGINT/SIGQUIT so it can still print the report, then exits with the command's
 status (130). SIGTERM and SIGHUP sent to nullroute are forwarded to the command.
 
+## Seeing the sandbox: `--inspect`
+
+`--inspect` prints the sandbox topology to stderr before the command starts,
+then runs the command as usual (stdout and the exit code are untouched):
+
+```text
+$ nullroute run --inspect --seal-docker --port 5432 --allow api.github.com -- pytest
+nullroute: inspect: sandbox topology
+  namespaces:      user, net, mount
+  loopback:        lo: UP (127.0.0.1, ::1)
+  bridged ports:   5432
+  unix sockets:
+    blocked (403 decoy):
+      /run/containerd/containerd.sock
+    sealed (--seal-docker proxy):
+      /run/docker.sock
+  upstream proxy:  http://127.0.0.1:3128 (allow: api.github.com)
+...test output...
+```
+
+| Line | Meaning |
+|---|---|
+| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` only when a socket is hidden or sealed. |
+| `loopback` | The sandbox's own `lo`, brought up before the command runs. |
+| `bridged ports` | `--port` values (sorted, deduplicated), or `none`. |
+| `blocked (403 decoy)` | Sockets replaced by a decoy that answers `403` (defaults + `--hide-socket`, minus `--allow-socket`). |
+| `sealed (--seal-docker proxy)` | Docker sockets proxied with containers forced to `NetworkMode=none`. |
+| `upstream proxy` | Where the `--allow` proxy listens inside the sandbox, and the allowed hosts, or `none`. |
+
+The summary is built from the same plan the sandbox is built from, so it shows
+exactly what will be set up. Combine with `--dry-run` to print it and exit
+without running anything: `nullroute run --inspect --dry-run -- true`.
+(`--dry-run`'s own stdout listing is unchanged by `--inspect`.)
+
 ## Unix sockets: the side door, closed by default
 
 A network namespace only covers network sockets. Unix socket *files* are reached
@@ -127,6 +161,7 @@ Error response from daemon: nullroute blocked access to /run/docker.sock (...). 
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
 | `--hide-socket PATH` | Hide another socket too, e.g. an SSH agent or a local proxy (repeatable). |
 | `--dry-run` | Print the sockets that would be hidden and the ports forwarded, then exit. |
+| `--inspect` | Print the full sandbox topology to stderr before running (see above). |
 
 ### Letting Docker tests run, with sealed containers
 
@@ -165,6 +200,7 @@ sockets speak a different protocol and are still hidden (not sealed) by default.
 | Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none`; not a boundary for hostile images |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; other protocols stay sealed |
 | Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy and socket blocks; not direct IP connects |
+| Show the sandbox topology (`--inspect`) | ✅ namespaces, loopback, ports, sockets, proxy |
 | macOS | ❌ no network namespaces; needs a different mechanism |
 
 ### What nullroute is not
