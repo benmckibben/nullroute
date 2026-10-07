@@ -333,3 +333,8 @@ cargo test                                   # integration tests run the real bi
 cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.
