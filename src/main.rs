@@ -81,6 +81,16 @@ enum Cmd {
         #[arg(long = "seal-docker-socket", value_name = "PATH")]
         seal_docker_sockets: Vec<std::path::PathBuf>,
 
+        /// With --seal-docker: what the Docker daemon may contact for the
+        /// command (image pulls, pushes, logins, manifest lookups, URL imports,
+        /// remote build contexts). any (default): anything, as without this
+        /// flag; allowlisted: only pulls, logins and lookups from registries in
+        /// --allow (Docker Hub: --allow docker.io; a localhost registry: --port);
+        /// none: nothing. A classic build's missing FROM image is still pulled
+        /// (see the README).
+        #[arg(long = "seal-docker-pulls", value_name = "MODE", value_enum)]
+        seal_docker_pulls: Option<docker::PullPolicy>,
+
         /// Let this host through (repeatable or comma-separated):
         /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
         /// optionally :PORT. Proxy-aware clients go through an HTTP(S) proxy;
@@ -145,6 +155,7 @@ fn main() -> ExitCode {
             allow_sockets,
             seal_docker,
             seal_docker_sockets,
+            seal_docker_pulls,
             allow,
             resolve,
             no_dns,
@@ -155,6 +166,13 @@ fn main() -> ExitCode {
             inspect,
             argv,
         } => {
+            if seal_docker_pulls.is_some() && !seal_docker && seal_docker_sockets.is_empty() {
+                eprintln!(
+                    "nullroute: --seal-docker-pulls only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
+                );
+                return ExitCode::from(2);
+            }
+            let pulls = seal_docker_pulls.unwrap_or_default();
             let allowlist = match proxy::Allowlist::parse(&allow) {
                 Ok(a) => a,
                 Err(e) => {
@@ -206,13 +224,20 @@ fn main() -> ExitCode {
             if seal_docker {
                 seal.extend(docker::docker_api_sockets());
             }
-            let plan = match hide::plan(&hide_sockets, &allow_sockets, &seal) {
+            let mut plan = match hide::plan(&hide_sockets, &allow_sockets, &seal) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("nullroute: preparing socket hiding: {e}");
                     return ExitCode::from(125);
                 }
             };
+            if let Some(p) = plan.as_mut() {
+                p.set_docker_policy(docker::Policy {
+                    pulls,
+                    allow: allowlist.clone(),
+                    ports: ports.clone(),
+                });
+            }
             let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
             if inspect {
                 let proxy = (!allowlist.is_empty())
@@ -226,6 +251,7 @@ fn main() -> ExitCode {
                         dns_plan.as_ref(),
                         &dns::bypass_targets(),
                     )
+                    .with_docker_pulls(pulls)
                     .render()
                 );
             }
@@ -237,6 +263,9 @@ fn main() -> ExitCode {
                             .for_each(|t| println!("hidden socket: {}", t.display()));
                         p.sealed_targets()
                             .for_each(|t| println!("sealed docker socket: {}", t.display()));
+                        if p.sealed_targets().next().is_some() {
+                            println!("docker pulls: {}", pulls.describe());
+                        }
                     }
                 }
                 for p in &ports {

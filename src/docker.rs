@@ -50,20 +50,42 @@
 //! (Transfer-Encoding other than a strictly parsed chunked build upload,
 //! duplicate Content-Length, non-HTTP/1.x) are refused.
 //!
+//! --seal-docker-pulls: the daemon itself still has network, and some requests
+//! make it contact a registry (or any URL) the command chose, which can carry
+//! data out in the host name or image path. With `any` (the default) they
+//! pass. With `allowlisted` or `none` (see PullPolicy) they're classified
+//! (Request::registry_reach) and refused (403, a `docker` report entry)
+//! unless allowed:
+//!
+//! - reads from a registry: `POST /images/create?fromImage=` (pull),
+//!   `GET /distribution/{name}/json` (manifest lookup), `GET /images/search`,
+//!   `POST /auth` (`docker login`; the registry is the body's
+//!   serveraddress), `GET /plugins/privileges?remote=`. Under `allowlisted`
+//!   these pass when the registry matches --allow (image names are split into
+//!   registry and path by Docker's reference rules, see image_registry);
+//! - everything else that reaches out: `POST /images/{name}/push`,
+//!   `POST /plugins/{name}/push`, `POST /images/create?fromSrc=URL`, and a
+//!   classic build with `remote=` (a URL or git context) or `pull=1` (base
+//!   images, named inside the uploaded Dockerfile, force-pulled). Refused under
+//!   both. A classic build's missing `FROM` image is pulled by the daemon
+//!   inside `/build`, with no request of its own: that can't be refused.
+//!
 //! Scope: this is not a Docker security boundary. It stops the common ways a
 //! container gets a network through the API; --privileged containers can still
-//! escape, and the daemon itself still reaches registries when asked to (image
-//! pull/push/import, `docker login`, build `remote=`/`pull=`), which a
-//! command can use to leak data in a registry host name or image path. It's
-//! "CI tests can use throwaway containers without those containers phoning
-//! home", not "run hostile images safely".
+//! escape, and (unless --seal-docker-pulls says otherwise) the daemon itself
+//! still reaches registries when asked to, which a command can use to leak
+//! data in a registry host name or image path. It's "CI tests can use
+//! throwaway containers without those containers phoning home", not "run
+//! hostile images safely".
 
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
+use crate::proxy::Allowlist;
 use crate::report::{Kind, Report};
 
 const MAX_HEAD: usize = 32 * 1024;
@@ -76,8 +98,8 @@ pub const SEAL_REASON: &str = "sealed with --seal-docker: containers forced to n
 
 /// Handle one connection to the sealed docker.sock. `upstream` is the real
 /// socket path (still reachable from nullroute's mount namespace).
-pub fn handle(client: UnixStream, upstream: &Path, report: &Arc<Report>) {
-    if let Err(e) = proxy(client, upstream, report) {
+pub fn handle(client: UnixStream, upstream: &Path, report: &Arc<Report>, policy: &Policy) {
+    if let Err(e) = proxy(client, upstream, report, policy) {
         // Best-effort; the client usually just sees a closed connection.
         if e.kind() != io::ErrorKind::BrokenPipe && e.kind() != io::ErrorKind::UnexpectedEof {
             eprintln!("nullroute: --seal-docker: {e}");
@@ -85,7 +107,12 @@ pub fn handle(client: UnixStream, upstream: &Path, report: &Arc<Report>) {
     }
 }
 
-fn proxy(client: UnixStream, upstream: &Path, report: &Arc<Report>) -> io::Result<()> {
+fn proxy(
+    client: UnixStream,
+    upstream: &Path,
+    report: &Arc<Report>,
+    policy: &Policy,
+) -> io::Result<()> {
     let mut client_r = BufReader::new(client.try_clone()?);
     let mut client_w = client;
     let up = UnixStream::connect(upstream)?;
@@ -134,6 +161,20 @@ fn proxy(client: UnixStream, upstream: &Path, report: &Arc<Report>) -> io::Resul
                 return Ok(());
             }
             write_error(&mut client_w, 403, b.message, body_unread)?;
+            if body_unread {
+                return Ok(());
+            }
+            continue;
+        }
+
+        if let Some(b) = policy.check(&req) {
+            report.record(Kind::Docker, &b.target, &b.why, || {
+                format!(
+                    "nullroute: --seal-docker-pulls: refused {} ({})",
+                    b.target, b.why
+                )
+            });
+            write_error(&mut client_w, 403, &b.message, body_unread)?;
             if body_unread {
                 return Ok(());
             }
@@ -671,6 +712,107 @@ impl Request {
             .is_some_and(|v| v.eq_ignore_ascii_case("close"))
     }
 
+    /// Does the body carry form parameters? Go's FormValue lets those
+    /// override the query string, so the query alone can't be trusted.
+    fn has_form_body(&self) -> bool {
+        self.headers
+            .iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+            .map(|(_, v)| v.trim().to_ascii_lowercase())
+            .any(|v| {
+                v.starts_with("application/x-www-form-urlencoded") || v.starts_with("multipart/")
+            })
+    }
+
+    /// What this request would make the daemon contact, for
+    /// --seal-docker-pulls: empty for requests that don't reach out, Err if
+    /// it does but we can't tell where (refused unless the policy is `any`).
+    ///
+    /// Fixed paths are matched by suffix, like blocked(); pushes by a final
+    /// `push` after an `images` or `plugins` segment. Manifest lookups are
+    /// matched from the first segment, since the daemon's router is anchored
+    /// there and an image name may contain anything (`docker inspect
+    /// x/distribution/y` is not a manifest lookup).
+    fn registry_reach(&self) -> Result<Vec<Reach>, &'static str> {
+        let s = self.segs();
+        let n = s.len();
+        let read = |verb, name: &str, search| Reach::Read {
+            verb,
+            name: name.to_string(),
+            registry: image_registry(name, search),
+        };
+        let other = |verb, name: &str| Reach::Other {
+            verb,
+            name: name.to_string(),
+        };
+        let is_get = self.method.eq_ignore_ascii_case("GET") || self.is_head();
+        let mut out = Vec::new();
+        if self.is_post() && ends_with(s, &["images", "create"]) {
+            if self.has_form_body() {
+                return Err("form-encoded image create parameters");
+            }
+            let q = query_params(&self.path)?;
+            // The daemon pulls if fromImage is set, else imports fromSrc:
+            // "-" is the request body, anything else a URL it downloads.
+            let images: Vec<&str> = values(&q, "fromImage").filter(|v| !v.is_empty()).collect();
+            if images.is_empty() {
+                for src in values(&q, "fromSrc").filter(|v| !v.is_empty() && *v != "-") {
+                    out.push(other(Verb::Import, src));
+                }
+            }
+            for image in images {
+                out.push(read(Verb::Pull, image, false));
+            }
+        } else if self.is_post() && ends_with(s, &["auth"]) {
+            for addr in auth_addresses(&self.body)? {
+                out.push(Reach::Read {
+                    verb: Verb::Login,
+                    registry: auth_registry(&addr),
+                    name: if addr.is_empty() {
+                        "docker.io".into()
+                    } else {
+                        addr
+                    },
+                });
+            }
+        } else if self.is_post()
+            && n >= 3
+            && s[n - 1] == "push"
+            && let Some(i) = s[..n - 2]
+                .iter()
+                .position(|x| x == "images" || x == "plugins")
+        {
+            let verb = if s[i] == "images" {
+                Verb::Push
+            } else {
+                Verb::PluginPush
+            };
+            out.push(other(verb, &s[i + 1..n - 1].join("/")));
+        } else if is_get && n >= 3 && s[0] == "distribution" && s[n - 1] == "json" {
+            out.push(read(Verb::Manifest, &s[1..n - 1].join("/"), false));
+        } else if is_get && ends_with(s, &["images", "search"]) {
+            for term in values(&query_params(&self.path)?, "term") {
+                out.push(read(Verb::Search, term, true));
+            }
+        } else if is_get && ends_with(s, &["plugins", "privileges"]) {
+            for remote in values(&query_params(&self.path)?, "remote").filter(|v| !v.is_empty()) {
+                out.push(read(Verb::PluginLookup, remote, false));
+            }
+        } else if self.is_build() {
+            // A query or body rewrite_build can't read is refused there.
+            let Ok(q) = query_params(&self.path) else {
+                return Ok(out);
+            };
+            for remote in values(&q, "remote").filter(|v| !v.is_empty()) {
+                out.push(other(Verb::RemoteBuild, remote));
+            }
+            if values(&q, "pull").any(go_bool) {
+                out.push(other(Verb::BuildPull, "base images"));
+            }
+        }
+        Ok(out)
+    }
+
     /// Rebuild the request head with the (possibly rewritten) target. With
     /// `Some(len)` Content-Length is replaced by `len`; with `None` (a streamed
     /// body) the framing headers are kept as they are.
@@ -1001,13 +1143,7 @@ fn hex(c: u8) -> Option<u8> {
 ///   query, so a `networkmode=host` there would win;
 /// - query strings Go would parse differently from us (`;`, bad escapes).
 fn rewrite_build(req: &Request) -> Result<String, &'static str> {
-    let form_body = req
-        .headers
-        .iter()
-        .filter(|(n, _)| n.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.trim().to_ascii_lowercase())
-        .any(|v| v.starts_with("application/x-www-form-urlencoded") || v.starts_with("multipart/"));
-    if form_body {
+    if req.has_form_body() {
         return Err("form-encoded build parameters can't be sealed");
     }
     let (path, query) = req.path.split_once('?').unwrap_or((&req.path, ""));
@@ -1032,6 +1168,452 @@ fn rewrite_build(req: &Request) -> Result<String, &'static str> {
     }
     kept.push("networkmode=none");
     Ok(format!("{path}?{}", kept.join("&")))
+}
+
+// ---- --seal-docker-pulls --------------------------------------------------------
+
+/// `--seal-docker-pulls`: what the Docker daemon may contact on the
+/// command's behalf (see the module docs for which requests that covers).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum PullPolicy {
+    /// Any registry or URL, as without the flag.
+    #[default]
+    Any,
+    /// Only pulls, logins and lookups from registries matched by --allow (or
+    /// a localhost registry bridged with --port); no pushes, URL imports or
+    /// remote build contexts.
+    Allowlisted,
+    /// Nothing: every request that would make the daemon contact a registry
+    /// or URL is refused.
+    #[value(name = "none")]
+    Never,
+}
+
+impl PullPolicy {
+    /// The flag value and what it means, for --inspect and --dry-run.
+    pub fn describe(self) -> &'static str {
+        match self {
+            PullPolicy::Any => "any (the daemon may contact any registry or URL)",
+            PullPolicy::Allowlisted => {
+                "allowlisted (pulls, logins and lookups only from registries in --allow; no push, URL import or remote build)"
+            }
+            PullPolicy::Never => {
+                "none (no registry or URL access: pulls, pushes, logins and lookups refused)"
+            }
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            PullPolicy::Any => "--seal-docker-pulls=any",
+            PullPolicy::Allowlisted => "--seal-docker-pulls=allowlisted",
+            PullPolicy::Never => "--seal-docker-pulls=none",
+        }
+    }
+}
+
+/// What the sealing proxy needs to apply --seal-docker-pulls.
+#[derive(Debug, Default)]
+pub struct Policy {
+    pub pulls: PullPolicy,
+    /// --allow: the registries `allowlisted` lets the daemon read from.
+    pub allow: Allowlist,
+    /// --port: localhost registries `allowlisted` lets the daemon read from.
+    pub ports: Vec<u16>,
+}
+
+/// A request --seal-docker-pulls refuses: report target and reason, and the
+/// message the Docker CLI prints.
+struct PullBlock {
+    target: String,
+    why: String,
+    message: String,
+}
+
+impl Policy {
+    /// Should this request be refused, and how?
+    fn check(&self, req: &Request) -> Option<PullBlock> {
+        if self.pulls == PullPolicy::Any {
+            return None;
+        }
+        let flag = self.pulls.flag();
+        match req.registry_reach() {
+            Ok(reach) => reach.iter().find_map(|r| self.refusal(r)),
+            Err(why) => Some(PullBlock {
+                target: "registry request".into(),
+                why: format!("{why}; {flag}"),
+                message: format!(
+                    "nullroute blocked a request that makes the Docker daemon contact a registry: {flag} couldn't tell which one ({why})."
+                ),
+            }),
+        }
+    }
+
+    fn refusal(&self, reach: &Reach) -> Option<PullBlock> {
+        let flag = self.pulls.flag();
+        let (verb, name) = match reach {
+            Reach::Read { verb, name, .. } | Reach::Other { verb, name } => (*verb, shown(name)),
+        };
+        let target = format!("{} {name}", verb.noun());
+        let doing = format!("nullroute blocked {} {name}", verb.doing());
+        if self.pulls == PullPolicy::Never {
+            return Some(PullBlock {
+                target,
+                why: flag.into(),
+                message: format!(
+                    "{doing}: {flag} doesn't let the Docker daemon contact registries or URLs for the command. Pull the images you need before running nullroute, or use --seal-docker-pulls=allowlisted with --allow REGISTRY."
+                ),
+            });
+        }
+        let registry = match reach {
+            Reach::Other { .. } => {
+                return Some(PullBlock {
+                    target,
+                    why: flag.into(),
+                    message: format!(
+                        "{doing}: {flag} only lets the Docker daemon read from registries in --allow; it never pushes, imports from a URL, builds from a remote context or force-pulls build base images (--pull). Use --seal-docker-pulls=any to allow that."
+                    ),
+                });
+            }
+            Reach::Read { registry, .. } => registry,
+        };
+        let Some(r) = registry else {
+            return Some(PullBlock {
+                target,
+                why: format!("unrecognised registry; {flag}"),
+                message: format!(
+                    "{doing}: {flag} couldn't tell which registry that names, so it can't check it against --allow."
+                ),
+            });
+        };
+        if self.allows(r) {
+            return None;
+        }
+        let shown = r.display();
+        let (why, reason, fix) = if r.is_local() {
+            (
+                format!("{shown} not bridged with --port"),
+                format!("{shown} is on this machine and its port isn't bridged with --port"),
+                format!("Add --port {}", r.port()),
+            )
+        } else if r.is_hub() {
+            (
+                "docker.io not in --allow".to_string(),
+                "Docker Hub isn't one".to_string(),
+                "Add --allow docker.io".to_string(),
+            )
+        } else {
+            (
+                format!("{shown} not in --allow"),
+                format!("{shown} isn't one"),
+                format!("Add --allow {shown}"),
+            )
+        };
+        let or_prepull = if verb == Verb::Pull {
+            ", or pull the image before running nullroute"
+        } else {
+            ""
+        };
+        Some(PullBlock {
+            target,
+            why: format!("{why}; {flag}"),
+            message: format!(
+                "{doing}: {flag} only lets the Docker daemon contact registries in --allow, and {reason}. {fix}{or_prepull}."
+            ),
+        })
+    }
+
+    /// May `allowlisted` contact this registry? By the --allow rules (port
+    /// 443 unless the reference names one); Docker Hub if --allow matches any
+    /// of its names; a localhost registry if its port is bridged with --port
+    /// (--allow never matches loopback).
+    fn allows(&self, r: &Registry) -> bool {
+        let port = r.port();
+        if r.is_local() {
+            self.ports.contains(&port)
+        } else if r.is_hub() {
+            HUB.iter().any(|h| self.allow.allows(h, port))
+        } else {
+            self.allow.allows(&r.host, port)
+        }
+    }
+}
+
+/// A request that makes the daemon reach out.
+#[derive(Debug)]
+enum Reach {
+    /// A read from a registry: `allowlisted` permits it if the registry is
+    /// allowed. `registry` is None if it can't be determined.
+    Read {
+        verb: Verb,
+        name: String,
+        registry: Option<Registry>,
+    },
+    /// A push, a download from an arbitrary URL, or a pull from registries we
+    /// can't see: `allowlisted` never permits it.
+    Other { verb: Verb, name: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Verb {
+    Pull,
+    Login,
+    Manifest,
+    Search,
+    PluginLookup,
+    Push,
+    PluginPush,
+    Import,
+    RemoteBuild,
+    BuildPull,
+}
+
+impl Verb {
+    /// Report target prefix.
+    fn noun(self) -> &'static str {
+        match self {
+            Verb::Pull => "pull",
+            Verb::Login => "login",
+            Verb::Manifest => "manifest",
+            Verb::Search => "search",
+            Verb::PluginLookup => "plugin privileges",
+            Verb::Push => "push",
+            Verb::PluginPush => "plugin push",
+            Verb::Import => "import",
+            Verb::RemoteBuild => "build remote",
+            Verb::BuildPull => "build --pull",
+        }
+    }
+
+    /// For "nullroute blocked <doing> <name>".
+    fn doing(self) -> &'static str {
+        match self {
+            Verb::Pull => "pulling",
+            Verb::Login => "logging in to",
+            Verb::Manifest => "looking up",
+            Verb::Search => "searching for",
+            Verb::PluginLookup => "looking up plugin",
+            Verb::Push => "pushing",
+            Verb::PluginPush => "pushing plugin",
+            Verb::Import => "importing from",
+            Verb::RemoteBuild => "building from",
+            Verb::BuildPull => "force-pulling (docker build --pull) the",
+        }
+    }
+}
+
+/// Docker Hub's names. Docker's reference parser maps "no host" and
+/// `index.docker.io` to `docker.io`, and the daemon pulls from
+/// `registry-1.docker.io`; all three are one registry here.
+const HUB: [&str; 3] = ["docker.io", "index.docker.io", "registry-1.docker.io"];
+
+/// A registry host as the daemon would dial it.
+#[derive(Debug, Clone, PartialEq)]
+struct Registry {
+    /// Lowercase host name, or an IP in canonical form (no brackets).
+    host: String,
+    port: Option<u16>,
+}
+
+impl Registry {
+    fn hub() -> Registry {
+        Registry {
+            host: "docker.io".into(),
+            port: None,
+        }
+    }
+
+    fn is_hub(&self) -> bool {
+        HUB.contains(&self.host.as_str())
+    }
+
+    /// Port the daemon dials (registries are HTTPS unless they say otherwise).
+    fn port(&self) -> u16 {
+        self.port.unwrap_or(443)
+    }
+
+    /// On this machine: localhost names and loopback addresses, which
+    /// --allow refuses (see proxy::Forbidden::Loopback).
+    fn is_local(&self) -> bool {
+        let h = self.host.as_str();
+        match h.parse::<IpAddr>() {
+            Ok(ip) => crate::proxy::forbidden(ip) == Some(crate::proxy::Forbidden::Loopback),
+            Err(_) => {
+                h == "localhost"
+                    || h.ends_with(".localhost")
+                    || h == "localhost.localdomain"
+                    || h == "ip6-localhost"
+                    || h == "ip6-loopback"
+            }
+        }
+    }
+
+    fn display(&self) -> String {
+        let h = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        match self.port {
+            Some(p) => format!("{h}:{p}"),
+            None => h,
+        }
+    }
+}
+
+/// The registry an image name refers to, by Docker's reference rules
+/// (distribution/reference splitDockerDomain): the part before the first `/`
+/// is a registry host only if it contains `.` or `:`, is `localhost`, or
+/// (except in a search term, see the daemon's splitReposSearchTerm) has an
+/// uppercase letter. Otherwise the image is on Docker Hub. None if the host
+/// part isn't a host name, IP or `[IPv6]` with an optional port.
+fn image_registry(name: &str, search_term: bool) -> Option<Registry> {
+    let Some((first, _)) = name.split_once('/') else {
+        return Some(Registry::hub());
+    };
+    let is_host = first.contains(['.', ':'])
+        || first == "localhost"
+        || (!search_term && first.to_lowercase() != first);
+    if is_host {
+        registry_host(first)
+    } else {
+        Some(Registry::hub())
+    }
+}
+
+/// `host`, `host:port`, `[v6]` or `[v6]:port`.
+fn registry_host(s: &str) -> Option<Registry> {
+    let (host, port) = match s.strip_prefix('[') {
+        Some(rest) => {
+            let (h, after) = rest.split_once(']')?;
+            h.parse::<std::net::Ipv6Addr>().ok()?;
+            let port = match after {
+                "" => None,
+                a => Some(a.strip_prefix(':')?),
+            };
+            (h, port)
+        }
+        None => match s.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (s, None),
+        },
+    };
+    let port = match port {
+        None => None,
+        Some(p) if !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(p.parse::<u16>().ok().filter(|&p| p != 0)?)
+        }
+        Some(_) => return None,
+    };
+    let host = host.to_ascii_lowercase();
+    if host.parse::<IpAddr>().is_err() && !crate::proxy::valid_hostname(&host) {
+        return None;
+    }
+    Some(Registry {
+        host: Allowlist::norm(&host),
+        port,
+    })
+}
+
+/// The registry a `docker login` server address names, read the way the
+/// daemon does (registry.Service.Auth): `https://` is assumed without an
+/// `http(s)://` prefix, and the host is what comes before the next `/`,
+/// `?` or `#`. Empty means Docker Hub. User info (`a@b`) and escapes are
+/// refused rather than interpreted.
+fn auth_registry(addr: &str) -> Option<Registry> {
+    if addr.is_empty() {
+        return Some(Registry::hub());
+    }
+    let rest = addr
+        .strip_prefix("https://")
+        .or_else(|| addr.strip_prefix("http://"))
+        .unwrap_or(addr);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains(['@', '%']) {
+        return None;
+    }
+    registry_host(authority)
+}
+
+/// Every `serveraddress` in a `POST /auth` body. Go matches the key
+/// case-insensitively, so all spellings are returned; none (or an empty body)
+/// means Docker Hub, returned as "".
+fn auth_addresses(body: &[u8]) -> Result<Vec<String>, &'static str> {
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(vec![String::new()]);
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| "login request body is not one JSON object")?;
+    let obj = v
+        .as_object()
+        .ok_or("login request body is not a JSON object")?;
+    let keys = keys_folding_to(obj, "serveraddress");
+    if keys.is_empty() {
+        return Ok(vec![String::new()]);
+    }
+    keys.iter()
+        .map(|k| match &obj[k] {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Null => Ok(String::new()),
+            _ => Err("login server address is not a string"),
+        })
+        .collect()
+}
+
+/// A request target's query parameters, decoded like Go's url.ParseQuery
+/// (`+` is a space). Err where Go would parse it differently or not at all.
+fn query_params(target: &str) -> Result<Vec<(String, String)>, &'static str> {
+    let query = target.split_once('?').map_or("", |(_, q)| q);
+    let mut out = Vec::new();
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        if pair.contains(';') {
+            return Err("';' in the query string");
+        }
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        let decode = |s: &str| {
+            percent_decode_strict(s, true)
+                .and_then(|b| String::from_utf8(b).ok())
+                .ok_or("invalid percent-encoding in the query string")
+        };
+        out.push((decode(k)?, decode(v)?));
+    }
+    Ok(out)
+}
+
+/// Every value of `key` (Go's keys are case-sensitive). The daemon reads
+/// only the first; checking all of them errs on the safe side.
+fn values<'a>(q: &'a [(String, String)], key: &'a str) -> impl Iterator<Item = &'a str> {
+    q.iter()
+        .filter(move |(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+}
+
+/// The daemon's httputils.BoolValue: true unless empty, 0, no, false or none.
+fn go_bool(v: &str) -> bool {
+    !matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "no" | "false" | "none"
+    )
+}
+
+/// A user-chosen name, fit for one line of stderr: control characters
+/// escaped, at most 200 characters.
+fn shown(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .take(200)
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect();
+    if s.chars().count() > 200 {
+        out.push_str("...");
+    }
+    out
 }
 
 /// An HTTP error with a JSON `{"message": ...}` the Docker CLI prints.
@@ -1296,10 +1878,15 @@ mod tests {
 
         /// Run the sealing proxy for one client connection; returns our end.
         fn client(&self) -> UnixStream {
+            self.client_with(Policy::default())
+        }
+
+        /// Like client(), with a --seal-docker-pulls policy.
+        fn client_with(&self, policy: Policy) -> UnixStream {
             let (ours, theirs) = UnixStream::pair().unwrap();
             let path = self.path.clone();
             thread::spawn(move || {
-                let _ = proxy(theirs, &path, &Report::new(true));
+                let _ = proxy(theirs, &path, &Report::new(true), &policy);
             });
             ours.set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -1995,5 +2582,583 @@ mod tests {
         // RFC 7541 C.1.2: 1337 with a 5-bit prefix; here 7-bit: 1337-127 = 1210.
         assert_eq!(&out[..3], &[127, 0xba, 0x09]);
         assert_eq!(out.len(), 3 + 1337);
+    }
+    // ---- --seal-docker-pulls ---------------------------------------------------
+
+    fn reg(host: &str, port: Option<u16>) -> Option<Registry> {
+        Some(Registry {
+            host: host.into(),
+            port,
+        })
+    }
+
+    #[test]
+    fn image_names_are_split_by_dockers_reference_rules() {
+        let hub = Some(Registry::hub());
+        for (name, want) in [
+            ("alpine", hub.clone()),
+            ("alpine:3.20", hub.clone()),
+            ("library/alpine", hub.clone()),
+            ("user/repo:tag", hub.clone()),
+            ("user/repo@sha256:0123", hub.clone()),
+            ("docker.io/library/alpine", reg("docker.io", None)),
+            (
+                "index.docker.io/library/alpine",
+                reg("index.docker.io", None),
+            ),
+            (
+                "registry-1.docker.io/x/y",
+                reg("registry-1.docker.io", None),
+            ),
+            ("localhost/x", reg("localhost", None)),
+            ("localhost:5000/x", reg("localhost", Some(5000))),
+            ("127.0.0.1:5000/x", reg("127.0.0.1", Some(5000))),
+            ("[::1]:5000/x", reg("::1", Some(5000))),
+            ("[2001:DB8::1]/x", reg("2001:db8::1", None)),
+            ("ghcr.io/a/b:tag@sha256:0123abcd", reg("ghcr.io", None)),
+            ("GHCR.IO/a/b", reg("ghcr.io", None)),
+            ("myreg:5000/a/b", reg("myreg", Some(5000))),
+            // An uppercase first component is a host (it can't be a Hub
+            // namespace, those are lowercase).
+            ("Foo/bar", reg("foo", None)),
+            // Not hosts: invalid ports, junk, a trailing dot. Refused, not guessed.
+            ("reg:abc/x", None),
+            ("reg:0/x", None),
+            ("reg:99999/x", None),
+            ("reg:/x", None),
+            ("re g.io/x", None),
+            ("reg.io./x", None),
+            ("[zz]:1/x", None),
+            ("[::1]x/y", None),
+            (".io/x", None),
+        ] {
+            assert_eq!(image_registry(name, false), want, "{name}");
+        }
+        // Search terms don't have the uppercase rule.
+        assert_eq!(image_registry("Foo/bar", true), hub);
+        assert_eq!(image_registry("ghcr.io/x", true), reg("ghcr.io", None));
+        assert!(reg("docker.io", None).unwrap().is_hub());
+        assert!(reg("registry-1.docker.io", Some(443)).unwrap().is_hub());
+        assert!(!reg("hub.docker.com", None).unwrap().is_hub());
+        for local in [
+            "localhost",
+            "a.localhost",
+            "127.0.0.2",
+            "::1",
+            "0.0.0.0",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(reg(local, None).unwrap().is_local(), "{local}");
+        }
+        assert!(!reg("10.0.0.1", None).unwrap().is_local());
+    }
+
+    #[test]
+    fn login_server_addresses_are_read_like_the_daemon() {
+        for (addr, want) in [
+            ("", Some(Registry::hub())),
+            ("https://index.docker.io/v1/", reg("index.docker.io", None)),
+            ("ghcr.io", reg("ghcr.io", None)),
+            ("http://myreg:5000/v2/x?y#z", reg("myreg", Some(5000))),
+            ("https://GHCR.io", reg("ghcr.io", None)),
+            ("localhost:5000", reg("localhost", Some(5000))),
+            // Ambiguous ones are refused.
+            ("https://ghcr.io@evil.example", None),
+            ("evil.example%2fghcr.io", None),
+            ("HTTPS://ghcr.io", None),
+            ("https://", None),
+        ] {
+            assert_eq!(auth_registry(addr), want, "{addr}");
+        }
+        let addrs = |b: &str| auth_addresses(b.as_bytes());
+        assert_eq!(addrs("").unwrap(), [""]);
+        assert_eq!(addrs(r#"{"username":"u"}"#).unwrap(), [""]);
+        assert_eq!(
+            addrs(r#"{"serveraddress":"ghcr.io"}"#).unwrap(),
+            ["ghcr.io"]
+        );
+        let mut both =
+            addrs(r#"{"ServerAddress":"ghcr.io","SERVERADDRESS":"evil.example"}"#).unwrap();
+        both.sort();
+        assert_eq!(both, ["evil.example", "ghcr.io"]);
+        assert!(addrs(r#"{"serveraddress":1}"#).is_err());
+        assert!(addrs(r#"{"serveraddress":"a"} trailing"#).is_err());
+        assert!(addrs("[]").is_err());
+    }
+
+    #[test]
+    fn query_params_decode_like_go() {
+        let q = query_params("/images/create?fromImage=ghcr%2Eio%2Fa+b&tag=1&&x").unwrap();
+        assert_eq!(
+            q,
+            [
+                ("fromImage".to_string(), "ghcr.io/a b".to_string()),
+                ("tag".to_string(), "1".to_string()),
+                ("x".to_string(), String::new()),
+            ]
+        );
+        assert!(query_params("/x?a=%zz").is_err());
+        assert!(query_params("/x?a=1;b=2").is_err());
+        assert!(query_params("/x?a=%ff").is_err());
+        assert!(go_bool("1") && go_bool("True") && go_bool("yes"));
+        assert!(!go_bool("") && !go_bool("0") && !go_bool("FALSE") && !go_bool("none"));
+    }
+
+    fn policy(pulls: PullPolicy, allow: &[&str], ports: &[u16]) -> Policy {
+        let allow: Vec<String> = allow.iter().map(|s| s.to_string()).collect();
+        Policy {
+            pulls,
+            allow: Allowlist::parse(&allow).unwrap(),
+            ports: ports.to_vec(),
+        }
+    }
+
+    /// The report target of the refusal, or None if the request passes.
+    fn decide(
+        p: &Policy,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> Option<String> {
+        let h = headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect();
+        let mut r = Request::new(method, path, "HTTP/1.1", h);
+        r.body = body.as_bytes().to_vec();
+        p.check(&r).map(|b| {
+            assert!(b.message.contains("--seal-docker-pulls"), "{}", b.message);
+            assert!(b.why.contains("--seal-docker-pulls"), "{}", b.why);
+            b.target
+        })
+    }
+
+    #[test]
+    fn pull_policy_decision_table() {
+        use PullPolicy::*;
+        // (method, path, body, any, allowlisted with --allow ghcr.io + --port 5000, none)
+        // true = allowed.
+        let rows: &[(&str, &str, &str, bool, bool, bool)] = &[
+            // pulls
+            (
+                "POST",
+                "/v1.56/images/create?fromImage=ghcr.io%2Fa%2Fb&tag=1",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=ghcr.io/a/b:t@sha256:00",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=GHCR.IO/a",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=quay.io/a/b",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=alpine&tag=latest",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=docker.io/library/alpine",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=localhost:5000/x",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=localhost:5001/x",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=ghcr.io/a&fromImage=quay.io/b",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=reg:bad/x",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromImage=ghcr.io%2",
+                "",
+                true,
+                false,
+                false,
+            ),
+            // imports
+            (
+                "POST",
+                "/images/create?fromSrc=-&repo=x",
+                "",
+                true,
+                true,
+                true,
+            ),
+            ("POST", "/images/create?repo=x", "", true, true, true),
+            (
+                "POST",
+                "/images/create?fromSrc=https://ghcr.io/x.tar",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/images/create?fromSrc=evil.example",
+                "",
+                true,
+                false,
+                false,
+            ),
+            // push
+            (
+                "POST",
+                "/v1.56/images/ghcr.io/a/b/push?tag=1",
+                "",
+                true,
+                false,
+                false,
+            ),
+            ("POST", "/plugins/ghcr.io/p/push", "", true, false, false),
+            // login
+            (
+                "POST",
+                "/v1.56/auth",
+                r#"{"username":"u","serveraddress":"ghcr.io"}"#,
+                true,
+                true,
+                false,
+            ),
+            (
+                "POST",
+                "/auth",
+                r#"{"username":"u","serveraddress":"https://quay.io/v2/"}"#,
+                true,
+                false,
+                false,
+            ),
+            ("POST", "/auth", r#"{"username":"u"}"#, true, false, false),
+            ("POST", "/auth", "not json", true, false, false),
+            // manifest lookup, search, plugin privileges
+            (
+                "GET",
+                "/v1.56/distribution/ghcr.io/a/b:1/json",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "GET",
+                "/distribution/ghcr.io%2Fa/json",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "GET",
+                "/distribution/quay.io/a/json",
+                "",
+                true,
+                false,
+                false,
+            ),
+            ("GET", "/distribution/alpine/json", "", true, false, false),
+            (
+                "GET",
+                "/images/search?term=ghcr.io/x",
+                "",
+                true,
+                true,
+                false,
+            ),
+            ("GET", "/images/search?term=alpine", "", true, false, false),
+            (
+                "GET",
+                "/plugins/privileges?remote=ghcr.io/p",
+                "",
+                true,
+                true,
+                false,
+            ),
+            (
+                "GET",
+                "/plugins/privileges?remote=vieux/sshfs",
+                "",
+                true,
+                false,
+                false,
+            ),
+            // builds
+            ("POST", "/build?t=x", "", true, true, true),
+            (
+                "POST",
+                "/build?remote=https://ghcr.io/ctx.tar",
+                "",
+                true,
+                false,
+                false,
+            ),
+            (
+                "POST",
+                "/build?remote=git%40github.com%3Ax%2Fy.git",
+                "",
+                true,
+                false,
+                false,
+            ),
+            ("POST", "/build?pull=1", "", true, false, false),
+            ("POST", "/build?pull=0", "", true, true, true),
+            // unrelated requests never reach out
+            ("GET", "/images/ghcr.io/a/json", "", true, true, true),
+            ("GET", "/images/x/distribution/y/json", "", true, true, true),
+            (
+                "POST",
+                "/images/ghcr.io/a/tag?repo=quay.io/b",
+                "",
+                true,
+                true,
+                true,
+            ),
+            ("POST", "/containers/create", "{}", true, true, true),
+            (
+                "GET",
+                "/images/create?fromImage=quay.io/a",
+                "",
+                true,
+                true,
+                true,
+            ),
+        ];
+        let any = policy(Any, &[], &[]);
+        let allowlisted = policy(Allowlisted, &["ghcr.io"], &[5000]);
+        let none = policy(Never, &["ghcr.io"], &[5000]);
+        for &(m, path, body, a, al, n) in rows {
+            for (p, want) in [(&any, a), (&allowlisted, al), (&none, n)] {
+                assert_eq!(
+                    decide(p, m, path, &[], body).is_none(),
+                    want,
+                    "{:?} {m} {path} {body}",
+                    p.pulls
+                );
+            }
+        }
+        // A form body could override the query string: refused.
+        let form = [("Content-Type", "application/x-www-form-urlencoded")];
+        assert!(
+            decide(
+                &allowlisted,
+                "POST",
+                "/images/create?fromImage=ghcr.io/a",
+                &form,
+                "fromImage=quay.io/b"
+            )
+            .is_some()
+        );
+        assert!(
+            decide(
+                &any,
+                "POST",
+                "/images/create?fromImage=ghcr.io/a",
+                &form,
+                ""
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn docker_hub_is_one_registry_under_any_of_its_names() {
+        let hub_refs = [
+            "/images/create?fromImage=alpine",
+            "/images/create?fromImage=library/alpine",
+            "/images/create?fromImage=docker.io/library/alpine",
+            "/images/create?fromImage=index.docker.io/library/alpine",
+            "/images/create?fromImage=registry-1.docker.io/library/alpine",
+        ];
+        for allow in [
+            "docker.io",
+            "index.docker.io",
+            "registry-1.docker.io",
+            "*.docker.io",
+            "docker.io:443",
+        ] {
+            let p = policy(PullPolicy::Allowlisted, &[allow], &[]);
+            for path in hub_refs {
+                assert_eq!(
+                    decide(&p, "POST", path, &[], ""),
+                    None,
+                    "--allow {allow}: {path}"
+                );
+            }
+            assert_eq!(decide(&p, "POST", "/auth", &[], "{}"), None);
+            let body = r#"{"serveraddress":"https://index.docker.io/v1/"}"#;
+            assert_eq!(decide(&p, "POST", "/auth", &[], body), None);
+        }
+        let p = policy(
+            PullPolicy::Allowlisted,
+            &["docker.io:5000", "hub.docker.com"],
+            &[],
+        );
+        for path in hub_refs {
+            assert_eq!(
+                decide(&p, "POST", path, &[], "").as_deref(),
+                Some(&*format!("pull {}", path.split('=').nth(1).unwrap()))
+            );
+        }
+    }
+
+    #[test]
+    fn refusals_name_the_registry_and_how_to_allow_it() {
+        let msg = |p: &Policy, path: &str| {
+            p.check(&req("POST", path))
+                .map(|b| (b.target, b.why, b.message))
+                .unwrap()
+        };
+        let p = policy(PullPolicy::Allowlisted, &[], &[]);
+        let (t, why, m) = msg(&p, "/images/create?fromImage=ghcr.io/nonexistent/x");
+        assert_eq!(t, "pull ghcr.io/nonexistent/x");
+        assert_eq!(
+            why,
+            "ghcr.io not in --allow; --seal-docker-pulls=allowlisted"
+        );
+        assert!(
+            m.contains("nullroute blocked pulling ghcr.io/nonexistent/x")
+                && m.contains("Add --allow ghcr.io, or pull the image"),
+            "{m}"
+        );
+        let (_, _, m) = msg(&p, "/images/create?fromImage=alpine");
+        assert!(m.contains("--allow docker.io"), "{m}");
+        let (_, why, m) = msg(&p, "/images/create?fromImage=localhost:5000/x");
+        assert!(
+            why.contains("not bridged with --port") && m.contains("--port 5000"),
+            "{m}"
+        );
+        let (t, _, m) = msg(&p, "/images/x/push");
+        assert_eq!(t, "push x");
+        assert!(m.contains("never pushes"), "{m}");
+        let p = policy(PullPolicy::Never, &["ghcr.io"], &[]);
+        let (_, why, m) = msg(&p, "/images/create?fromImage=ghcr.io/a");
+        assert_eq!(why, "--seal-docker-pulls=none");
+        assert!(m.contains("--seal-docker-pulls=none"), "{m}");
+        // Names are user-chosen: control characters are escaped, length capped.
+        let long = "a".repeat(500);
+        let (t, _, _) = msg(&p, &format!("/images/create?fromImage=x%0a{long}"));
+        assert!(
+            !t.contains('\n') && t.contains("x\\n") && t.len() < 230,
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn refused_pull_never_reaches_the_daemon_and_connection_stays_usable() {
+        let d = FakeDaemon::start("pull");
+        let mut c = d.client_with(policy(PullPolicy::Allowlisted, &["ghcr.io"], &[]));
+        let all = http(
+            "POST",
+            "/v1.56/images/create?fromImage=quay.io%2Fx&tag=1",
+            "",
+            "",
+        ) + &http(
+            "POST",
+            "/v1.56/images/create?fromImage=ghcr.io%2Fx&tag=1",
+            "",
+            "",
+        ) + &http("POST", "/v1.56/containers/create", "", HOST_CREATE);
+        c.write_all(all.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 3);
+        assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+        assert!(out.contains("--seal-docker-pulls=allowlisted"), "{out}");
+        assert_eq!(out.matches("HTTP/1.1 404").count(), 2, "{out}");
+        drop(c);
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert!(reqs[0].1.contains("ghcr.io"), "{reqs:?}");
+        assert_creates_sealed(&reqs);
+    }
+
+    #[test]
+    fn refused_remote_build_closes_the_connection_without_reading_the_body() {
+        let d = FakeDaemon::start("remote");
+        let mut c = d.client_with(policy(PullPolicy::Never, &[], &[]));
+        let both = http(
+            "POST",
+            "/v1.56/build?remote=https%3A%2F%2Fevil.example%2Fx",
+            "Content-Type: application/x-tar\r\n",
+            "TARS",
+        ) + &http("POST", "/containers/create", "", HOST_CREATE);
+        c.write_all(both.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 2);
+        assert!(out.starts_with("HTTP/1.1 403"), "{out}");
+        assert!(out.contains("Connection: close"), "{out}");
+        assert_eq!(out.matches("HTTP/1.1 ").count(), 1, "{out}");
+        drop(c);
+        assert!(d.requests().is_empty());
+    }
+
+    #[test]
+    fn default_policy_changes_nothing() {
+        let d = FakeDaemon::start("any");
+        let mut c = d.client();
+        let all = http("POST", "/images/create?fromImage=quay.io%2Fx", "", "")
+            + &http("POST", "/images/x/push", "", "")
+            + &http("POST", "/auth", "", r#"{"serveraddress":"evil.example"}"#)
+            + &http(
+                "POST",
+                "/build?remote=x&pull=1",
+                "Content-Type: application/x-tar\r\n",
+                "",
+            );
+        c.write_all(all.as_bytes()).unwrap();
+        let out = read_responses(&mut c, 4);
+        assert_eq!(out.matches("HTTP/1.1 404").count(), 4, "{out}");
+        drop(c);
+        assert_eq!(d.requests().len(), 4);
     }
 }

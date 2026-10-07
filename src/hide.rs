@@ -135,6 +135,8 @@ const EXPLICIT_REASON: &str = "hidden with --hide-socket";
 pub struct Plan {
     dir: PathBuf,
     decoys: Vec<Decoy>,
+    /// --seal-docker-pulls and what it checks against, for sealed sockets.
+    docker: Arc<crate::docker::Policy>,
 }
 
 /// (decoy path, target path) pairs for the child, allocated before fork.
@@ -210,6 +212,7 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
     let mut plan = Plan {
         dir,
         decoys: Vec::new(),
+        docker: Arc::default(),
     };
     for (i, (target, (mode, reason))) in targets.into_iter().enumerate() {
         let listener = UnixListener::bind(plan.dir.join(format!("decoy-{i}.sock")))?;
@@ -251,6 +254,11 @@ impl Plan {
             .map(|d| d.target.as_path())
     }
 
+    /// Set the --seal-docker-pulls policy sealed sockets apply.
+    pub fn set_docker_policy(&mut self, policy: crate::docker::Policy) {
+        self.docker = Arc::new(policy);
+    }
+
     /// Start answering connections on the decoys. Call after spawn.
     pub fn start(&self, report: &Arc<Report>) -> io::Result<()> {
         for d in &self.decoys {
@@ -259,11 +267,13 @@ impl Plan {
             let reason = d.reason;
             let mode = d.mode;
             let report = report.clone();
+            let docker = self.docker.clone();
             thread::spawn(move || {
                 for conn in listener.incoming() {
                     let Ok(conn) = conn else { continue };
                     let target = target.clone();
                     let report = report.clone();
+                    let docker = docker.clone();
                     match mode {
                         Mode::Block => {
                             let t = target.display().to_string();
@@ -273,7 +283,9 @@ impl Plan {
                             thread::spawn(move || answer(conn, &target, reason));
                         }
                         Mode::SealDocker => {
-                            thread::spawn(move || crate::docker::handle(conn, &target, &report));
+                            thread::spawn(move || {
+                                crate::docker::handle(conn, &target, &report, &docker)
+                            });
                         }
                     }
                 }

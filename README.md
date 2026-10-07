@@ -168,7 +168,7 @@ nullroute: blocked 7 attempts to reach 2 targets:
 | `socket` | a connection to a hidden socket | yes |
 | `proxy` | a proxy request to a host that isn't allowed | yes |
 | `dns` | a lookup of a name that isn't allowed, or a relay the sinkhole refused | yes |
-| `docker` | a Docker API request `--seal-docker` refused | yes |
+| `docker` | a Docker API request `--seal-docker` (or `--seal-docker-pulls`) refused | yes |
 | `rewritten` | a request `--seal-docker` changed and let through (a container create forced onto `NetworkMode=none`, or a classic `docker build` forced onto `networkmode=none`) | no |
 
 `rewritten` entries are listed after the blocks, under their own heading
@@ -242,6 +242,7 @@ nullroute: inspect: sandbox topology
 | `bridged ports` | `--port` values (sorted, deduplicated), or `none`. |
 | `blocked (403 decoy)` | Sockets replaced by a decoy that answers `403` (defaults + `--hide-socket`, minus `--allow-socket`). |
 | `sealed (--seal-docker proxy)` | Docker sockets proxied with containers forced to `NetworkMode=none`. |
+| `docker pulls` | The `--seal-docker-pulls` mode (only shown when a socket is sealed). `--dry-run` prints it too. |
 | `masked (resolver bypass)` | Local resolver sockets (systemd-resolved varlink, nscd) replaced by an unconnectable file, always. |
 | `upstream proxy` | Where the `--allow` proxy listens inside the sandbox, and the allowed hosts, or `none`. |
 | `dns sinkhole` | The resolver address and each allowed name's synthetic address and relayed ports, or `none` (no `--allow` host names, or `--no-dns`). |
@@ -302,7 +303,14 @@ it can't take back:
 ```bash
 nullroute run --seal-docker -- pytest        # tests may start containers; none get network
 nullroute run --seal-docker-socket /custom/docker.sock -- ...   # non-standard path
+nullroute run --seal-docker --seal-docker-pulls none -- pytest  # and the daemon pulls nothing either
 ```
+
+| Flag | Effect |
+|---|---|
+| `--seal-docker` | Seal the standard Docker socket paths (`/var/run/docker.sock`, rootless, Docker Desktop, `DOCKER_HOST=unix://`). |
+| `--seal-docker-socket PATH` | Seal this Docker API socket (repeatable). |
+| `--seal-docker-pulls MODE` | What the Docker daemon may contact for the command: `any` (default), `allowlisted` or `none`. See [Registry access](#registry-access---seal-docker-pulls). Needs `--seal-docker` or `--seal-docker-socket` (exit 2 otherwise). |
 
 The sealed container still runs and can mount volumes, but it has no network at
 all: not the internet, not other containers, and not the host's `--port`
@@ -333,7 +341,7 @@ DOCKER_BUILDKIT=0 nullroute run --seal-docker -- docker build -t myimage .
 
 The classic builder doesn't support BuildKit-only Dockerfile syntax (`RUN
 --mount`, heredocs, ...). Its `FROM` images must already be present or
-pullable (see below).
+pullable (see below; `--seal-docker-pulls` can't stop that pull).
 
 Requests are matched on the path the daemon routes: percent-decoded, with
 `//`, `.` and `..` resolved, any `/vX.Y` prefix and query string ignored. A
@@ -359,18 +367,86 @@ sockets speak a different protocol and are still hidden (not sealed) by default.
 The Docker daemon itself still has network, and some requests make it reach out
 on the command's behalf. Each one sends a host name (and a path) the command
 chose to the network, so it can carry data out even though no container has a
-network:
+network. By default (`--seal-docker-pulls=any`) `--seal-docker` lets them
+through unchanged; `--seal-docker-pulls` can refuse them (next section).
 
-- image pulls (`POST /images/create`, `docker pull`, `docker run` of a missing
-  image, `docker build --pull`, classic-builder `FROM` images that aren't
-  present), including the registry's DNS lookup;
-- image pushes (`docker push`) and imports from a URL (`docker import URL`);
-- registry logins (`docker login`, `POST /auth`) and manifest lookups
-  (`/distribution/{name}/json`);
-- builds from a remote context (`docker build https://...`, `remote=`).
+Still open in every mode:
 
-`--seal-docker` lets these through unchanged. If that matters, pre-pull the
-images you need and don't rely on `--seal-docker` alone.
+- a classic `docker build` whose `FROM` image isn't present: the daemon pulls
+  it inside the `/build` request (no request of its own to refuse, and the
+  image is named in the uploaded Dockerfile). Pre-pull base images;
+- registry mirrors configured on the daemon (`registry-mirrors`): a Docker Hub
+  pull goes to the mirror, and the registry's own redirects (token service,
+  blob CDN) are followed as the daemon sees fit;
+- the daemon resolves allowed registry names itself, on the host's DNS;
+- logging drivers that ship container logs over the network (`--log-driver
+  syslog|gelf|fluentd|splunk|...` with a remote address) and `local` volumes
+  backed by NFS/CIFS (`--opt type=nfs,o=addr=HOST`): the daemon or kernel
+  connects to a host the command chose. Not covered by `--seal-docker` at all.
+
+#### Registry access: `--seal-docker-pulls`
+
+```bash
+nullroute run --seal-docker --seal-docker-pulls none -- pytest
+nullroute run --seal-docker --seal-docker-pulls allowlisted --allow ghcr.io,docker.io -- pytest
+```
+
+| Request | `any` (default) | `allowlisted` | `none` |
+|---|---|---|---|
+| image pull (`POST /images/create?fromImage=`: `docker pull`, `docker run`/`create` of a missing image, compose) | allowed | if the registry is allowed | refused |
+| `docker login` (`POST /auth`, the body's `serveraddress`) | allowed | if the registry is allowed | refused |
+| manifest lookup (`GET /distribution/{name}/json`) | allowed | if the registry is allowed | refused |
+| `docker search` (`GET /images/search`) | allowed | if the registry is allowed | refused |
+| plugin privileges (`GET /plugins/privileges`; installing a plugin is refused anyway) | allowed | if the registry is allowed | refused |
+| `docker push`, `docker plugin push` | allowed | refused | refused |
+| import from a URL (`POST /images/create?fromSrc=URL`); `fromSrc=-` (stdin) is local and always allowed | allowed | refused | refused |
+| classic build from a remote context (`POST /build?remote=`) | allowed (sealed) | refused | refused |
+| classic `docker build --pull` (`pull=1`: force-pull base images nullroute can't see) | allowed (sealed) | refused | refused |
+| classic build `FROM` an image that isn't present | pulled | **pulled** (can't be refused) | **pulled** (can't be refused) |
+| `docker run` / classic build of images already present | allowed | allowed | allowed |
+
+Refusals are `403`s the Docker CLI prints, naming the flag, and `docker`
+entries in the report (so `--strict` fails):
+
+```text
+$ nullroute run --seal-docker --seal-docker-pulls allowlisted -- docker pull ghcr.io/acme/tool
+nullroute: --seal-docker-pulls: refused pull ghcr.io/acme/tool (ghcr.io not in --allow; --seal-docker-pulls=allowlisted)
+Error response from daemon: nullroute blocked pulling ghcr.io/acme/tool: --seal-docker-pulls=allowlisted only lets the Docker daemon contact registries in --allow, and ghcr.io isn't one. Add --allow ghcr.io, or pull the image before running nullroute.
+```
+
+Allowed requests aren't listed in the report. How `allowlisted` decides:
+
+- **Which registry.** Image names follow Docker's reference rules: the part
+  before the first `/` is a registry only if it contains `.` or `:`, is
+  `localhost`, or has an uppercase letter; otherwise the image is on Docker
+  Hub (`alpine`, `library/alpine`, `user/repo`). `ghcr.io/a/b:tag@sha256:...`
+  is `ghcr.io`; `localhost:5000/x` is `localhost` port 5000. A name whose
+  registry part isn't a valid host (bad port, stray characters) is refused.
+- **Matching.** The registry host is checked against `--allow` with the usual
+  rules (case-insensitive, `*.example.com` for subdomains, `:port`). Without
+  a port in the image name the port is 443, so `--allow ghcr.io` and
+  `--allow ghcr.io:443` both allow `ghcr.io/...`, and `myreg:5000/x` needs
+  `--allow myreg` or `--allow myreg:5000`.
+- **Docker Hub** is one registry under any of its names: images without a
+  registry, `docker.io/...`, `index.docker.io/...` and
+  `registry-1.docker.io/...` (and `docker login` with no server or
+  `https://index.docker.io/v1/`) are allowed if `--allow` matches any of
+  `docker.io`, `index.docker.io` or `registry-1.docker.io` (so
+  `--allow docker.io` or `--allow '*.docker.io'` both work).
+  Other hosts such as `hub.docker.com` only match themselves.
+- **Local registries** (`localhost`, `*.localhost`, loopback IPs) can't be in
+  `--allow`; a local registry is allowed when its port is bridged with
+  `--port` (`--port 5000` for `localhost:5000/x`), since the command can
+  reach it then anyway.
+- `allowlisted` only lets the daemon *read* from allowed registries: pushes,
+  URL imports, remote build contexts and `build --pull` are refused whatever
+  `--allow` says. Use `any` for those.
+- Query strings are decoded like the daemon does; one it would read differently
+  (`;`, bad escapes) or form-encoded parameters in the body are refused.
+
+Recent Docker CLIs fetch `docker build https://...` and git contexts
+themselves (inside the sandbox, under its network rules) and send the daemon a
+plain build, so `remote=` only comes from other API clients.
 
 ## Status: v0.7, Linux only
 
@@ -384,7 +460,8 @@ images you need and don't rely on `--seal-docker` alone.
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
 | Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes and the system D-Bus |
 | Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
-| Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); not a boundary for hostile images, and the daemon can still pull images |
+| Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); not a boundary for hostile images |
+| Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
 | Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |
 | Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy, DNS and socket blocks; not direct IP connects |
