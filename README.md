@@ -1,5 +1,7 @@
 # nullroute
 
+[![CI](https://github.com/benmckibben/nullroute/actions/workflows/ci.yml/badge.svg)](https://github.com/benmckibben/nullroute/actions/workflows/ci.yml)
+
 Run a command with outbound network access sealed off. Language-agnostic: it
 works the same for `pytest`, `go test`, `cargo test`, `npm test` or any binary,
 with no code changes, fixtures or monkeypatching.
