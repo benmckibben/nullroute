@@ -21,6 +21,9 @@ pub struct Topology {
     pub blocked: Vec<PathBuf>,
     /// Docker sockets replaced by a sealing proxy (`--seal-docker`).
     pub sealed: Vec<PathBuf>,
+    /// Resolver bypass sockets (resolved varlink, nscd) masked with an
+    /// unconnectable file, in every sandbox.
+    pub masked: Vec<PathBuf>,
     /// Port of the `--allow` proxy inside the sandbox, and the allowed hosts.
     pub proxy: Option<(u16, Vec<String>)>,
     /// DNS sinkhole mapping lines (host -> synthetic address, ports), if on.
@@ -33,6 +36,7 @@ impl Topology {
         plan: Option<&hide::Plan>,
         proxy: Option<(u16, Vec<String>)>,
         dns: Option<&dns::Plan>,
+        masked: &[PathBuf],
     ) -> Self {
         let (blocked, sealed) = match plan {
             None => (Vec::new(), Vec::new()),
@@ -42,10 +46,13 @@ impl Topology {
             ),
         };
         Topology {
-            ns_flags: sandbox::namespace_flags(plan.is_some() || dns.is_some()),
+            ns_flags: sandbox::namespace_flags(
+                plan.is_some() || dns.is_some() || !masked.is_empty(),
+            ),
             ports: ports.to_vec(),
             blocked,
             sealed,
+            masked: masked.to_vec(),
             proxy,
             dns: dns.map(dns::Plan::describe),
         }
@@ -87,6 +94,7 @@ impl Topology {
         let _ = writeln!(s, "  unix sockets:");
         list(&mut s, "blocked (403 decoy)", &self.blocked);
         list(&mut s, "sealed (--seal-docker proxy)", &self.sealed);
+        list(&mut s, "masked (resolver bypass)", &self.masked);
         match &self.proxy {
             None => {
                 let _ = writeln!(s, "  upstream proxy:  none");
@@ -139,6 +147,7 @@ mod tests {
             ports: vec![],
             blocked: vec![],
             sealed: vec![],
+            masked: vec![],
             proxy: None,
             dns: None,
         }
@@ -154,6 +163,7 @@ mod tests {
             "  unix sockets:",
             "    blocked (403 decoy): none",
             "    sealed (--seal-docker proxy): none",
+            "    masked (resolver bypass): none",
             "  upstream proxy:  none",
             "  dns sinkhole:    none",
             "",
@@ -174,11 +184,25 @@ mod tests {
 
     #[test]
     fn new_without_plan_has_no_mount_namespace_or_sockets() {
-        let t = Topology::new(&[80, 443], None, None, None);
+        let t = Topology::new(&[80, 443], None, None, None, &[]);
         assert_eq!(t.namespaces(), vec!["user", "net"]);
-        assert!(t.blocked.is_empty() && t.sealed.is_empty());
+        assert!(t.blocked.is_empty() && t.sealed.is_empty() && t.masked.is_empty());
         assert_eq!(t.ports, vec![80, 443]);
         assert!(t.render().contains("  bridged ports:   80, 443\n"));
+    }
+
+    #[test]
+    fn masked_resolver_sockets_are_listed_and_add_mount_namespace() {
+        let sock = PathBuf::from("/run/systemd/resolve/io.systemd.Resolve");
+        let t = Topology::new(&[], None, None, None, std::slice::from_ref(&sock));
+        assert_eq!(t.namespaces(), vec!["user", "net", "mount"]);
+        assert!(
+            t.render().contains(
+                "    masked (resolver bypass):\n      /run/systemd/resolve/io.systemd.Resolve\n"
+            ),
+            "{}",
+            t.render()
+        );
     }
 
     #[test]
@@ -188,6 +212,7 @@ mod tests {
             ports: vec![5432, 6379],
             blocked: vec!["/run/podman/podman.sock".into(), "/tmp/a.sock".into()],
             sealed: vec!["/run/docker.sock".into()],
+            masked: vec![],
             proxy: Some((3128, vec!["api.github.com".into(), "*.stripe.dev".into()])),
             dns: Some(vec!["api.github.com -> 127.77.0.1 (ports 80, 443)".into()]),
         };
@@ -219,7 +244,7 @@ mod tests {
     fn dns_sinkhole_lists_mapping_and_adds_mount_namespace() {
         let allow = crate::proxy::Allowlist::parse(&["db.example.com:5432".to_string()]).unwrap();
         let plan = dns::Plan::new(&allow).unwrap().unwrap();
-        let t = Topology::new(&[], None, None, Some(&plan));
+        let t = Topology::new(&[], None, None, Some(&plan), &[]);
         assert_eq!(t.namespaces(), vec!["user", "net", "mount"]);
         let out = t.render();
         assert!(

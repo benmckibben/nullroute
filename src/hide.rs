@@ -17,8 +17,14 @@
 //! unmounting needs CAP_SYS_ADMIN. Mounts are only changed inside the new mount
 //! namespace; the host's filesystem is untouched.
 //!
-//! By default the well-known container-runtime sockets are hidden. `--hide-socket`
-//! adds more and `--allow-socket` keeps one visible.
+//! By default the well-known container-runtime sockets and the system D-Bus
+//! socket are hidden. `--hide-socket` adds more and `--allow-socket` keeps one
+//! visible.
+//!
+//! D-Bus is hidden because the system bus reaches host services that live
+//! outside the network namespace. The obvious one is systemd-resolved
+//! (`org.freedesktop.resolve1`), which would happily resolve any name on the
+//! command's behalf: a DNS side channel straight past the sandbox.
 
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -33,9 +39,49 @@ use std::time::Duration;
 
 use crate::report::{Kind, Report, json_string};
 
-/// Sockets hidden unless `--allow-socket`ed: container runtimes, whose
-/// daemons can start network-connected containers on the command's behalf.
-pub fn default_sockets() -> Vec<PathBuf> {
+/// Sockets hidden unless `--allow-socket`ed, each with why: container
+/// runtimes, whose daemons can start network-connected containers on the
+/// command's behalf, and the system D-Bus, whose services (systemd-resolved)
+/// can resolve names outside the sandbox.
+pub fn default_sockets() -> Vec<(PathBuf, &'static str)> {
+    let mut v: Vec<(PathBuf, &'static str)> = runtime_sockets()
+        .into_iter()
+        .map(|p| (p, RUNTIME_REASON))
+        .collect();
+    v.extend(dbus_system_sockets().into_iter().map(|p| (p, DBUS_REASON)));
+    v
+}
+
+/// The system bus socket, at its standard paths and wherever
+/// DBUS_SYSTEM_BUS_ADDRESS points (`unix:path=...`).
+pub fn dbus_system_sockets() -> Vec<PathBuf> {
+    let mut v = vec![
+        PathBuf::from(DBUS_SYSTEM_SOCKET),
+        PathBuf::from("/var/run/dbus/system_bus_socket"),
+    ];
+    if let Ok(addr) = std::env::var("DBUS_SYSTEM_BUS_ADDRESS") {
+        v.extend(dbus_address_paths(&addr));
+    }
+    v
+}
+
+/// Socket paths in a D-Bus address: a ;-separated list of
+/// `transport:key=value,...`, of which `unix:path=...` names a file.
+/// (Abstract sockets are scoped to the network namespace, so they don't matter.)
+fn dbus_address_paths(addr: &str) -> Vec<PathBuf> {
+    addr.split(';')
+        .filter_map(|t| t.strip_prefix("unix:"))
+        .flat_map(|params| params.split(','))
+        .filter_map(|kv| kv.strip_prefix("path="))
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Where the system D-Bus listens on practically every distribution.
+pub const DBUS_SYSTEM_SOCKET: &str = "/run/dbus/system_bus_socket";
+
+fn runtime_sockets() -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = [
         "/var/run/docker.sock",
         "/run/docker.sock",
@@ -82,6 +128,7 @@ struct Decoy {
 }
 
 const RUNTIME_REASON: &str = "container runtimes can start containers with full network access";
+const DBUS_REASON: &str = "the system D-Bus reaches host services such as systemd-resolved, which resolve names outside the sandbox";
 const EXPLICIT_REASON: &str = "hidden with --hide-socket";
 
 /// What to hide, with decoys already listening. Removes its temp dir on drop.
@@ -105,9 +152,9 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
         std::collections::BTreeMap::new();
     let candidates = default_sockets()
         .into_iter()
-        .map(|p| (p, false))
-        .chain(extra.iter().cloned().map(|p| (p, true)));
-    for (path, explicit) in candidates {
+        .map(|(p, why)| (p, why, false))
+        .chain(extra.iter().cloned().map(|p| (p, EXPLICIT_REASON, true)));
+    for (path, default_reason, explicit) in candidates {
         let Ok(canon) = std::fs::canonicalize(&path) else {
             if explicit {
                 eprintln!(
@@ -132,12 +179,9 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
         if sealed.contains(&canon) || allowed.contains(&canon) {
             continue; // sealed ones are added below; allowed ones stay visible
         }
-        let reason = if explicit {
-            EXPLICIT_REASON
-        } else {
-            RUNTIME_REASON
-        };
-        let r = targets.entry(canon).or_insert((Mode::Block, reason));
+        let r = targets
+            .entry(canon)
+            .or_insert((Mode::Block, default_reason));
         if explicit {
             *r = (Mode::Block, EXPLICIT_REASON);
         }
@@ -312,4 +356,56 @@ pub fn apply_in_child(mounts: &MountList) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_dbus_is_hidden_by_default_with_its_own_reason() {
+        let d = default_sockets();
+        assert!(
+            d.iter()
+                .any(|(p, why)| p == Path::new(DBUS_SYSTEM_SOCKET) && *why == DBUS_REASON),
+            "{d:?}"
+        );
+        assert!(
+            d.iter()
+                .any(|(p, why)| p == Path::new("/var/run/docker.sock") && *why == RUNTIME_REASON)
+        );
+    }
+
+    #[test]
+    fn dbus_address_paths_are_parsed() {
+        assert_eq!(
+            dbus_address_paths("unix:path=/run/dbus/system_bus_socket"),
+            vec![PathBuf::from("/run/dbus/system_bus_socket")]
+        );
+        assert_eq!(
+            dbus_address_paths("unix:abstract=/tmp/x;unix:guid=1,path=/a/b;tcp:host=x,port=1"),
+            vec![PathBuf::from("/a/b")]
+        );
+        assert!(dbus_address_paths("").is_empty());
+        assert!(dbus_address_paths("unix:path=").is_empty());
+    }
+
+    #[test]
+    fn allow_socket_keeps_the_system_bus_visible() {
+        let Ok(canon) = std::fs::canonicalize(DBUS_SYSTEM_SOCKET) else {
+            return eprintln!("skipping: no system D-Bus socket");
+        };
+        let hidden = plan(&[], &[], &[]).unwrap();
+        assert!(
+            hidden
+                .as_ref()
+                .is_some_and(|p| p.blocked_targets().any(|t| t == canon))
+        );
+        let allowed = plan(&[], &[PathBuf::from(DBUS_SYSTEM_SOCKET)], &[]).unwrap();
+        assert!(
+            allowed
+                .as_ref()
+                .is_none_or(|p| p.blocked_targets().all(|t| t != canon))
+        );
+    }
 }

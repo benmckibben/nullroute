@@ -148,8 +148,11 @@ fn base_topology_has_user_and_net_namespaces_and_loopback() {
     assert_eq!(field(&e, "loopback"), "lo: UP (127.0.0.1, ::1)");
     assert_eq!(field(&e, "bridged ports"), "none");
     assert_eq!(field(&e, "upstream proxy"), "none");
-    // The mount namespace is there exactly when some socket is hidden or sealed.
-    let any_sockets = !section(&e, "blocked").is_empty() || !section(&e, "sealed").is_empty();
+    // The mount namespace is there exactly when some socket is hidden, sealed
+    // or masked.
+    let any_sockets = !section(&e, "blocked").is_empty()
+        || !section(&e, "sealed").is_empty()
+        || !section(&e, "masked").is_empty();
     assert_eq!(ns.contains(&"mount"), any_sockets, "{e}");
 }
 

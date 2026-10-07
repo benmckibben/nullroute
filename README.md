@@ -71,7 +71,14 @@ Other details:
 
 - `NO_PROXY=localhost,127.0.0.1,::1`, so `--port` services are reached directly.
 - Host names are resolved on the host. A name that resolves to a loopback
-  address is refused even if allowed (use `--port` for local services).
+  address (`127.0.0.0/8`, `::1`, `0.0.0.0/8`, `::`, or an IPv6 form wrapping
+  one, like `::ffff:127.0.0.1`) is refused even if allowed (use `--port` for
+  local services). So is a link-local address (`169.254.0.0/16`, `fe80::/10`),
+  which covers the `169.254.169.254` cloud metadata service, and the other
+  known metadata endpoints (`fd00:ec2::254`, `100.100.100.200`).
+- `--allow` entries that can never be reached this way are rejected up front
+  (exit 2): `localhost`, `*.localhost`, loopback IPs (with a pointer to
+  `--port`), and link-local/metadata IPs.
 - Plain-HTTP requests are sent with `Connection: close`: one request per
   proxied connection.
 - The proxy listens on `127.0.0.1:3128` inside the sandbox (or the next port
@@ -92,7 +99,10 @@ With `--allow`, the sandbox also gets its own resolver:
    over the real one in the sandbox's private mount namespace. Local resolver
    sockets that would bypass `resolv.conf` (systemd-resolved's
    `/run/systemd/resolve/io.systemd.Resolve`, used by `nss-resolve`, and nscd's
-   socket) are masked, so glibc falls back to plain DNS. Nothing changes on the host.
+   socket) are masked, so glibc falls back to plain DNS. (They are masked in
+   every sandbox, with or without `--allow`; see
+   [Unix sockets](#unix-sockets-the-side-door-closed-by-default).) Nothing
+   changes on the host.
 2. **Synthetic addresses.** An allowed name resolves to a loopback address from
    `127.77.0.0/24`: each exact host gets its own (`127.77.0.1`, `.2`, ... in
    sorted order); names matching a `*.domain` wildcard share a pool of 32,
@@ -189,6 +199,8 @@ nullroute: inspect: sandbox topology
       /run/containerd/containerd.sock
     sealed (--seal-docker proxy):
       /run/docker.sock
+    masked (resolver bypass):
+      /run/systemd/resolve/io.systemd.Resolve
   upstream proxy:  http://127.0.0.1:3128 (allow: api.github.com)
   dns sinkhole:    127.0.0.1:53 (udp, tcp; other names get NXDOMAIN)
     api.github.com -> 127.77.0.1 (ports 80, 443)
@@ -197,11 +209,12 @@ nullroute: inspect: sandbox topology
 
 | Line | Meaning |
 |---|---|
-| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden or sealed, or the DNS sinkhole is on. |
+| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden, sealed or masked, or the DNS sinkhole is on. |
 | `loopback` | The sandbox's own `lo`, brought up before the command runs (plus the synthetic pool address with the DNS sinkhole). |
 | `bridged ports` | `--port` values (sorted, deduplicated), or `none`. |
 | `blocked (403 decoy)` | Sockets replaced by a decoy that answers `403` (defaults + `--hide-socket`, minus `--allow-socket`). |
 | `sealed (--seal-docker proxy)` | Docker sockets proxied with containers forced to `NetworkMode=none`. |
+| `masked (resolver bypass)` | Local resolver sockets (systemd-resolved varlink, nscd) replaced by an unconnectable file, always. |
 | `upstream proxy` | Where the `--allow` proxy listens inside the sandbox, and the allowed hosts, or `none`. |
 | `dns sinkhole` | The resolver address and each allowed name's synthetic address and relayed ports, or `none` (no `--allow` host names, or `--no-dns`). |
 
@@ -228,6 +241,20 @@ nullroute: blocked a connection to /run/docker.sock (container runtimes can star
 Error response from daemon: nullroute blocked access to /run/docker.sock (...). Rerun with --allow-socket /run/docker.sock to permit it.
 ```
 
+Local resolvers are a side door too: they resolve names on the host's network
+for whoever asks, which leaks DNS queries (and their answers) out of the
+sandbox. So, also by default:
+
+- The **system D-Bus** (`/run/dbus/system_bus_socket`, or wherever
+  `DBUS_SYSTEM_BUS_ADDRESS=unix:path=` points) is hidden, because
+  systemd-resolved answers `org.freedesktop.resolve1` calls on it. If the
+  command genuinely needs the system bus, `--allow-socket /run/dbus/system_bus_socket`
+  brings it back (and with it resolved's D-Bus API).
+- **systemd-resolved's varlink socket** (`/run/systemd/resolve/io.systemd.Resolve`)
+  and **nscd** are masked in every sandbox, even a bare `nullroute run`, and
+  can't be opted back in: connecting fails with `EACCES`. glibc then falls back
+  to plain DNS, which has no route out (or reaches the `--allow` sinkhole).
+
 | Flag | Effect |
 |---|---|
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
@@ -252,6 +279,15 @@ all: not the internet, not other containers, and not the host's `--port`
 services. `docker build` works. A
 requested `--network` (including `host`) is overridden to `none`.
 
+Every request on a connection is parsed, including keep-alive and pipelined
+ones. The connection only becomes a raw stream after a genuine protocol switch
+(`101 Switching Protocols` from attach/exec, or the daemon's raw stream for a
+`POST` attach / exec start), never after a `404` or any other ordinary
+response. Container-create bodies that aren't a single JSON object are refused
+(`400`), `HostConfig`/`NetworkMode` keys are matched case-insensitively the
+way Docker's JSON decoder does, and request bodies that can't be framed by one
+`Content-Length` (e.g. `Transfer-Encoding: chunked`) are refused.
+
 **This is not a Docker security boundary.** It stops the ordinary ways a
 container gets a network through the CLI; it does not cover every Docker API
 path, and a `--privileged` container can still escape. It's "CI containers
@@ -268,7 +304,8 @@ sockets speak a different protocol and are still hidden (not sealed) by default.
 | Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails) |
 | Reach chosen services on the host's localhost (`--port`) | ✅ TCP, IPv4 + IPv6 |
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
-| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes |
+| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes and the system D-Bus |
+| Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
 | Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none`; not a boundary for hostile images |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
 | Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |
@@ -281,8 +318,8 @@ sockets speak a different protocol and are still hidden (not sealed) by default.
 nullroute stops **accidental** network access. It is not a security boundary
 for hostile code. The command still sees your whole filesystem and runs as you,
 and only the sockets listed above are hidden by default: other local daemons
-with a Unix socket (D-Bus, an SSH agent, a local proxy) stay reachable unless you
-`--hide-socket` them. For untrusted code use a real sandbox such as a VM, gVisor
+with a Unix socket (the session D-Bus, an SSH agent, a local proxy) stay
+reachable unless you `--hide-socket` them. For untrusted code use a real sandbox such as a VM, gVisor
 or bubblewrap with a locked-down filesystem.
 
 ## How it works
@@ -317,8 +354,10 @@ sinkhole the child also binds `127.0.0.1:53` (UDP and TCP) and one listener per
 synthetic address and allowed port (binding ports below 1024 works because the
 child still holds its namespace capabilities at that point; the command doesn't
 after exec), adds `127.77.0.1/24` to `lo` over rtnetlink, and bind-mounts the
-generated `resolv.conf` and the resolver-socket masks. The parent answers the
-queries and relays the connections on the host's network.
+generated `resolv.conf`. The resolver-socket masks (an empty mode-000 file
+bind-mounted over each one) are applied in every sandbox, which is why even a
+bare run usually gets a mount namespace. The parent answers the queries and
+relays the connections on the host's network.
 
 ## Requirements
 

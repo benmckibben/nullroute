@@ -21,12 +21,18 @@
 //! sealed network and fails with "network unreachable", so the failure mode is
 //! closed, never open.
 //!
-//! Resolution happens on the host. Addresses that resolve to loopback or
-//! "unspecified" are refused even for allowed names, so an allowed name can't be
-//! used to reach the host's localhost services behind `--port`'s back.
+//! Resolution happens on the host. Addresses that resolve to loopback,
+//! "unspecified", link-local (which includes the 169.254.169.254 cloud
+//! metadata service) or another known metadata endpoint are refused even for
+//! allowed names, so an allowed name can't be used to reach the host's
+//! localhost services behind `--port`'s back or to lift cloud credentials.
+//! `--allow` entries that name such addresses (or `localhost`) are rejected
+//! up front.
 
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs,
+};
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 
@@ -92,6 +98,9 @@ impl Allowlist {
             }
             // Bare IPv6 literal (has colons, no brackets): no port possible.
             if let Ok(ip) = v.parse::<IpAddr>() {
+                if let Some(why) = forbidden(ip) {
+                    return Err(unreachable_allow(raw, why, None));
+                }
                 entries.push(Entry {
                     pattern: Pattern::Exact(ip.to_string()),
                     port: None,
@@ -126,8 +135,14 @@ impl Allowlist {
                 }
             };
             let host = host.trim_end_matches('.').to_string();
+            if is_localhost_name(&host) {
+                return Err(unreachable_allow(raw, Forbidden::Loopback, port));
+            }
             // Store IpAddr's canonical form so `2001:0db8::1` matches `2001:db8::1`.
             let pattern = if let Ok(ip) = host.parse::<IpAddr>() {
+                if let Some(why) = forbidden(ip) {
+                    return Err(unreachable_allow(raw, why, port));
+                }
                 Pattern::Exact(ip.to_string())
             } else if let Some(rest) = host.strip_prefix("*.") {
                 if !valid_hostname(rest) || !rest.contains('.') {
@@ -176,6 +191,38 @@ impl Allowlist {
         self.entries
             .iter()
             .any(|e| e.pattern.matches(&h) && e.port.is_none_or(|p| p == port))
+    }
+}
+
+/// Names that mean "this machine" (glibc/systemd resolve them to loopback
+/// without asking DNS): `localhost`, `*.localhost` (RFC 6761),
+/// `localhost.localdomain` and the Debian `ip6-` aliases.
+fn is_localhost_name(h: &str) -> bool {
+    let h = h.trim_start_matches("*.");
+    h == "localhost"
+        || h.ends_with(".localhost")
+        || h == "localhost.localdomain"
+        || h == "ip6-localhost"
+        || h == "ip6-loopback"
+}
+
+/// The parse error for an `--allow` that could never be reached.
+fn unreachable_allow(raw: &str, why: Forbidden, port: Option<u16>) -> String {
+    match why {
+        Forbidden::Loopback => {
+            let hint = match port {
+                Some(p) => format!("--port {p}"),
+                None => "--port PORT".to_string(),
+            };
+            format!(
+                "--allow {raw:?}: loopback is never reachable through --allow; \
+                 to reach a service on this machine's localhost, bridge it with {hint}"
+            )
+        }
+        other => format!(
+            "--allow {raw:?}: {} addresses are always blocked",
+            other.describe()
+        ),
     }
 }
 
@@ -308,20 +355,20 @@ impl Proxy {
         }
         let upstream = match dial(&req.host, req.port, &self.overrides) {
             Ok(s) => s,
-            Err(DialError::Loopback) => {
-                self.block(
-                    &req.host,
-                    req.port,
-                    "resolves to loopback; use --port for local services",
-                );
-                respond(
-                    &mut client,
-                    403,
-                    &format!(
+            Err(DialError::Forbidden(why)) => {
+                self.block(&req.host, req.port, why.reason());
+                let msg = match why {
+                    Forbidden::Loopback => format!(
                         "nullroute blocked {}: it resolves to a loopback address. Use --port for services on this machine.",
                         req.host
                     ),
-                );
+                    other => format!(
+                        "nullroute blocked {}: it resolves to a {} address, which is never reachable from the sandbox.",
+                        req.host,
+                        other.describe()
+                    ),
+                };
+                respond(&mut client, 403, &msg);
                 return;
             }
             Err(DialError::Io(e)) => {
@@ -472,11 +519,44 @@ fn rewrite_for_origin(head: &[u8], req: &Request) -> Vec<u8> {
 }
 
 pub(crate) enum DialError {
-    Loopback,
+    /// The target resolved to an address nullroute never dials.
+    Forbidden(Forbidden),
     Io(io::Error),
 }
 
-/// Resolve (or look up in `overrides`) and connect, refusing loopback targets.
+/// Why a destination address is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Forbidden {
+    /// 127.0.0.0/8, ::1, 0.0.0.0/8, ::, and v4-mapped/-compatible/NAT64 forms.
+    Loopback,
+    /// 169.254.0.0/16, fe80::/10.
+    LinkLocal,
+    /// Cloud instance metadata endpoints outside link-local.
+    Metadata,
+}
+
+impl Forbidden {
+    fn describe(self) -> &'static str {
+        match self {
+            Forbidden::Loopback => "loopback",
+            Forbidden::LinkLocal => "link-local (incl. cloud metadata)",
+            Forbidden::Metadata => "cloud metadata",
+        }
+    }
+
+    /// The reason shown in warnings and the report.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Forbidden::Loopback => "resolves to loopback; use --port for local services",
+            Forbidden::LinkLocal => {
+                "resolves to a link-local address (incl. cloud metadata); always blocked"
+            }
+            Forbidden::Metadata => "resolves to a cloud metadata address; always blocked",
+        }
+    }
+}
+
+/// Resolve (or look up in `overrides`) and connect, refusing forbidden targets.
 pub(crate) fn dial(host: &str, port: u16, overrides: &Overrides) -> Result<TcpStream, DialError> {
     let addrs: Vec<SocketAddr> = match overrides.get(&Allowlist::norm(host)) {
         Some(&ip) => vec![SocketAddr::new(ip, port)],
@@ -491,8 +571,8 @@ pub(crate) fn dial(host: &str, port: u16, overrides: &Overrides) -> Result<TcpSt
             "no addresses",
         )));
     }
-    if addrs.iter().any(|a| forbidden(a.ip())) {
-        return Err(DialError::Loopback);
+    if let Some(why) = addrs.iter().find_map(|a| forbidden(a.ip())) {
+        return Err(DialError::Forbidden(why));
     }
     let mut last = None;
     for a in &addrs {
@@ -504,15 +584,65 @@ pub(crate) fn dial(host: &str, port: u16, overrides: &Overrides) -> Result<TcpSt
     Err(DialError::Io(last.unwrap()))
 }
 
-fn forbidden(ip: IpAddr) -> bool {
-    let ip = match ip {
-        IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(v6)),
-        v4 => v4,
-    };
-    ip.is_loopback() || ip.is_unspecified()
+/// Is `ip` a destination nullroute must never dial for the command, and why?
+///
+/// IPv6 forms that carry an IPv4 address (v4-mapped `::ffff:a.b.c.d`,
+/// deprecated v4-compatible `::a.b.c.d`, NAT64 `64:ff9b::a.b.c.d`) are judged
+/// by the IPv4 address inside, so `::ffff:127.0.0.1` is loopback.
+pub(crate) fn forbidden(ip: IpAddr) -> Option<Forbidden> {
+    match ip {
+        IpAddr::V4(v4) => forbidden_v4(v4),
+        IpAddr::V6(v6) => embedded_v4(v6)
+            .and_then(forbidden_v4)
+            .or_else(|| forbidden_v6(v6)),
+    }
+}
+
+fn embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let s = v6.segments();
+    // NAT64 well-known prefix 64:ff9b::/96.
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32));
+    }
+    // IPv4-compatible ::a.b.c.d (but not :: or ::1, handled as IPv6).
+    if s[..6] == [0; 6] && !(s[6] == 0 && s[7] <= 1) {
+        return Some(Ipv4Addr::from(((s[6] as u32) << 16) | s[7] as u32));
+    }
+    None
+}
+
+fn forbidden_v4(ip: Ipv4Addr) -> Option<Forbidden> {
+    let o = ip.octets();
+    // 0.0.0.0/8: Linux treats connect() to 0.0.0.0 (and friends) as local.
+    if ip.is_loopback() || o[0] == 0 {
+        Some(Forbidden::Loopback)
+    } else if ip.is_link_local() {
+        // 169.254.0.0/16, including 169.254.169.254 (AWS, GCP, Azure, ...)
+        // and 169.254.170.2 (ECS task credentials).
+        Some(Forbidden::LinkLocal)
+    } else if ip == Ipv4Addr::new(100, 100, 100, 200) {
+        // Alibaba Cloud metadata.
+        Some(Forbidden::Metadata)
+    } else {
+        None
+    }
+}
+
+fn forbidden_v6(ip: Ipv6Addr) -> Option<Forbidden> {
+    if ip.is_loopback() || ip.is_unspecified() {
+        Some(Forbidden::Loopback)
+    } else if ip.segments()[0] & 0xffc0 == 0xfe80 {
+        // fe80::/10 (Ipv6Addr::is_unicast_link_local).
+        Some(Forbidden::LinkLocal)
+    } else if ip == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254) {
+        // AWS IMDS over IPv6.
+        Some(Forbidden::Metadata)
+    } else {
+        None
+    }
 }
 
 fn respond(s: &mut TcpStream, code: u16, msg: &str) {
@@ -652,20 +782,116 @@ mod tests {
         );
     }
 
+    fn why(ip: &str) -> Option<Forbidden> {
+        forbidden(ip.parse().unwrap())
+    }
+
     #[test]
     fn loopback_targets_are_forbidden() {
         for ip in [
             "127.0.0.1",
             "127.8.9.10",
+            "127.255.255.255",
             "::1",
             "0.0.0.0",
+            "0.1.2.3",
             "::",
             "::ffff:127.0.0.1",
+            "::ffff:0.0.0.0",
+            "::127.0.0.1",
+            "64:ff9b::7f00:1",
         ] {
-            assert!(forbidden(ip.parse().unwrap()), "{ip}");
+            assert_eq!(why(ip), Some(Forbidden::Loopback), "{ip}");
         }
-        for ip in ["10.0.0.1", "93.184.216.34", "2001:db8::1"] {
-            assert!(!forbidden(ip.parse().unwrap()), "{ip}");
+    }
+
+    #[test]
+    fn link_local_and_metadata_targets_are_forbidden() {
+        for ip in [
+            "169.254.169.254",
+            "169.254.170.2",
+            "169.254.0.1",
+            "169.254.255.255",
+            "::ffff:169.254.169.254",
+            "64:ff9b::a9fe:a9fe",
+            "fe80::1",
+            "fe80::a9fe:a9fe",
+            "febf:ffff::1",
+        ] {
+            assert_eq!(why(ip), Some(Forbidden::LinkLocal), "{ip}");
+        }
+        for ip in ["100.100.100.200", "fd00:ec2::254", "::ffff:100.100.100.200"] {
+            assert_eq!(why(ip), Some(Forbidden::Metadata), "{ip}");
+        }
+    }
+
+    #[test]
+    fn ordinary_targets_are_allowed() {
+        for ip in [
+            "10.0.0.1",
+            "93.184.216.34",
+            "169.253.255.255",
+            "169.255.0.1",
+            "100.100.100.201",
+            "128.0.0.1",
+            "2001:db8::1",
+            "fec0::1",
+            "fd00:ec2::253",
+            "::ffff:10.0.0.1",
+            "64:ff9b::5db8:d822",
+        ] {
+            assert_eq!(why(ip), None, "{ip}");
+        }
+    }
+
+    #[test]
+    fn allow_rejects_loopback_and_localhost_pointing_at_port() {
+        for bad in [
+            "127.0.0.1",
+            "127.0.0.1:5432",
+            "::1",
+            "[::1]:8080",
+            "::ffff:127.0.0.1",
+            "0.0.0.0",
+            "localhost",
+            "LOCALHOST.",
+            "localhost:5432",
+            "db.localhost",
+            "*.localhost",
+            "localhost.localdomain",
+            "ip6-localhost",
+        ] {
+            let e = Allowlist::parse(&[bad.to_string()]).unwrap_err();
+            assert!(e.contains("--port"), "{bad}: {e}");
+            assert!(e.contains("loopback"), "{bad}: {e}");
+        }
+        let e = Allowlist::parse(&["localhost:5432".to_string()]).unwrap_err();
+        assert!(e.contains("--port 5432"), "{e}");
+        let e = Allowlist::parse(&["127.0.0.1".to_string()]).unwrap_err();
+        assert!(e.contains("--port PORT"), "{e}");
+    }
+
+    #[test]
+    fn allow_rejects_link_local_and_metadata() {
+        for bad in [
+            "169.254.169.254",
+            "169.254.169.254:80",
+            "fe80::1",
+            "[fe80::1]:443",
+            "100.100.100.200",
+            "fd00:ec2::254",
+        ] {
+            let e = Allowlist::parse(&[bad.to_string()]).unwrap_err();
+            assert!(e.contains("always blocked"), "{bad}: {e}");
+        }
+        // Look-alikes are fine.
+        for ok in [
+            "localhost.example.com",
+            "mylocalhost",
+            "169.255.0.1",
+            "notlocalhost.dev",
+        ] {
+            assert!(Allowlist::parse(&[ok.to_string()]).is_ok(), "{ok}");
         }
     }
 
@@ -701,7 +927,17 @@ mod tests {
         o.insert("pinned.test".into(), "127.0.0.1".parse().unwrap());
         assert!(matches!(
             dial("Pinned.Test", 1, &o),
-            Err(DialError::Loopback)
+            Err(DialError::Forbidden(Forbidden::Loopback))
+        ));
+        o.insert("meta.test".into(), "169.254.169.254".parse().unwrap());
+        assert!(matches!(
+            dial("meta.test", 80, &o),
+            Err(DialError::Forbidden(Forbidden::LinkLocal))
+        ));
+        o.insert("mapped.test".into(), "::ffff:127.0.0.1".parse().unwrap());
+        assert!(matches!(
+            dial("mapped.test", 80, &o),
+            Err(DialError::Forbidden(Forbidden::Loopback))
         ));
     }
 

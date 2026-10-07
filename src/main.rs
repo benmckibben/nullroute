@@ -39,13 +39,16 @@ enum Cmd {
         ports: Vec<u16>,
 
         /// Also hide this Unix socket (repeatable). Container-runtime sockets
-        /// (docker.sock, podman.sock, containerd, buildkit) are hidden by default.
+        /// (docker.sock, podman.sock, containerd, buildkit) and the system D-Bus
+        /// are hidden by default.
         #[arg(long = "hide-socket", value_name = "PATH")]
         hide_sockets: Vec<std::path::PathBuf>,
 
         /// Keep this socket reachable even though it's hidden by default
         /// (repeatable). E.g. --allow-socket /var/run/docker.sock for tests that
-        /// start containers; those containers will have network access.
+        /// start containers; those containers will have network access. Or
+        /// --allow-socket /run/dbus/system_bus_socket for the system D-Bus (which
+        /// can resolve names through systemd-resolved).
         #[arg(long = "allow-socket", value_name = "PATH")]
         allow_sockets: Vec<std::path::PathBuf>,
 
@@ -65,13 +68,15 @@ enum Cmd {
         /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
         /// optionally :PORT. Proxy-aware clients go through an HTTP(S) proxy;
         /// other clients resolve allowed names via nullroute's DNS sinkhole and
-        /// are relayed on the allowed ports (80/443 without :PORT).
+        /// are relayed on the allowed ports (80/443 without :PORT). localhost and
+        /// loopback, link-local and cloud-metadata IPs are refused (use --port
+        /// for local services).
         #[arg(short, long = "allow", value_name = "HOST", value_delimiter = ',')]
         allow: Vec<String>,
 
         /// Dial this allowed host at IP instead of resolving it on the host,
         /// like curl's --resolve (repeatable): --resolve db.internal:10.0.0.5.
-        /// Loopback addresses are still refused.
+        /// Loopback, link-local and cloud-metadata addresses are still refused.
         #[arg(long = "resolve", value_name = "HOST:IP")]
         resolve: Vec<String>,
 
@@ -184,8 +189,14 @@ fn main() -> ExitCode {
                     .then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
                 eprint!(
                     "{}",
-                    inspect::Topology::new(&ports, plan.as_ref(), proxy, dns_plan.as_ref())
-                        .render()
+                    inspect::Topology::new(
+                        &ports,
+                        plan.as_ref(),
+                        proxy,
+                        dns_plan.as_ref(),
+                        &dns::bypass_targets(),
+                    )
+                    .render()
                 );
             }
             if dry_run {

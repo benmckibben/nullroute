@@ -155,19 +155,68 @@ fn unlisted_host_gets_403_and_one_warning() {
 }
 
 #[test]
-fn allowed_loopback_target_is_still_refused() {
+fn allow_loopback_or_localhost_is_rejected_pointing_at_port() {
+    for (bad, hint) in [
+        ("127.0.0.1", "--port PORT"),
+        ("localhost:5432", "--port 5432"),
+        ("[::1]:6379", "--port 6379"),
+        ("::ffff:127.0.0.1", "--port PORT"),
+        ("db.localhost", "--port PORT"),
+    ] {
+        let o = nullroute(&["--allow", bad, "--", "true"]);
+        assert_eq!(o.status.code(), Some(2), "--allow {bad}: {o:?}");
+        assert!(err(&o).contains(hint), "--allow {bad}: {}", err(&o));
+    }
+}
+
+#[test]
+fn allow_link_local_or_metadata_is_rejected() {
+    for bad in ["169.254.169.254", "fe80::1", "fd00:ec2::254"] {
+        let o = nullroute(&["--allow", bad, "--", "true"]);
+        assert_eq!(o.status.code(), Some(2), "--allow {bad}: {o:?}");
+        assert!(err(&o).contains("always blocked"), "{}", err(&o));
+    }
+}
+
+#[test]
+fn allowed_name_resolving_to_loopback_is_still_refused() {
     let l = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
-    let o = nullroute(&[
-        "--allow",
-        "127.0.0.1",
-        "--",
-        "python3",
-        "-c",
-        &connect_script(&format!("127.0.0.1:{port}")),
-    ]);
-    assert_eq!(out(&o), "HTTP/1.1 403 Forbidden", "{o:?}");
-    assert!(err(&o).contains("resolves to loopback"), "{}", err(&o));
+    for ip in ["127.0.0.1", "::ffff:127.0.0.1"] {
+        let o = nullroute(&[
+            "--allow",
+            "loop.nr.test",
+            "--resolve",
+            &format!("loop.nr.test:{ip}"),
+            "--no-dns",
+            "--",
+            "python3",
+            "-c",
+            &connect_script(&format!("loop.nr.test:{port}")),
+        ]);
+        assert_eq!(out(&o), "HTTP/1.1 403 Forbidden", "{ip}: {o:?}");
+        assert!(err(&o).contains("resolves to loopback"), "{}", err(&o));
+    }
+}
+
+#[test]
+fn allowed_name_resolving_to_cloud_metadata_is_refused() {
+    // Never dialled: refused before connecting, so no metadata service needed.
+    for ip in ["169.254.169.254", "fe80::1", "100.100.100.200"] {
+        let o = nullroute(&[
+            "--allow",
+            "meta.nr.test",
+            "--resolve",
+            &format!("meta.nr.test:{ip}"),
+            "--no-dns",
+            "--",
+            "python3",
+            "-c",
+            &connect_script("meta.nr.test:80"),
+        ]);
+        assert_eq!(out(&o), "HTTP/1.1 403 Forbidden", "{ip}: {o:?}");
+        assert!(err(&o).contains("always blocked"), "{ip}: {}", err(&o));
+    }
 }
 
 #[test]
