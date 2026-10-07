@@ -272,6 +272,15 @@ all: not the internet, not other containers, and not the host's `--port`
 services. `docker build` works. A
 requested `--network` (including `host`) is overridden to `none`.
 
+Every request on a connection is parsed, including keep-alive and pipelined
+ones. The connection only becomes a raw stream after a genuine protocol switch
+(`101 Switching Protocols` from attach/exec, or the daemon's raw stream for a
+`POST` attach / exec start), never after a `404` or any other ordinary
+response. Container-create bodies that aren't a single JSON object are refused
+(`400`), `HostConfig`/`NetworkMode` keys are matched case-insensitively the
+way Docker's JSON decoder does, and request bodies that can't be framed by one
+`Content-Length` (e.g. `Transfer-Encoding: chunked`) are refused.
+
 **This is not a Docker security boundary.** It stops the ordinary ways a
 container gets a network through the CLI; it does not cover every Docker API
 path, and a `--privileged` container can still escape. It's "CI containers
