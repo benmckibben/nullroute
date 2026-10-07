@@ -86,7 +86,8 @@ enum Cmd {
         no_dns: bool,
 
         /// Fail (exit 1) if anything was blocked, even if the command succeeded.
-        /// A command that already failed keeps its own exit code.
+        /// A command that already failed keeps its own exit code. Requests
+        /// --seal-docker rewrote and let through don't count.
         #[arg(long)]
         strict: bool,
 
@@ -95,7 +96,9 @@ enum Cmd {
         quiet: bool,
 
         /// Also write the breach report as JSON to this file (written on every
-        /// run, with an empty "blocked" list when nothing was blocked).
+        /// run, with an empty "blocked" list when nothing was blocked). Checked
+        /// before the command runs (exit 2 if it can't be written); if writing
+        /// still fails afterwards, a run that would have exited 0 exits 74.
         #[arg(long, value_name = "FILE")]
         report_json: Option<std::path::PathBuf>,
 
@@ -159,6 +162,15 @@ fn main() -> ExitCode {
                     }
                 }
             };
+            if let Some(path) = &report_json
+                && let Err(e) = report::check_writable(path)
+            {
+                eprintln!(
+                    "nullroute: --report-json {}: can't write the report there: {e}; not running the command",
+                    path.display()
+                );
+                return ExitCode::from(2);
+            }
             ports.sort_unstable();
             ports.dedup();
             if dns_plan.is_some() && ports.contains(&dns::PORT) {
@@ -256,6 +268,10 @@ fn normalize_host(h: &str) -> String {
     h.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Exit code when the command (and --strict) would have exited 0 but the
+/// --report-json file couldn't be written at the end (EX_IOERR, sysexits.h).
+const EXIT_REPORT_WRITE_FAILED: i32 = 74;
+
 struct RunOpts {
     strict: bool,
     report_json: Option<std::path::PathBuf>,
@@ -288,7 +304,7 @@ fn run(
     if let Some(s) = report.summary() {
         eprint!("{s}");
     }
-    let strict_failed = opts.strict && code == 0 && !report.is_empty();
+    let strict_failed = opts.strict && code == 0 && report.has_blocks();
     if strict_failed {
         eprintln!(
             "nullroute: --strict: failing because the command tried to reach blocked targets"
@@ -298,7 +314,14 @@ fn run(
     if let Some(path) = &opts.report_json
         && let Err(e) = report.write_json(path, argv, code, strict_failed)
     {
-        eprintln!("nullroute: writing --report-json {}: {e}", path.display());
+        eprintln!(
+            "nullroute: --report-json {}: writing the report failed: {e}",
+            path.display()
+        );
+        // Don't mask a failure that's already there; just don't report success.
+        if code == 0 {
+            code = EXIT_REPORT_WRITE_FAILED;
+        }
     }
     ExitCode::from(code as u8)
 }

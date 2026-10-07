@@ -163,19 +163,45 @@ nullroute: blocked 7 attempts to reach 2 targets:
   proxy   api.github.com:443     2x  (not in --allow)
 ```
 
-Kinds: `socket` (hidden socket), `proxy` (proxy request), `docker`
-(`--seal-docker`), `dns` (a lookup of a name that isn't allowed, or a relay the
-sinkhole refused). DNS counts are queries, so one lookup can count twice (`A`
-and `AAAA`).
+| Kind | What | Counts as blocked (`--strict`) |
+|---|---|---|
+| `socket` | a connection to a hidden socket | yes |
+| `proxy` | a proxy request to a host that isn't allowed | yes |
+| `dns` | a lookup of a name that isn't allowed, or a relay the sinkhole refused | yes |
+| `docker` | a Docker API request `--seal-docker` refused | yes |
+| `rewritten` | a request `--seal-docker` changed and let through (a container create forced onto `NetworkMode=none`, or a classic `docker build` forced onto `networkmode=none`) | no |
+
+`rewritten` entries are listed after the blocks, under their own heading
+(`nullroute: rewrote N requests and let them through (not blocks; --strict
+ignores these):`), and in their own `"rewritten"` list in the JSON report.
+
+DNS counts are queries, so one lookup can count twice (`A` and `AAAA`).
 
 Counts are connections, so one `docker ps` can count several times (the Docker
 CLI reconnects).
 
 | Flag | Effect |
 |---|---|
-| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors. A command that already failed keeps its own exit code. |
+| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors. A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
 | `-q`, `--quiet` | Skip the live lines; keep the summary. |
-| `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` when clean). |
+| `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
+
+```json
+{
+  "command": ["docker", "run", "--rm", "alpine", "true"],
+  "exit_code": 0,
+  "strict_failed": false,
+  "blocked": [],
+  "rewritten": [
+    {"kind": "rewritten", "target": "containers/create", "reason": "forced NetworkMode=none", "count": 1}
+  ]
+}
+```
+
+Exit codes nullroute adds to the command's own: `2` for bad arguments
+(including an unwritable `--report-json`; nothing is run), `125` if nullroute
+itself fails to set up the sandbox, `1` from `--strict`, and `74` if the
+`--report-json` file couldn't be written after a successful run.
 
 Not listed: a direct connection to an IP address fails inside the kernel
 ("network unreachable") without reaching nullroute. Proxy requests, DNS lookups

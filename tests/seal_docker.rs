@@ -82,13 +82,18 @@ fn network_connect_is_refused() {
 }
 
 #[test]
-fn report_and_strict_flag_a_sealed_create() {
+fn sealed_create_is_reported_as_rewritten_and_strict_passes() {
     if !docker_ok() || !have_alpine() {
         return eprintln!("skipping");
     }
+    let dir = std::env::temp_dir().join(format!("nr-seal-json-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let json = dir.join("r.json");
     let o = nr(&[
         "--seal-docker",
         "--strict",
+        "--report-json",
+        json.to_str().unwrap(),
         "--",
         "docker",
         "run",
@@ -96,12 +101,44 @@ fn report_and_strict_flag_a_sealed_create() {
         "alpine",
         "true",
     ]);
+    let body = std::fs::read_to_string(&json).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(o.status.code(), Some(0), "a rewrite isn't a block: {o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains("nullroute: rewrote") && err.contains("rewritten  containers/create"),
+        "{err}"
+    );
+    assert!(!err.contains("nullroute: blocked"), "{err}");
+    assert!(!err.contains("--strict: failing"), "{err}");
+    assert!(body.contains("\"strict_failed\": false"), "{body}");
+    assert!(body.contains("\"blocked\": []"), "{body}");
+    let (_, rewritten) = body.split_once("\"rewritten\"").unwrap();
+    assert!(
+        rewritten.contains("\"kind\": \"rewritten\", \"target\": \"containers/create\""),
+        "{body}"
+    );
+}
+
+#[test]
+fn strict_still_fails_on_a_real_docker_block() {
+    if !docker_ok() || !have_alpine() {
+        return eprintln!("skipping");
+    }
+    let name = format!("nr-strict-{}", std::process::id());
+    // network connect is refused (a block); the script itself still exits 0.
+    let script = format!(
+        "docker run -d --name {name} alpine sleep 20 >/dev/null; \
+         docker network connect bridge {name} 2>/dev/null; docker rm -f {name} >/dev/null; true"
+    );
+    let o = nr(&["--seal-docker", "--strict", "--", "sh", "-c", &script]);
     assert_eq!(o.status.code(), Some(1), "strict should fail: {o:?}");
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
-        err.contains("docker") && err.contains("containers/create"),
+        err.contains("--strict: failing") && err.contains("docker  networks/connect"),
         "{err}"
     );
+    assert!(err.contains("rewritten  containers/create"), "{err}");
 }
 
 /// Python: on ONE connection to docker.sock, send each probe and read its
@@ -239,16 +276,19 @@ fn classic_build_with_host_network_is_forced_to_none() {
         "DOCKER_BUILDKIT=0 docker build --network host --no-cache --force-rm -t {image} {}",
         dir.display()
     );
-    let o = nr(&["--seal-docker", "--", "sh", "-c", &script]);
+    // --strict: forcing the build onto no network is a rewrite, not a block.
+    let o = nr(&["--seal-docker", "--strict", "--", "sh", "-c", &script]);
     let _ = Command::new("docker").args(["rmi", "-f", &image]).output();
     let _ = std::fs::remove_dir_all(&dir);
     let text = out(&o);
-    assert!(o.status.success(), "{o:?}");
+    assert!(o.status.success(), "a rewrite isn't a block: {o:?}");
     // (The step's command line is echoed too, so match whole lines.)
     let said = |w: &str| text.lines().any(|l| l.trim() == w);
     assert!(said("NONET") && !said("HASNET"), "{o:?}");
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(err.contains("forced networkmode=none"), "{err}");
+    assert!(err.contains("rewritten  build"), "{err}");
+    assert!(!err.contains("--strict: failing"), "{err}");
 }
 
 #[test]

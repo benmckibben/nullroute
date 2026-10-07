@@ -189,9 +189,126 @@ fn report_json_written_when_clean() {
     nr(&["--report-json", out.to_str().unwrap(), "--", "true"], &t);
     let body = std::fs::read_to_string(&out).unwrap();
     assert!(
-        body.contains("\"blocked\": []") && body.contains("\"exit_code\": 0"),
+        body.contains("\"blocked\": []")
+            && body.contains("\"rewritten\": []")
+            && body.contains("\"exit_code\": 0"),
         "{body}"
     );
+}
+
+#[test]
+fn unwritable_report_json_fails_before_the_command_runs() {
+    let t = Tmp::new("json-bad");
+    let marker = t.0.join("ran");
+    let touch = format!("touch {}", marker.display());
+    let missing_dir = t.0.join("no-such-dir/r.json");
+    let is_a_dir = t.0.clone();
+    for path in [missing_dir.to_str().unwrap(), is_a_dir.to_str().unwrap()] {
+        let o = nr(&["--report-json", path, "--", "sh", "-c", &touch], &t);
+        assert_eq!(o.status.code(), Some(2), "{path}: {o:?}");
+        let e = err(&o);
+        assert!(
+            e.contains(&format!(
+                "nullroute: --report-json {path}: can't write the report there:"
+            )) && e.contains("not running the command"),
+            "{e}"
+        );
+        assert!(!marker.exists(), "{path}: the command ran");
+    }
+    assert!(!missing_dir.parent().unwrap().exists());
+}
+
+#[test]
+fn report_json_check_doesnt_touch_an_existing_file_or_leave_one_behind() {
+    let t = Tmp::new("json-probe");
+    // The command sees the file as it was: an old report isn't truncated
+    // before the run, and a new one isn't created early.
+    let old = t.0.join("old.json");
+    std::fs::write(&old, "previous").unwrap();
+    let new = t.0.join("new.json");
+    let o = nr(
+        &[
+            "--report-json",
+            old.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "cat {}; test -e {} && echo early",
+                old.display(),
+                new.display()
+            ),
+        ],
+        &t,
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&o.stdout).trim(),
+        "previous",
+        "{o:?}"
+    );
+    let o = nr(
+        &[
+            "--report-json",
+            new.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            &format!("test -e {} && echo early || echo absent", new.display()),
+        ],
+        &t,
+    );
+    assert_eq!(String::from_utf8_lossy(&o.stdout).trim(), "absent", "{o:?}");
+    assert!(
+        std::fs::read_to_string(&new)
+            .unwrap()
+            .contains("\"exit_code\": 0")
+    );
+}
+
+#[test]
+fn report_json_write_failing_at_the_end_exits_74() {
+    // The path is fine when checked, but the command removes its directory.
+    let t = Tmp::new("json-late");
+    let dir = t.0.join("out");
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("r.json");
+    let rm = format!("rm -rf {}", dir.display());
+    let o = nr(
+        &[
+            "--report-json",
+            path.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            &rm,
+        ],
+        &t,
+    );
+    assert_eq!(o.status.code(), Some(74), "{o:?}");
+    assert!(
+        err(&o).contains(&format!(
+            "nullroute: --report-json {}: writing the report failed:",
+            path.display()
+        )),
+        "{}",
+        err(&o)
+    );
+
+    // A command that already failed keeps its own code.
+    std::fs::create_dir(&dir).unwrap();
+    let o = nr(
+        &[
+            "--report-json",
+            path.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            &format!("{rm}; exit 3"),
+        ],
+        &t,
+    );
+    assert_eq!(o.status.code(), Some(3), "{o:?}");
+    assert!(err(&o).contains("writing the report failed"), "{}", err(&o));
 }
 
 #[test]
