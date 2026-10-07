@@ -113,6 +113,9 @@ pub fn run_hermetic(
 
     // From here until the handlers are installed, SIGINT/SIGQUIT/SIGTERM/SIGHUP
     // stay pending instead of hitting nullroute's default action (see signals.rs).
+    // Whatever the command orphans is reparented to nullroute, which kills it
+    // once the command is done (lifecycle.rs).
+    lifecycle::become_subreaper();
     let blocked = signals::block()?;
     let child_mask = blocked.child_mask();
     // The parent-death signal is tied to the forking thread (lifecycle.rs).
@@ -170,6 +173,7 @@ pub fn run_hermetic(
     {
         let _ = child.kill();
         let _ = child.wait();
+        lifecycle::kill_leftovers();
         return Err(e);
     }
     if let Some(parent) = parent_side {
@@ -178,6 +182,7 @@ pub fn run_hermetic(
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                lifecycle::kill_leftovers();
                 return Err(e);
             }
         };
@@ -210,6 +215,9 @@ pub fn run_hermetic(
         }
     }
     let status = child.wait();
+    // The command is done; don't leave anything it started running in a
+    // sandbox whose relays are about to go away.
+    lifecycle::kill_leftovers();
     drop(dns_files);
     status
 }
