@@ -439,6 +439,10 @@ relays the connections on the host's network.
 
 ## Requirements
 
+Linux only (x86_64 and aarch64; glibc or musl, so static musl builds work). On
+macOS, FreeBSD and other targets the build stops with a single "nullroute only
+supports Linux" error.
+
 Unprivileged user namespaces must be enabled. On Ubuntu 23.10+ AppArmor restricts
 them by default (`kernel.apparmor_restrict_unprivileged_userns=1`); nullroute prints a
 hint if namespace creation is refused.
@@ -449,6 +453,7 @@ hint if namespace creation is refused.
 cargo test                                   # integration tests run the real binary
 cargo clippy --all-targets -- -D warnings
 cargo fmt
+cargo check --target x86_64-unknown-linux-musl   # CI also checks aarch64 musl/gnu
 ```
 
 ## License

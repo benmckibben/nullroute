@@ -11,6 +11,9 @@ keywords = ["sandbox", "network", "namespace", "security", "ci"]
 categories = ["command-line-utilities", "development-tools::testing"]
 include = ["src/**", "tests/**", "README.md", "LICENSE*", "Cargo.*"]
 
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
