@@ -27,7 +27,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 
 use crate::report::Report;
-use crate::{dns, forward, hide, proxy, signals};
+use crate::{dns, forward, hide, lifecycle, proxy, signals};
 use std::sync::Arc;
 
 /// What a listener created inside the sandbox is for.
@@ -115,6 +115,13 @@ pub fn run_hermetic(
     // stay pending instead of hitting nullroute's default action (see signals.rs).
     let blocked = signals::block()?;
     let child_mask = blocked.child_mask();
+    // The parent-death signal is tied to the forking thread (lifecycle.rs).
+    debug_assert!(
+        lifecycle::on_main_thread(),
+        "spawn the command from the main thread"
+    );
+    // SAFETY: getpid has no preconditions.
+    let parent = unsafe { libc::getpid() };
 
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -125,6 +132,8 @@ pub fn run_hermetic(
     // which is what pre_exec requires.
     unsafe {
         cmd.pre_exec(move || {
+            // First, so the child can't outlive nullroute even during setup.
+            lifecycle::die_with_parent(parent)?;
             if libc::unshare(flags) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -142,6 +151,8 @@ pub fn run_hermetic(
             if let Some(c) = child_side.as_mut() {
                 c.listen_and_send()?;
             }
+            // Re-arm after the user-namespace credential change (lifecycle.rs).
+            lifecycle::die_with_parent(parent)?;
             // Last: unblock, so nothing is delivered before setup is done.
             child_mask.restore()?;
             Ok(())
