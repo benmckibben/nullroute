@@ -2,7 +2,8 @@
 //!
 //! Several features need something listening *inside* the sandbox's network
 //! namespace but handled by nullroute *outside* it, on the host's network:
-//! `--port` bridges and the `--allow` proxy. They work the same way:
+//! `--port` bridges, the `--allow` proxy and the DNS sinkhole (dns.rs). They
+//! work the same way:
 //!
 //! 1. Before forking, nullroute makes a Unix socketpair and a list of specs
 //!    (address, required or optional).
@@ -33,6 +34,8 @@ const CHUNK: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Proto {
     Tcp,
+    /// A bound (not connected) datagram socket, e.g. the DNS sinkhole.
+    Udp,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +51,13 @@ impl Spec {
         Spec {
             addr,
             proto: Proto::Tcp,
+            optional: false,
+        }
+    }
+    pub fn udp(addr: SocketAddr) -> Self {
+        Spec {
+            addr,
+            proto: Proto::Udp,
             optional: false,
         }
     }
@@ -265,6 +275,7 @@ impl ChildSide {
 fn create(s: &RawSpec) -> io::Result<libc::c_int> {
     let ty = match s.proto {
         Proto::Tcp => libc::SOCK_STREAM,
+        Proto::Udp => libc::SOCK_DGRAM,
     };
     // SAFETY: storage holds a valid sockaddr of length len.
     unsafe {

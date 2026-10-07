@@ -11,7 +11,8 @@ nullroute run --port 5432,6379 -- pytest   # local Postgres + Redis still reacha
 ```
 
 Inside, the command has a loopback interface and nothing else. Connecting to any
-other host fails immediately with "network unreachable", and DNS lookups fail.
+other host fails immediately with "network unreachable", and DNS lookups fail
+(with `--allow`, only allowed names resolve; see below).
 The exit code is passed through, so it drops into CI unchanged.
 
 ## Reaching local services: `--port`
@@ -31,6 +32,13 @@ once per port.
 ```bash
 nullroute run --allow api.github.com,*.stripe.dev -- pytest
 ```
+
+Allowed hosts are reachable two ways, and both apply the same allowlist:
+
+- **Proxy-aware clients** use an HTTP(S) proxy (below).
+- **Everything else** (database drivers, gRPC, custom binaries, `curl --noproxy '*'`)
+  resolves names through nullroute's DNS sinkhole and has its TCP connections
+  relayed. See [Clients that ignore proxy variables](#clients-that-ignore-proxy-variables-the-dns-sinkhole).
 
 nullroute runs an HTTP proxy that is the only thing able to reach the network,
 and points `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (plus lowercase forms) at it.
@@ -53,12 +61,11 @@ nullroute: blocked api.github.com (not in --allow)
 curl: (56) CONNECT tunnel failed, response 403
 ```
 
-**Only proxy-aware clients can use the allowlist.** curl, wget, git, pip, Python
-`urllib`/`requests`/`httpx`, Go's `net/http` and Node 24's `fetch` (nullroute
-sets `NODE_USE_ENV_PROXY=1`) all honour the variables; curl, Python `urllib`, git
-and Node `fetch` are tested. Anything that ignores them (raw sockets, most
-database drivers, `curl --noproxy '*'`) hits the sealed network and fails with
-"network unreachable". The failure mode is closed, never open.
+curl, wget, git, pip, Python `urllib`/`requests`/`httpx`, Go's `net/http` and
+Node 24's `fetch` (nullroute sets `NODE_USE_ENV_PROXY=1`) all honour the proxy
+variables; curl, Python `urllib`, git and Node `fetch` are tested. Clients that
+ignore them are covered by the DNS sinkhole for allowed *host names*; anything
+else still hits the sealed network. The failure mode is closed, never open.
 
 Other details:
 
@@ -70,6 +77,63 @@ Other details:
 - The proxy listens on `127.0.0.1:3128` inside the sandbox (or the next port
   that isn't a `--port`). An existing `HTTP(S)_PROXY` is overridden; chaining to
   a corporate upstream proxy isn't supported yet.
+
+### Clients that ignore proxy variables: the DNS sinkhole
+
+```bash
+nullroute run --allow db.staging.example.com:5432 -- psql -h db.staging.example.com
+nullroute run --allow api.github.com -- ./my-static-binary   # ports 80 and 443
+```
+
+With `--allow`, the sandbox also gets its own resolver:
+
+1. **Resolver.** nullroute answers DNS on `127.0.0.1:53` (UDP and TCP) inside the
+   sandbox, and bind-mounts a generated `/etc/resolv.conf` (`nameserver 127.0.0.1`)
+   over the real one in the sandbox's private mount namespace. Local resolver
+   sockets that would bypass `resolv.conf` (systemd-resolved's
+   `/run/systemd/resolve/io.systemd.Resolve`, used by `nss-resolve`, and nscd's
+   socket) are masked, so glibc falls back to plain DNS. Nothing changes on the host.
+2. **Synthetic addresses.** An allowed name resolves to a loopback address from
+   `127.77.0.0/24`: each exact host gets its own (`127.77.0.1`, `.2`, ... in
+   sorted order); names matching a `*.domain` wildcard share a pool of 32,
+   assigned on first lookup and recycled least-recently-resolved first (TTL 30s).
+   **Any other name gets `NXDOMAIN`** and is recorded in the report as `dns`.
+   `AAAA` queries for allowed names get an empty answer, so clients use IPv4.
+3. **Transparent relay.** nullroute listens on each synthetic address on the
+   ports that name is allowed on: the `:port` from `--allow`, or **80 and 443**
+   when none is given. A connection to `127.77.0.x:PORT` is mapped back to its
+   name and dialled from the host's network, with the same rules as the proxy:
+   resolved on the host, loopback results refused. TLS stays end-to-end, and the
+   client sends the right SNI/`Host` because it dialled by name.
+
+| Flag | Effect |
+|---|---|
+| `--resolve HOST:IP` | Dial an allowed host at `IP` instead of resolving it on the host, like curl's `--resolve` (repeatable; applies to the proxy too). The host must be allowed; loopback IPs are still refused. |
+| `--no-dns` | Don't run the sinkhole: names don't resolve inside, only proxy-aware clients reach allowed hosts. |
+
+```text
+$ nullroute run --allow api.github.com -- python3 -c "import socket; socket.create_connection(('example.com', 443))"
+nullroute: blocked DNS lookup of example.com (not in --allow)
+socket.gaierror: [Errno -2] Name or service not known
+```
+
+Limits (all fail closed):
+
+- **IP literals never ask DNS**, so dialling one directly still fails with
+  `ENETUNREACH` ("network unreachable"), even if the IP is in `--allow`. IP
+  entries only work through the proxy.
+- Only the listed ports are relayed. A port the name isn't allowed on gets
+  "connection refused" (or, in a wildcard pool that listens on another
+  wildcard's port, is closed and reported as `dns  host:port (port not in --allow)`).
+- Only TCP is relayed; UDP to a synthetic address (e.g. QUIC/HTTP3) gets
+  nothing back, and clients fall back to TCP.
+- An allowed name that has no port and isn't HTTP(S) needs `--allow host:port`.
+- A client with a hard-coded resolver (`dig @8.8.8.8`, DNS-over-HTTPS) bypasses
+  `resolv.conf`; it gets "network unreachable" instead of an answer.
+- `--port 53` clashes with the resolver; add `--no-dns` to bridge it.
+- nullroute adds `127.77.0.1/24` to the sandbox's `lo`: routing doesn't need
+  it, but glibc's `AI_ADDRCONFIG` ignores lookups for IPv4 when the only IPv4
+  address is `127.0.0.1`.
 
 ## What got blocked: the report and `--strict`
 
@@ -87,6 +151,11 @@ nullroute: blocked 7 attempts to reach 2 targets:
   proxy   api.github.com:443     2x  (not in --allow)
 ```
 
+Kinds: `socket` (hidden socket), `proxy` (proxy request), `docker`
+(`--seal-docker`), `dns` (a lookup of a name that isn't allowed, or a relay the
+sinkhole refused). DNS counts are queries, so one lookup can count twice (`A`
+and `AAAA`).
+
 Counts are connections, so one `docker ps` can count several times (the Docker
 CLI reconnects).
 
@@ -97,8 +166,8 @@ CLI reconnects).
 | `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` when clean). |
 
 Not listed: a direct connection to an IP address fails inside the kernel
-("network unreachable") without reaching nullroute. Proxy requests and hidden
-sockets are listed.
+("network unreachable") without reaching nullroute. Proxy requests, DNS lookups
+and hidden sockets are listed.
 
 **Signals.** Ctrl-C reaches the command as usual; nullroute itself ignores
 SIGINT/SIGQUIT so it can still print the report, then exits with the command's
@@ -113,7 +182,7 @@ then runs the command as usual (stdout and the exit code are untouched):
 $ nullroute run --inspect --seal-docker --port 5432 --allow api.github.com -- pytest
 nullroute: inspect: sandbox topology
   namespaces:      user, net, mount
-  loopback:        lo: UP (127.0.0.1, ::1)
+  loopback:        lo: UP (127.0.0.1, ::1, 127.77.0.1/24)
   bridged ports:   5432
   unix sockets:
     blocked (403 decoy):
@@ -121,17 +190,20 @@ nullroute: inspect: sandbox topology
     sealed (--seal-docker proxy):
       /run/docker.sock
   upstream proxy:  http://127.0.0.1:3128 (allow: api.github.com)
+  dns sinkhole:    127.0.0.1:53 (udp, tcp; other names get NXDOMAIN)
+    api.github.com -> 127.77.0.1 (ports 80, 443)
 ...test output...
 ```
 
 | Line | Meaning |
 |---|---|
-| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` only when a socket is hidden or sealed. |
-| `loopback` | The sandbox's own `lo`, brought up before the command runs. |
+| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden or sealed, or the DNS sinkhole is on. |
+| `loopback` | The sandbox's own `lo`, brought up before the command runs (plus the synthetic pool address with the DNS sinkhole). |
 | `bridged ports` | `--port` values (sorted, deduplicated), or `none`. |
 | `blocked (403 decoy)` | Sockets replaced by a decoy that answers `403` (defaults + `--hide-socket`, minus `--allow-socket`). |
 | `sealed (--seal-docker proxy)` | Docker sockets proxied with containers forced to `NetworkMode=none`. |
 | `upstream proxy` | Where the `--allow` proxy listens inside the sandbox, and the allowed hosts, or `none`. |
+| `dns sinkhole` | The resolver address and each allowed name's synthetic address and relayed ports, or `none` (no `--allow` host names, or `--no-dns`). |
 
 The summary is built from the same plan the sandbox is built from, so it shows
 exactly what will be set up. Combine with `--dry-run` to print it and exit
@@ -160,7 +232,7 @@ Error response from daemon: nullroute blocked access to /run/docker.sock (...). 
 |---|---|
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
 | `--hide-socket PATH` | Hide another socket too, e.g. an SSH agent or a local proxy (repeatable). |
-| `--dry-run` | Print the sockets that would be hidden and the ports forwarded, then exit. |
+| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
 
 ### Letting Docker tests run, with sealed containers
@@ -198,9 +270,10 @@ sockets speak a different protocol and are still hidden (not sealed) by default.
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
 | Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes |
 | Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none`; not a boundary for hostile images |
-| Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; other protocols stay sealed |
-| Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy and socket blocks; not direct IP connects |
-| Show the sandbox topology (`--inspect`) | ✅ namespaces, loopback, ports, sockets, proxy |
+| Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
+| Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |
+| Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy, DNS and socket blocks; not direct IP connects |
+| Show the sandbox topology (`--inspect`) | ✅ namespaces, loopback, ports, sockets, proxy, DNS sinkhole |
 | macOS | ❌ no network namespaces; needs a different mechanism |
 
 ### What nullroute is not
@@ -238,6 +311,14 @@ over a Unix socketpair (`SCM_RIGHTS`) before running your command. A socket
 stays in the namespace it was created in, so the parent, still on the host's
 network, accepts connections on it and relays each one to the host's
 `localhost:PORT`. Only the named ports are bridged, and only TCP.
+
+The `--allow` proxy and the DNS sinkhole use the same handover. For the
+sinkhole the child also binds `127.0.0.1:53` (UDP and TCP) and one listener per
+synthetic address and allowed port (binding ports below 1024 works because the
+child still holds its namespace capabilities at that point; the command doesn't
+after exec), adds `127.77.0.1/24` to `lo` over rtnetlink, and bind-mounts the
+generated `resolv.conf` and the resolver-socket masks. The parent answers the
+queries and relays the connections on the host's network.
 
 ## Requirements
 

@@ -16,9 +16,10 @@
 //!
 //! This only covers clients that honour proxy variables (curl, wget, pip,
 //! Python requests/urllib/httpx, Go net/http, Node's fetch with
-//! NODE_USE_ENV_PROXY, Java with flags...). Anything else, and anything that's
-//! not HTTP(S), still hits the sealed network and fails with "network
-//! unreachable", so the failure mode is closed, never open.
+//! NODE_USE_ENV_PROXY, Java with flags...). Other clients can reach allowed
+//! host names through the DNS sinkhole (dns.rs); anything else still hits the
+//! sealed network and fails with "network unreachable", so the failure mode is
+//! closed, never open.
 //!
 //! Resolution happens on the host. Addresses that resolve to loopback or
 //! "unspecified" are refused even for allowed names, so an allowed name can't be
@@ -50,7 +51,7 @@ pub enum Pattern {
 }
 
 impl Pattern {
-    fn matches(&self, h: &str) -> bool {
+    pub(crate) fn matches(&self, h: &str) -> bool {
         match self {
             Pattern::Exact(e) => e == h,
             Pattern::Suffix(s) => {
@@ -70,7 +71,7 @@ pub struct Entry {
     pub port: Option<u16>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Allowlist {
     entries: Vec<Entry>,
 }
@@ -149,7 +150,17 @@ impl Allowlist {
         self.entries.is_empty()
     }
 
-    fn norm(host: &str) -> String {
+    pub fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    /// Is host allowed on at least one port?
+    pub fn allows_host(&self, host: &str) -> bool {
+        let h = Self::norm(host);
+        self.entries.iter().any(|e| e.pattern.matches(&h))
+    }
+
+    pub(crate) fn norm(host: &str) -> String {
         let h = host.trim_end_matches('.').to_ascii_lowercase();
         let h = h.trim_start_matches('[').trim_end_matches(']');
         // Same canonical IP form stored by parse, so either spelling matches.
@@ -168,7 +179,7 @@ impl Allowlist {
     }
 }
 
-fn valid_hostname(h: &str) -> bool {
+pub(crate) fn valid_hostname(h: &str) -> bool {
     !h.is_empty()
         && h.len() <= 253
         && h.split('.').all(|l| {
@@ -179,6 +190,36 @@ fn valid_hostname(h: &str) -> bool {
                 && !l.starts_with('-')
                 && !l.ends_with('-')
         })
+}
+
+/// `--resolve HOST:IP` pins: host name (normalized) to the address nullroute
+/// dials instead of resolving the name on the host.
+pub type Overrides = std::collections::BTreeMap<String, IpAddr>;
+
+/// Parse `--resolve` values (`host:ip`, `host:[v6]` or `host:v6`). Every
+/// pinned host must be allowed by `allow`, so a pin can't widen the allowlist.
+pub fn parse_overrides(values: &[String], allow: &Allowlist) -> Result<Overrides, String> {
+    let mut out = Overrides::new();
+    for raw in values {
+        let v = raw.trim().to_ascii_lowercase();
+        let bad = |why: &str| Err(format!("--resolve {raw:?}: {why}"));
+        let Some((host, ip)) = v.split_once(':') else {
+            return bad("expected HOST:IP, e.g. api.example.com:10.0.0.5");
+        };
+        let host = host.trim_end_matches('.');
+        if !valid_hostname(host) || host.parse::<IpAddr>().is_ok() {
+            return bad("not a valid host name");
+        }
+        let ip = ip.trim_start_matches('[').trim_end_matches(']');
+        let Ok(ip) = ip.parse::<IpAddr>() else {
+            return bad("not a valid IP address");
+        };
+        if !allow.allows_host(host) {
+            return bad("host is not in --allow");
+        }
+        out.insert(host.to_string(), ip);
+    }
+    Ok(out)
 }
 
 /// First port from DEFAULT_PORT up that isn't a `--port`.
@@ -209,12 +250,17 @@ pub fn env_vars(port: u16) -> Vec<(&'static str, String)> {
 /// Shared state for one run: the allowlist and where blocks are recorded.
 pub struct Proxy {
     allow: Allowlist,
+    overrides: Overrides,
     report: Arc<Report>,
 }
 
 impl Proxy {
-    pub fn new(allow: Allowlist, report: Arc<Report>) -> Arc<Self> {
-        Arc::new(Proxy { allow, report })
+    pub fn new(allow: Allowlist, overrides: Overrides, report: Arc<Report>) -> Arc<Self> {
+        Arc::new(Proxy {
+            allow,
+            overrides,
+            report,
+        })
     }
 
     /// Serve proxy connections on a listener fd received from the sandbox.
@@ -260,7 +306,7 @@ impl Proxy {
             );
             return;
         }
-        let upstream = match dial(&req.host, req.port) {
+        let upstream = match dial(&req.host, req.port, &self.overrides) {
             Ok(s) => s,
             Err(DialError::Loopback) => {
                 self.block(
@@ -430,11 +476,15 @@ pub(crate) enum DialError {
     Io(io::Error),
 }
 
-pub(crate) fn dial(host: &str, port: u16) -> Result<TcpStream, DialError> {
-    let addrs: Vec<SocketAddr> = (host, port)
-        .to_socket_addrs()
-        .map_err(DialError::Io)?
-        .collect();
+/// Resolve (or look up in `overrides`) and connect, refusing loopback targets.
+pub(crate) fn dial(host: &str, port: u16, overrides: &Overrides) -> Result<TcpStream, DialError> {
+    let addrs: Vec<SocketAddr> = match overrides.get(&Allowlist::norm(host)) {
+        Some(&ip) => vec![SocketAddr::new(ip, port)],
+        None => (host, port)
+            .to_socket_addrs()
+            .map_err(DialError::Io)?
+            .collect(),
+    };
     if addrs.is_empty() {
         return Err(DialError::Io(io::Error::new(
             io::ErrorKind::NotFound,
@@ -617,6 +667,42 @@ mod tests {
         for ip in ["10.0.0.1", "93.184.216.34", "2001:db8::1"] {
             assert!(!forbidden(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn resolve_overrides_must_be_allowed_and_valid() {
+        let a = al(&["api.example.com", "*.svc.test:9000"]);
+        let o = parse_overrides(
+            &[
+                "API.example.com.:10.0.0.5".to_string(),
+                "x.svc.test:[2001:db8::1]".to_string(),
+                "y.svc.test:2001:db8::2".to_string(),
+            ],
+            &a,
+        )
+        .unwrap();
+        assert_eq!(o["api.example.com"], "10.0.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(o["x.svc.test"], "2001:db8::1".parse::<IpAddr>().unwrap());
+        assert_eq!(o["y.svc.test"], "2001:db8::2".parse::<IpAddr>().unwrap());
+        for bad in [
+            "other.com:10.0.0.5",
+            "api.example.com",
+            "api.example.com:nope",
+            "10.0.0.1:10.0.0.5",
+            "svc.test:10.0.0.5",
+        ] {
+            assert!(parse_overrides(&[bad.to_string()], &a).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn dial_uses_override_and_still_refuses_loopback() {
+        let mut o = Overrides::new();
+        o.insert("pinned.test".into(), "127.0.0.1".parse().unwrap());
+        assert!(matches!(
+            dial("Pinned.Test", 1, &o),
+            Err(DialError::Loopback)
+        ));
     }
 
     #[test]

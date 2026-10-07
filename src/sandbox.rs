@@ -15,7 +15,8 @@
 //!
 //! Loopback inside is the namespace's own, so services on the host's 127.0.0.1
 //! (a local Postgres, a published Docker port) are only reachable through
-//! `--port` forwarding; see forward.rs.
+//! `--port` forwarding; see forward.rs. With `--allow`, names resolve through
+//! the DNS sinkhole instead (dns.rs), which needs the mount namespace too.
 
 use std::ffi::CString;
 use std::io;
@@ -23,8 +24,15 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 
 use crate::report::Report;
-use crate::{forward, hide, proxy, signals};
+use crate::{dns, forward, hide, proxy, signals};
 use std::sync::Arc;
+
+/// What a listener created inside the sandbox is for.
+enum Role {
+    Port(u16),
+    Proxy,
+    Dns(dns::Listener),
+}
 
 /// Run `argv` inside a hermetic network namespace and wait for it. Each port in
 /// `ports` is bridged from the sandbox's localhost to the host's.
@@ -33,6 +41,7 @@ pub fn run_hermetic(
     ports: &[u16],
     hide: Option<&hide::Plan>,
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
+    dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
 ) -> io::Result<ExitStatus> {
     let (program, args) = argv
@@ -52,16 +61,24 @@ pub fn run_hermetic(
     );
 
     // Every listener the parent will serve is created inside the sandbox and
-    // handed over in one batch: --port bridges, then the --allow proxy.
-    // Each entry: (port, is_proxy); its two specs are v4 then optional v6.
-    let mut roles: Vec<(u16, bool)> = ports.iter().map(|&p| (p, false)).collect();
-    if let Some((pp, _)) = &proxy {
-        roles.push((*pp, true));
+    // handed over in one batch: --port bridges, the --allow proxy, then the
+    // DNS sinkhole (resolver + one listener per synthetic address and port).
+    let mut roles: Vec<(Role, forward::Spec)> = Vec::new();
+    for &p in ports {
+        roles.extend(forward::port_specs(p).map(|s| (Role::Port(p), s)));
     }
-    let specs: Vec<forward::Spec> = roles
-        .iter()
-        .flat_map(|&(p, _)| forward::port_specs(p))
-        .collect();
+    if let Some((pp, _)) = &proxy {
+        roles.extend(forward::port_specs(*pp).map(|s| (Role::Proxy, s)));
+    }
+    if let Some(d) = dns {
+        roles.extend(
+            d.plan()
+                .listeners()
+                .into_iter()
+                .map(|(l, s)| (Role::Dns(l), s)),
+        );
+    }
+    let specs: Vec<forward::Spec> = roles.iter().map(|(_, s)| *s).collect();
     let (parent_side, mut child_side) = if specs.is_empty() {
         (None, None)
     } else {
@@ -69,8 +86,25 @@ pub fn run_hermetic(
         (Some(p), Some(c))
     };
 
-    let mounts = hide.map(|h| h.mount_list()).transpose()?;
-    let flags = namespace_flags(mounts.is_some());
+    // Bind mounts for the private mount namespace: socket decoys, then the
+    // sinkhole's resolv.conf and resolver-socket masks. dns_files must outlive
+    // the child (it deletes the sources on drop).
+    let dns_files = dns.map(|_| dns::Files::create()).transpose()?;
+    let need_mount_ns = hide.is_some() || dns.is_some();
+    let mounts = if need_mount_ns {
+        let mut m = hide
+            .map(|h| h.mount_list())
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(f) = &dns_files {
+            m.extend(f.mounts.iter().cloned());
+        }
+        Some(m)
+    } else {
+        None
+    };
+    let flags = namespace_flags(need_mount_ns);
+    let pool_address = dns.is_some();
 
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -92,6 +126,9 @@ pub fn run_hermetic(
                 hide::apply_in_child(m)?;
             }
             loopback_up()?;
+            if pool_address {
+                dns::add_pool_address()?;
+            }
             if let Some(c) = child_side.as_mut() {
                 c.listen_and_send()?;
             }
@@ -121,23 +158,44 @@ pub fn run_hermetic(
                 return Err(e);
             }
         };
-        for (i, &(port, is_proxy)) in roles.iter().enumerate() {
-            let warned = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            for fd in [got.take(2 * i), got.take(2 * i + 1)].into_iter().flatten() {
-                match (&proxy, is_proxy) {
-                    (Some((_, p)), true) => p.spawn_acceptor(fd),
-                    _ => forward::serve_port(fd, port, warned.clone()),
+        // One "nothing listening" warning per --port, shared by its v4/v6 sockets.
+        let mut warned = std::collections::HashMap::new();
+        for (i, (role, _)) in roles.iter().enumerate() {
+            let Some(fd) = got.take(i) else { continue };
+            match role {
+                Role::Port(port) => {
+                    let w = warned
+                        .entry(*port)
+                        .or_insert_with(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+                    forward::serve_port(fd, *port, w.clone());
                 }
+                Role::Proxy => match &proxy {
+                    Some((_, p)) => p.spawn_acceptor(fd),
+                    // SAFETY: unreachable in practice; don't leak the fd.
+                    None => unsafe {
+                        libc::close(fd);
+                    },
+                },
+                Role::Dns(l) => match dns {
+                    Some(d) => d.serve(*l, fd),
+                    // SAFETY: as above.
+                    None => unsafe {
+                        libc::close(fd);
+                    },
+                },
             }
         }
     }
-    child.wait()
+    let status = child.wait();
+    drop(dns_files);
+    status
 }
 
 /// The namespaces the child unshares: always user + net, plus a mount
-/// namespace when there are sockets to hide. Shared with `--inspect`.
-pub fn namespace_flags(hide_sockets: bool) -> libc::c_int {
-    libc::CLONE_NEWUSER | libc::CLONE_NEWNET | if hide_sockets { libc::CLONE_NEWNS } else { 0 }
+/// namespace when there are sockets to hide or the DNS sinkhole needs its
+/// resolv.conf. Shared with `--inspect`.
+pub fn namespace_flags(mount_ns: bool) -> libc::c_int {
+    libc::CLONE_NEWUSER | libc::CLONE_NEWNET | if mount_ns { libc::CLONE_NEWNS } else { 0 }
 }
 
 /// open + write + close with raw syscalls (safe to call in pre_exec).

@@ -1,13 +1,14 @@
 //! Breach report: everything nullroute blocked during a run.
 //!
-//! Each blocking site (the --allow proxy and socket decoys) records what it blocked here. The first attempt at each target is
+//! Each blocking site (the --allow proxy, the DNS sinkhole and socket decoys) records what it blocked here. The first attempt at each target is
 //! printed immediately (unless --quiet), so a hung or failing command shows why
 //! right away; a summary of all of them is printed when the command exits, and
 //! can also be written as JSON for CI (--report-json).
 //!
 //! What can't be listed: a connection straight to an IP address that isn't
 //! allowed fails inside the kernel ("network unreachable") without reaching
-//! nullroute, so it doesn't appear here. Proxy requests and hidden sockets do.
+//! nullroute, so it doesn't appear here. Proxy requests, DNS lookups and hidden
+//! sockets do.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -22,6 +23,9 @@ pub enum Kind {
     Proxy,
     /// A Docker API request changed or refused by --seal-docker.
     Docker,
+    /// A DNS lookup of a name that isn't allowed (answered NXDOMAIN), or a
+    /// connection to a synthetic address the sinkhole refused to relay.
+    Dns,
 }
 
 impl Kind {
@@ -30,6 +34,7 @@ impl Kind {
             Kind::Socket => "socket",
             Kind::Proxy => "proxy",
             Kind::Docker => "docker",
+            Kind::Dns => "dns",
         }
     }
 }

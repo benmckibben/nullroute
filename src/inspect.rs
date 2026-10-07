@@ -2,13 +2,13 @@
 //!
 //! The summary is built from the same inputs the sandbox is built from (the
 //! namespace flags from `sandbox::namespace_flags`, the socket plan, the
-//! deduplicated port list and the proxy port), so it can't drift from what is
+//! deduplicated port list, the proxy port and the DNS sinkhole plan), so it can't drift from what is
 //! actually set up. It goes to stderr so the command's stdout stays clean.
 
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use crate::{hide, sandbox};
+use crate::{dns, hide, sandbox};
 
 /// Everything `--inspect` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,8 @@ pub struct Topology {
     pub sealed: Vec<PathBuf>,
     /// Port of the `--allow` proxy inside the sandbox, and the allowed hosts.
     pub proxy: Option<(u16, Vec<String>)>,
+    /// DNS sinkhole mapping lines (host -> synthetic address, ports), if on.
+    pub dns: Option<Vec<String>>,
 }
 
 impl Topology {
@@ -30,6 +32,7 @@ impl Topology {
         ports: &[u16],
         plan: Option<&hide::Plan>,
         proxy: Option<(u16, Vec<String>)>,
+        dns: Option<&dns::Plan>,
     ) -> Self {
         let (blocked, sealed) = match plan {
             None => (Vec::new(), Vec::new()),
@@ -39,11 +42,12 @@ impl Topology {
             ),
         };
         Topology {
-            ns_flags: sandbox::namespace_flags(plan.is_some()),
+            ns_flags: sandbox::namespace_flags(plan.is_some() || dns.is_some()),
             ports: ports.to_vec(),
             blocked,
             sealed,
             proxy,
+            dns: dns.map(dns::Plan::describe),
         }
     }
 
@@ -64,7 +68,12 @@ impl Topology {
     pub fn render(&self) -> String {
         let mut s = String::from("nullroute: inspect: sandbox topology\n");
         let _ = writeln!(s, "  namespaces:      {}", self.namespaces().join(", "));
-        let _ = writeln!(s, "  loopback:        lo: UP (127.0.0.1, ::1)");
+        let pool = if self.dns.is_some() {
+            format!(", {}", dns::POOL_CIDR)
+        } else {
+            String::new()
+        };
+        let _ = writeln!(s, "  loopback:        lo: UP (127.0.0.1, ::1{pool})");
         let ports = if self.ports.is_empty() {
             "none".to_string()
         } else {
@@ -88,6 +97,21 @@ impl Topology {
                     "  upstream proxy:  http://127.0.0.1:{port} (allow: {})",
                     hosts.join(", ")
                 );
+            }
+        }
+        match &self.dns {
+            None => {
+                let _ = writeln!(s, "  dns sinkhole:    none");
+            }
+            Some(lines) => {
+                let _ = writeln!(
+                    s,
+                    "  dns sinkhole:    127.0.0.1:{} (udp, tcp; other names get NXDOMAIN)",
+                    dns::PORT
+                );
+                for l in lines {
+                    let _ = writeln!(s, "    {l}");
+                }
             }
         }
         s
@@ -116,6 +140,7 @@ mod tests {
             blocked: vec![],
             sealed: vec![],
             proxy: None,
+            dns: None,
         }
     }
 
@@ -130,6 +155,7 @@ mod tests {
             "    blocked (403 decoy): none",
             "    sealed (--seal-docker proxy): none",
             "  upstream proxy:  none",
+            "  dns sinkhole:    none",
             "",
         ]
         .join("\n");
@@ -148,7 +174,7 @@ mod tests {
 
     #[test]
     fn new_without_plan_has_no_mount_namespace_or_sockets() {
-        let t = Topology::new(&[80, 443], None, None);
+        let t = Topology::new(&[80, 443], None, None, None);
         assert_eq!(t.namespaces(), vec!["user", "net"]);
         assert!(t.blocked.is_empty() && t.sealed.is_empty());
         assert_eq!(t.ports, vec![80, 443]);
@@ -163,6 +189,7 @@ mod tests {
             blocked: vec!["/run/podman/podman.sock".into(), "/tmp/a.sock".into()],
             sealed: vec!["/run/docker.sock".into()],
             proxy: Some((3128, vec!["api.github.com".into(), "*.stripe.dev".into()])),
+            dns: Some(vec!["api.github.com -> 127.77.0.1 (ports 80, 443)".into()]),
         };
         let out = t.render();
         assert!(
@@ -183,6 +210,23 @@ mod tests {
         assert!(
             out.contains(
                 "  upstream proxy:  http://127.0.0.1:3128 (allow: api.github.com, *.stripe.dev)\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn dns_sinkhole_lists_mapping_and_adds_mount_namespace() {
+        let allow = crate::proxy::Allowlist::parse(&["db.example.com:5432".to_string()]).unwrap();
+        let plan = dns::Plan::new(&allow).unwrap().unwrap();
+        let t = Topology::new(&[], None, None, Some(&plan));
+        assert_eq!(t.namespaces(), vec!["user", "net", "mount"]);
+        let out = t.render();
+        assert!(
+            out.ends_with(
+                "  dns sinkhole:    127.0.0.1:53 (udp, tcp; other names get NXDOMAIN)
+    db.example.com -> 127.77.0.1 (ports 5432)
+"
             ),
             "{out}"
         );
