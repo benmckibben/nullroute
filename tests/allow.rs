@@ -170,6 +170,42 @@ fn allow_loopback_or_localhost_is_rejected_pointing_at_port() {
 }
 
 #[test]
+fn allow_loopback_is_rejected_before_anything_runs() {
+    // Every common spelling of "this machine", including in a comma list and
+    // with --dry-run: refused at parse time (exit 2), nothing runs, and the
+    // error says loopback can't work through --allow and points at --port.
+    let marker = std::env::temp_dir().join(format!("nr-allow-lo-{}", std::process::id()));
+    let touch = format!("touch {}", marker.display());
+    for bad in [
+        "localhost",
+        "LOCALHOST.",
+        "localhost.localdomain",
+        "ip6-localhost",
+        "ip6-loopback",
+        "*.localhost",
+        "127.0.0.1",
+        "127.1.2.3",
+        "::1",
+        "[::1]",
+        "0.0.0.0",
+        "::",
+        "example.com,localhost",
+    ] {
+        let o = nullroute(&["--allow", bad, "--", "sh", "-c", &touch]);
+        assert_eq!(o.status.code(), Some(2), "--allow {bad}: {o:?}");
+        let e = err(&o);
+        assert!(
+            e.contains("loopback is never reachable through --allow")
+                && e.contains("bridge it with --port PORT"),
+            "--allow {bad}: {e}"
+        );
+        assert!(!marker.exists(), "--allow {bad}: the command ran");
+        let o = nullroute(&["--allow", bad, "--dry-run", "--", "true"]);
+        assert_eq!(o.status.code(), Some(2), "--allow {bad} --dry-run: {o:?}");
+    }
+}
+
+#[test]
 fn allow_link_local_or_metadata_is_rejected() {
     for bad in ["169.254.169.254", "fe80::1", "fd00:ec2::254"] {
         let o = nullroute(&["--allow", bad, "--", "true"]);
