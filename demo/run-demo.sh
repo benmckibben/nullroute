@@ -47,10 +47,10 @@ type_cmd "nullroute run -- python3 examples/01-python-test-leak/test_payment.py"
 echo ""
 sleep 1
 
-echo -e "\033[1;33m[Scene 3] Surgical egress allowlisting (--allow api.github.com):\033[0m"
-type_cmd "nullroute run --allow api.github.com -- python3 examples/01-python-test-leak/test_payment.py"
-if curl -s --connect-timeout 2 -I https://api.github.com &>/dev/null; then
-    "$NULLROUTE" run --allow api.github.com -- python3 "$REPO_ROOT/examples/01-python-test-leak/test_payment.py" || true
+echo -e "\033[1;33m[Scene 3] Surgical egress allowlisting (--allow example.com):\033[0m"
+type_cmd "nullroute run --allow example.com -- python3 examples/01-python-test-leak/test_payment.py"
+if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
+    "$NULLROUTE" run --allow example.com -- python3 "$REPO_ROOT/examples/01-python-test-leak/test_payment.py" || true
 else
     echo "skipping live network call: host is currently offline."
 fi
@@ -58,7 +58,7 @@ echo ""
 sleep 1
 
 echo -e "\033[1;33m[Scene 4] Inspecting sandbox topology and bridged boundaries:\033[0m"
-type_cmd "nullroute run --allow api.github.com --port 5432 --inspect --dry-run -- true"
-"$NULLROUTE" run --allow api.github.com --port 5432 --inspect --dry-run -- true
+type_cmd "nullroute run --allow example.com --port 5432 --inspect --dry-run -- true"
+"$NULLROUTE" run --allow example.com --port 5432 --inspect --dry-run -- true
 echo ""
 echo -e "\033[1;32m✔ Demo complete.\033[0m"

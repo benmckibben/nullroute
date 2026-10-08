@@ -11,7 +11,7 @@ It is crucial to understand `nullroute`'s exact boundary:
 2. **Local Unix Sockets & Files:** Network namespaces **do not** isolate the filesystem or non-abstract Unix domain sockets by path. 
    - Standard Docker sockets and system D-Bus are hidden by default via mount namespace redirection to decoy sockets.
    - User agent sockets like `SSH_AUTH_SOCK`, X11, or GPG agent **remain reachable** unless explicitly hidden (`--hide-socket "$SSH_AUTH_SOCK"`) or unset.
-3. **Recommended Practice:** Always run untrusted scripts with a clean/temporary `HOME` (`MOCK_HOME=$(mktemp -d)`), stripped credentials, and unset `SSH_AUTH_SOCK` in addition to `nullroute run --`.
+3. **Recommended Practice:** Always run untrusted scripts with a clean/temporary `HOME` (`MOCK_HOME=$(mktemp -d)`), stripped credentials, and unset `SSH_AUTH_SOCK` via `env -u SSH_AUTH_SOCK` in addition to `nullroute run --`.
 
 ## Quick Demo
 
@@ -30,5 +30,5 @@ node postinstall.js
 
 ### 2. Sealed with nullroute (blocked at kernel namespace boundary):
 ```bash
-SSH_AUTH_SOCK="" nullroute run --strict -- node postinstall.js
+env -u SSH_AUTH_SOCK nullroute run -- node postinstall.js
 ```

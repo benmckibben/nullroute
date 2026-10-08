@@ -24,11 +24,11 @@ Enter
 Sleep 3s
 
 # Scene 3: Surgical Bridge with --allow
-Type "nullroute run --allow api.github.com -- python3 examples/01-python-test-leak/test_payment.py"
+Type "nullroute run --allow example.com -- python3 examples/01-python-test-leak/test_payment.py"
 Enter
 Sleep 3.5s
 
 # Scene 4: Summary & Inspect
-Type "nullroute run --allow api.github.com --port 5432 --inspect --dry-run"
+Type "nullroute run --allow example.com --port 5432 --inspect --dry-run -- true"
 Enter
 Sleep 4s
