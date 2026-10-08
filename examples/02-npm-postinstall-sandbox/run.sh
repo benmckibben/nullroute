@@ -15,7 +15,9 @@ cd "$SCRIPT_DIR"
 # and host files are NOT isolated by network namespaces alone.
 DEMO_TMP_HOME="$(mktemp -d)"
 cleanup() {
-    rm -rf "$DEMO_TMP_HOME"
+    if [[ -n "${DEMO_TMP_HOME:-}" && -d "$DEMO_TMP_HOME" ]]; then
+        rm -rf "$DEMO_TMP_HOME"
+    fi
 }
 trap cleanup EXIT
 

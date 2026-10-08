@@ -44,6 +44,8 @@ find_nullroute() {
         command -v nullroute
     else
         echo "Error: nullroute binary not found. Build it with 'cargo build' in $repo_root first." >&2
-        exit 1
+        # Exit 125 indicates a pre-execution / setup prerequisite failure, distinct from
+        # exit 1 (strict blocked) or exit 2 (bad arguments).
+        exit 125
     fi
 }
