@@ -1,0 +1,95 @@
+# Changelog
+
+All notable changes to this project are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+Nothing has been released yet. This section lists everything the first release
+will contain.
+
+### Added
+
+- `nullroute run [OPTIONS] -- COMMAND`: run a command in a new user and network
+  namespace that has only its own loopback. No root needed; the command's exit
+  code is passed through (`128+N` for signals, `125` if nullroute itself fails).
+- `--port`: bridge chosen ports of the host's localhost into the sandbox
+  (TCP, IPv4 and IPv6).
+- `--allow`: let chosen hosts through (`host`, `*.domain`, IP literals, optional
+  `:port`) via an HTTP(S) proxy (`HTTP_PROXY` and friends) and, for clients that
+  ignore proxy variables, a DNS sinkhole with a transparent TCP relay on
+  synthetic loopback addresses. `--resolve HOST:IP` pins an allowed host;
+  `--no-dns` turns the sinkhole off.
+- Container-runtime sockets (Docker, Podman, containerd, BuildKit) are hidden
+  by default behind a decoy that answers `403`; `--hide-socket` and
+  `--allow-socket` adjust the list.
+- `--seal-docker` and `--seal-docker-socket`: let the command use Docker, with
+  every container it creates forced onto `NetworkMode=none` and classic-builder
+  builds forced onto `networkmode=none`.
+- `--seal-docker-pulls any|allowlisted|none`: limit what the Docker daemon
+  contacts on the command's behalf (pulls, logins, lookups, pushes, URL imports,
+  remote build contexts).
+- Report of everything that was blocked, printed live and as a summary;
+  `--strict` (fail if anything was blocked), `--quiet`, and `--report-json FILE`
+  (including a separate `rewritten` list for requests `--seal-docker` changed
+  and let through).
+- `--dry-run` and `--inspect`: show what would be hidden, bridged, allowed and
+  sealed, and the sandbox topology.
+- Linux builds for x86_64 and aarch64, glibc and musl (static) targets. Other
+  targets fail to build with a single clear error.
+- CI: rustfmt, clippy, tests on stable and the MSRV (Rust 1.88) and on musl,
+  cross-target checks, and a `cargo-deny` audit (also run weekly); Dependabot for
+  Actions and Cargo.
+- A build-only release workflow that produces release archives and
+  `SHA256SUMS` as workflow-run artifacts, after checking the tag against the
+  crate version and running the CI checks.
+- `SECURITY.md`, `CONTRIBUTING.md` and this changelog.
+
+### Security
+
+Findings from a security review of the first version, all fixed before release:
+
+- S1: the system D-Bus socket is hidden by default (it let a sandboxed command
+  resolve names on the host through systemd-resolved).
+  `--allow-socket /run/dbus/system_bus_socket` opts back in.
+- S2: systemd-resolved's varlink socket and nscd are masked in every sandbox,
+  not only with `--allow`, so name resolution can't bypass the sandbox.
+- `--seal-docker`: the connection is no longer switched to an unparsed raw relay
+  just because a request path looked like attach/exec; a probe followed by a
+  `NetworkMode=host` container create on the same connection used to get a
+  host-networked container. Only a genuine `101 Switching Protocols` (or the
+  daemon's raw stream for attach/exec start) starts a relay. Container-create
+  bodies that aren't a single JSON object, chunked bodies and duplicate
+  `Content-Length` headers are refused, and JSON keys are matched the way
+  Docker's decoder matches them.
+- S4: `--seal-docker` now also seals classic `docker build` (`networkmode=none`)
+  and refuses what can't be sealed: BuildKit/buildx builds (`/build?version=2`,
+  `/grpc`, `/session`; the "BuildKit gap"), `/networks/{id}/connect`, Swarm
+  services and `swarm init/join`, and plugin install/enable/upgrade. Request paths
+  are matched after percent-decoding and dot/slash cleaning, and ambiguous ones
+  are refused.
+- S5: the `--allow` proxy and the DNS sinkhole refuse link-local addresses
+  (including the `169.254.169.254` cloud metadata service), other known metadata
+  endpoints, `0.0.0.0/8` and IPv6 forms that wrap a forbidden IPv4 address.
+  `--allow` entries that can never work (`localhost`, loopback and link-local
+  IPs) are rejected at startup.
+
+### Fixed
+
+- The command no longer outlives nullroute: it gets SIGKILL when nullroute dies
+  (`PR_SET_PDEATHSIG`), and whatever it leaves running when it exits (background
+  jobs, daemons, even `setsid` ones) is killed before nullroute exits.
+- SIGTERM, SIGHUP, SIGINT and SIGQUIT that arrive while the command is starting
+  are no longer lost or fatal to nullroute; the command starts with the signal
+  mask it would normally have.
+- `--report-json` is checked before the command runs (exit `2` if it can't be
+  written); a write failure at the end of an otherwise successful run now exits
+  `74` instead of `0`.
+- `--seal-docker` rewrites (forced `NetworkMode=none`, sealed classic builds)
+  no longer count as blocks, so `--strict --seal-docker` passes when the command
+  only starts sealed containers.
+- musl targets build (the `ioctl` request type differs from glibc).
+
+[Unreleased]: https://github.com/benmckibben/nullroute/commits/master
