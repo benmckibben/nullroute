@@ -12,17 +12,17 @@ cd "$SCRIPT_DIR"
 
 echo "=================================================================="
 echo " STEP 1: Running python test normally (NO nullroute)"
-echo " Notice how the test silently reaches out to GitHub API..."
+echo " Notice how the test silently reaches out to example.com..."
 echo " (Note: This step requires live internet connectivity)"
 echo "=================================================================="
-if curl -s --connect-timeout 2 -I https://api.github.com &>/dev/null; then
+if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     set +e
     python3 test_payment.py
     NORMAL_STATUS=$?
     set -e
     echo "Normal run exit code: $NORMAL_STATUS"
 else
-    echo "skipping step 1: host is currently offline or api.github.com is unreachable."
+    echo "skipping step 1: host is currently offline or example.com is unreachable."
 fi
 
 echo ""
@@ -51,8 +51,8 @@ echo " We verify the breach report directly from JSON output."
 echo "=================================================================="
 REPORT_FILE="$(mktemp --suffix=.json)"
 set +e
-# Allow a benign host (example.com); the test targets api.github.com
-"$NULLROUTE" run --allow example.com --report-json "$REPORT_FILE" -- python3 test_payment.py
+# Allow a benign host (example.org); the test targets example.com
+"$NULLROUTE" run --allow example.org --report-json "$REPORT_FILE" -- python3 test_payment.py
 set -e
 
 echo "Verifying breach report captures the unallowed destination..."
@@ -66,10 +66,10 @@ blocked = report.get('blocked', [])
 targets = [b.get('target') for b in blocked]
 print(f'Blocked targets in report: {targets}')
 
-if any('api.github.com' in t for t in targets):
-    print('✔ Verified: api.github.com was correctly intercepted and recorded.')
+if any('example.com' in t for t in targets):
+    print('✔ Verified: example.com was correctly intercepted and recorded.')
 else:
-    print('✘ Error: api.github.com not found in breach report!', file=sys.stderr)
+    print('✘ Error: example.com not found in breach report!', file=sys.stderr)
     sys.exit(1)
 "
 rm -f "$REPORT_FILE"
@@ -82,8 +82,8 @@ echo " exit 1 by --strict when unauthorized traffic was attempted."
 echo "=================================================================="
 REPORT_FILE="$(mktemp --suffix=.json)"
 set +e
-# curl attempts api.github.com (blocked), but the command pipeline exits 0 (|| true)
-"$NULLROUTE" run --strict --allow example.com --report-json "$REPORT_FILE" -- sh -c "curl -s https://api.github.com || true"
+# curl attempts example.com (blocked), but the command pipeline exits 0 (|| true)
+"$NULLROUTE" run --strict --allow example.org --report-json "$REPORT_FILE" -- sh -c "curl -s http://example.com || true"
 STRICT_EXIT=$?
 set -e
 
@@ -98,7 +98,7 @@ with open(report_path) as f:
 
 strict_failed = report.get("strict_failed", False)
 exit_code = report.get("exit_code", -1)
-print(f"Report strict_failed={strict_failed}, command exit_code={exit_code}, nullroute status={strict_exit}")
+print(f"Report strict_failed={strict_failed}, reported exit code (after strict)={exit_code}, nullroute status={strict_exit}")
 
 if strict_exit == 1 and strict_failed:
     print("✔ Verified: --strict converted exit 0 into exit 1 due to recorded breach.")
@@ -110,12 +110,19 @@ rm -f "$REPORT_FILE"
 
 echo ""
 echo "=================================================================="
-echo " STEP 5: Running with surgical --allow api.github.com"
+echo " STEP 5: Running with surgical --allow example.com"
 echo " (Opt-in external test; checks internet connectivity first)"
 echo "=================================================================="
-if curl -s --connect-timeout 2 -I https://api.github.com &>/dev/null; then
-    "$NULLROUTE" run --allow api.github.com -- python3 test_payment.py
-    echo "Allowed run succeeded cleanly!"
+if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
+    set +e
+    "$NULLROUTE" run --allow example.com -- python3 test_payment.py
+    ALLOWED_STATUS=$?
+    set -e
+    if [[ $ALLOWED_STATUS -eq 0 ]]; then
+        echo "Allowed run succeeded cleanly!"
+    else
+        echo "skipping: external request failed (network or upstream error, exit code: $ALLOWED_STATUS)"
+    fi
 else
-    echo "skipping: offline or external connectivity to api.github.com unavailable."
+    echo "skipping: offline or external connectivity to example.com unavailable."
 fi
