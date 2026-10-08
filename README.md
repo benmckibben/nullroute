@@ -221,7 +221,7 @@ CLI reconnects).
 | `1` | `--strict` and something was blocked, though the command succeeded |
 | `2` | bad arguments, and nothing is run: unknown or invalid options, an `--allow`, `--resolve` or `--port` value that can't work (or more than 64 of them), `--seal-docker-pulls` without a sealed socket, an unwritable `--report-json` |
 | `74` | the `--report-json` file couldn't be written after a run that would have exited 0 (a non-zero exit is kept) |
-| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused), the command couldn't be started (not found, not executable), socket hiding couldn't be prepared |
+| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused), the command couldn't be started (not found, not executable), or socket hiding couldn't be prepared |
 
 The command can exit with any of these itself, so they only mean something when
 the command isn't known to use them. (`125` is what Docker and Podman use for
