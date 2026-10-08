@@ -63,22 +63,23 @@ if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     fi
 
     # Verify breach report records the unallowed destination
-    python3 -c "
-import json, sys
+    REPORT_PATH="$REPORT_FILE" python3 -c '
+import json, os, sys
 
-with open('$REPORT_FILE') as f:
+report_path = os.environ["REPORT_PATH"]
+with open(report_path) as f:
     report = json.load(f)
 
-blocked = report.get('blocked', [])
-targets = [b.get('target') for b in blocked]
-print(f'Blocked targets in report: {targets}')
+blocked = report.get("blocked", [])
+targets = [b.get("target") for b in blocked]
+print(f"Blocked targets in report: {targets}")
 
-if any('example.org' in t for t in targets):
-    print('✔ Verified: example.org was correctly recorded in the breach report.')
+if any("example.org" in t for t in targets):
+    print("✔ Verified: example.org was correctly recorded in the breach report.")
 else:
-    print('✘ Error: example.org was not recorded in breach report!', file=sys.stderr)
+    print("✘ Error: example.org was not recorded in breach report!", file=sys.stderr)
     sys.exit(1)
-"
+'
     rm -f "$REPORT_FILE"
 else
     echo "skipping step 2: host is currently offline or example.com is unreachable."
