@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# shellcheck source=../common-preflight.sh
 source "$REPO_ROOT/examples/common-preflight.sh"
 preflight_check
 NULLROUTE="$(find_nullroute "$REPO_ROOT")"
@@ -25,12 +26,14 @@ trap cleanup EXIT
 echo "=================================================================="
 echo " STEP 1: Running postinstall hook directly (leaks to example.com)"
 echo "=================================================================="
-if curl -s --connect-timeout 2 -I https://example.com &>/dev/null; then
+if examples_offline; then
+    skip_step "step 1" "the unsandboxed postinstall hook needs live internet access to example.com"
+elif curl -s --connect-timeout 2 -I https://example.com &>/dev/null; then
     set +e
     HOME="$DEMO_TMP_HOME" node postinstall.js
     set -e
 else
-    echo "skipping step 1: host is currently offline."
+    skip_step "step 1" "host is currently offline."
 fi
 
 echo ""
@@ -45,7 +48,11 @@ set -e
 
 if [[ $STATUS -ne 0 ]]; then
     echo "-> Exfiltration attempt was successfully blocked! Node exit code: $STATUS"
+    assertion_passed
 else
     echo "-> Unexpected: process exited 0 under nullroute."
     exit 1
 fi
+
+echo ""
+examples_summary "02-npm-postinstall-sandbox"

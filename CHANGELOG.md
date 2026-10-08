@@ -46,6 +46,12 @@ will contain.
   `SHA256SUMS` as workflow-run artifacts, after checking the tag against the
   crate version and running the CI checks.
 - `SECURITY.md`, `CONTRIBUTING.md` and this changelog.
+- Developer examples under `examples/` (Python test leak, npm postinstall,
+  local service `--port`, surgical `--allow`) and a terminal demo under
+  `demo/` (`run-demo.sh` and a VHS tape). Not part of the published crate.
+  `NULLROUTE_EXAMPLES_OFFLINE=1` skips the steps that need the public internet,
+  and each example prints an `examples: <name>: N assertions run, M skipped`
+  summary; CI runs examples 01 and 03 this way, plus `shellcheck`.
 
 ### Security
 
