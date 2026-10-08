@@ -1,0 +1,428 @@
+name: Release build
+
+# BUILD ONLY. This workflow compiles release binaries and uploads them as
+# artifacts of the workflow run (visible to people with access to this
+# repository's Actions tab, and deleted after the retention period). It does
+# not publish anything:
+#   - no GitHub Release is created and no tag is pushed (the token is
+#     read-only, so it couldn't);
+#   - no cargo publish, no crates.io token, no repository secrets are used;
+#   - no attestations (see "Provenance" below).
+# Cutting the actual release (tag, GitHub Release, crates.io) is a manual step;
+# see CONTRIBUTING.md.
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry-run the whole pipeline from any branch, without a tag.
+  workflow_dispatch:
+
+# Read-only token, workflow-wide. Don't add write scopes here: a release
+# workflow that can write is one bug away from publishing.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+# Provenance: not enabled on purpose. actions/attest-build-provenance needs
+# id-token: write and attestations: write; artifact attestations aren't
+# available for private repositories on GitHub Free/Pro; and on a public
+# repository they are signed with the public-good Sigstore instance and
+# recorded in its public transparency log, which is a public publication that
+# this build-only workflow must not make. Once the repository is public and a
+# real release is intended, add the action to the "checksums" job (grant the
+# two write permissions on that job only, not workflow-wide) and attest
+# out/*.tar.gz and out/SHA256SUMS.
+
+# Third-party actions are pinned to full commit SHAs (tag in the trailing
+# comment); Dependabot keeps them current via .github/dependabot.yml.
+
+jobs:
+  # Cheap, fast guard: does the tag match the crate, and is it on master?
+  guard:
+    name: tag and version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # the tagged commit must be reachable from master
+      - id: meta
+        name: Check the tag against Cargo.toml
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "nullroute") | .version')
+          if [ -z "$version" ]; then
+            echo "::error::couldn't read the version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+
+          if [ "$REF_TYPE" != "tag" ]; then
+            echo "::notice::not a tag run ($REF_TYPE $REF_NAME): building $version for testing only"
+            exit 0
+          fi
+
+          # v<semver>, nothing else.
+          if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::tag '$REF_NAME' is not of the form vMAJOR.MINOR.PATCH[-prerelease]"
+            exit 1
+          fi
+          if [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::tag '$REF_NAME' doesn't match version $version in Cargo.toml (expected v$version)"
+            exit 1
+          fi
+
+          # Never release a commit that isn't on the default branch.
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::$GITHUB_SHA is not reachable from $DEFAULT_BRANCH; release tags must point at a commit on $DEFAULT_BRANCH"
+            exit 1
+          fi
+
+          # Once there's a changelog, the release must have its own section
+          # (moved out of "Unreleased").
+          if [ -f CHANGELOG.md ] && ! grep -Eq "^## \[$version\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$version]' section"
+            exit 1
+          fi
+          echo "tag $REF_NAME matches Cargo.toml and is on $DEFAULT_BRANCH"
+
+  # The same checks CI runs, on the commit being released.
+  checks:
+    name: checks (${{ matrix.toolchain }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        # "1.88" must match rust-version in Cargo.toml (MSRV).
+        toolchain: [stable, "1.88"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.toolchain }}
+      - name: rustfmt
+        if: matrix.toolchain == 'stable'
+        run: cargo fmt --all --check
+      - name: clippy
+        if: matrix.toolchain == 'stable'
+        run: cargo clippy --all-targets --locked -- -D warnings
+      # See ci.yml: the integration tests run the real binary and need
+      # unprivileged user namespaces, which Ubuntu 24.04 restricts.
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --net --map-current-user true
+      - name: Pull alpine for --seal-docker tests
+        run: docker pull alpine
+      - run: cargo test --locked --no-fail-fast -- --show-output
+
+  # cargo package builds the .crate that would go to crates.io, entirely
+  # locally (and verifies it compiles from the extracted package). Nothing is
+  # uploaded or published; this only checks what would be in it.
+  package:
+    name: package check (cargo package)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: package
+      - name: cargo package --locked (build and verify the .crate locally)
+        run: cargo package --locked
+      - name: Check the package contents
+        run: |
+          set -euo pipefail
+          cargo package --list --locked > files.txt
+          echo "::group::cargo package --list"
+          cat files.txt
+          echo "::endgroup::"
+
+          # Allow-list: the manifest, lockfile, docs, licences, sources and tests.
+          # Anything else (agent/editor files, CI config, notes, keys, ...) fails.
+          allowed='^(Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|\.cargo_vcs_info\.json|README\.md|CHANGELOG\.md|LICENSE-MIT|LICENSE-APACHE|src/[A-Za-z0-9_/]+\.rs|tests/[A-Za-z0-9_/]+\.rs)$'
+          unexpected=$(grep -Ev "$allowed" files.txt || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::unexpected files in the package:"
+            echo "$unexpected"
+            exit 1
+          fi
+
+          for f in Cargo.toml Cargo.lock README.md LICENSE-MIT LICENSE-APACHE src/main.rs; do
+            if ! grep -qx "$f" files.txt; then
+              echo "::error::$f is missing from the package"
+              exit 1
+            fi
+          done
+
+          # Belt and braces: look inside the packaged files for things that
+          # shouldn't ship (local paths, agent tooling, credentials).
+          version=$(cargo metadata --no-deps --locked --format-version 1 \
+            | jq -r '.packages[] | select(.name == "nullroute") | .version')
+          crate="target/package/nullroute-$version.crate"
+          ls -l "$crate"
+          sha256sum "$crate"
+          mkdir unpacked
+          tar -xzf "$crate" -C unpacked
+          if grep -rInE '/home/|/Users/|openclaw|ghp_[A-Za-z0-9]|github_pat_|gh[osu]_[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|CARGO_REGISTRY_TOKEN|cio[A-Za-z0-9]{30}' unpacked; then
+            echo "::error::the package contains something that looks like a local path, agent file or credential (see above)"
+            exit 1
+          fi
+          echo "package contents OK: $(wc -l < files.txt) files, no unexpected paths or credential-looking strings"
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: [guard, checks, package]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Static musl: runs on any Linux of that architecture. Pure Rust (no C
+          # dependencies), so the aarch64 build only needs a linker that knows
+          # aarch64: the distro's cross gcc (gcc-aarch64-linux-gnu). rustc
+          # brings its own musl C runtime. Chosen over cross (needs Docker and
+          # third-party images) and cargo-zigbuild (needs Zig downloaded from
+          # outside the distro): nothing is fetched except apt packages and
+          # the Rust toolchain.
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            arch: x86_64
+            static: true
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04
+            arch: aarch64
+            static: true
+            linker: aarch64-linux-gnu-gcc
+          # glibc builds, for hosts where the musl resolver's behaviour differs
+          # (nullroute resolves allowed names on the host). Built on 22.04 so
+          # the binaries only need glibc >= 2.35.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            arch: x86_64
+            static: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            arch: aarch64
+            static: false
+            linker: aarch64-linux-gnu-gcc
+    env:
+      VERSION: ${{ needs.guard.outputs.version }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Install the aarch64 cross linker and QEMU user-mode emulation
+        if: matrix.arch == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+
+      - name: Build
+        env:
+          LINKER: ${{ matrix.linker }}
+          # Smaller binaries, and no builder paths baked into them.
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="--remap-path-prefix=$GITHUB_WORKSPACE=/build --remap-path-prefix=$HOME/.cargo=/cargo --remap-path-prefix=$HOME/.rustup=/rustup"
+          args=(--release --locked --target "$TARGET")
+          if [ -n "$LINKER" ]; then
+            args+=(--config "target.$TARGET.linker=\"$LINKER\"")
+          fi
+          cargo build "${args[@]}"
+          file "target/$TARGET/release/nullroute"
+
+      - name: Check what was built
+        env:
+          ARCH: ${{ matrix.arch }}
+          STATIC: ${{ matrix.static }}
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/nullroute"
+          machine=$(readelf -h "$bin" | awk -F: '/Machine:/ {gsub(/^ +/, "", $2); print $2}')
+          echo "machine: $machine"
+          case "$ARCH" in
+            x86_64) want="Advanced Micro Devices X86-64" ;;
+            aarch64) want="AArch64" ;;
+          esac
+          [ "$machine" = "$want" ] || { echo "::error::expected $want, got $machine"; exit 1; }
+          # Capture first: grep -q exiting early would SIGPIPE readelf and trip pipefail.
+          segments=$(readelf -lW "$bin")
+          dynamic=$(readelf -dW "$bin" 2>/dev/null || true)
+          if [ "$STATIC" = "true" ]; then
+            # Fully static: no interpreter, no shared-library dependencies.
+            if grep -q INTERP <<<"$segments" || grep -q NEEDED <<<"$dynamic"; then
+              echo "::error::$bin is not statically linked"
+              exit 1
+            fi
+            echo "statically linked"
+          else
+            echo "dynamic dependencies:"
+            grep NEEDED <<<"$dynamic" || true
+            glibc=$(readelf --dyn-syms -W "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+            echo "highest glibc symbol version needed: $glibc"
+            [ "$(printf '%s\n' "$glibc" GLIBC_2.35 | sort -V | tail -1)" = "GLIBC_2.35" ] \
+              || { echo "::error::needs $glibc, wanted <= GLIBC_2.35"; exit 1; }
+          fi
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="nullroute-$VERSION-$TARGET"
+          rm -rf dist
+          mkdir -p "dist/$name"
+          install -m 755 "target/$TARGET/release/nullroute" "dist/$name/nullroute"
+          install -m 644 LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          if [ -f CHANGELOG.md ]; then
+            install -m 644 CHANGELOG.md "dist/$name/"
+          fi
+          # Reproducible archive: sorted names, fixed owner, commit timestamp.
+          epoch=$(git log -1 --format=%ct)
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              --mtime="@$epoch" -C dist -cf - "$name" \
+            | gzip -9n > "dist/$name.tar.gz"
+          ls -l dist
+          tar -tzvf "dist/$name.tar.gz"
+
+      # Smoke-test the archive we're about to ship, not the build directory.
+      - name: Smoke test (native)
+        if: matrix.arch == 'x86_64'
+        run: |
+          set -euo pipefail
+          name="nullroute-$VERSION-$TARGET"
+          work=$(mktemp -d)
+          tar -xzf "dist/$name.tar.gz" -C "$work"
+          bin="$work/$name/nullroute"
+
+          # Userns are restricted on 24.04 by AppArmor; the sysctl doesn't
+          # exist on 22.04.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          unshare --user --net --map-current-user true
+
+          "$bin" --version | tee version.txt
+          [ "$(cat version.txt)" = "nullroute $VERSION" ]
+          "$bin" run --dry-run --port 5432 --allow example.com -- true
+          "$bin" run --inspect --dry-run -- true
+
+          # A real sandbox: exit codes pass through, the network is sealed,
+          # and the JSON report is written.
+          rc=0; "$bin" run -- sh -c 'exit 3' || rc=$?
+          [ "$rc" -eq 3 ] || { echo "::error::expected exit code 3, got $rc"; exit 1; }
+          "$bin" run --strict --report-json report.json -- true
+          jq -e '.exit_code == 0 and (.blocked | length) == 0' report.json
+          out=$("$bin" run -- python3 -c "
+          import socket, sys
+          try:
+              socket.create_connection(('1.1.1.1', 443), timeout=5)
+          except OSError as e:
+              print('sealed:', e); sys.exit(0)
+          print('REACHED THE NETWORK'); sys.exit(1)
+          ")
+          echo "$out"
+          grep -q '^sealed: .*unreachable' <<<"$out"
+          echo "smoke test passed"
+
+      # No aarch64 runner: run what can run under qemu-user (the binary is
+      # static, or links the cross glibc). Sandboxing itself (namespaces under
+      # emulation) isn't exercised; CI's cross-check covers compilation and the
+      # native test jobs cover behaviour.
+      - name: Smoke test (aarch64, under QEMU)
+        if: matrix.arch == 'aarch64'
+        env:
+          STATIC: ${{ matrix.static }}
+        run: |
+          set -euo pipefail
+          name="nullroute-$VERSION-$TARGET"
+          work=$(mktemp -d)
+          tar -xzf "dist/$name.tar.gz" -C "$work"
+          bin="$work/$name/nullroute"
+          run=(qemu-aarch64)
+          if [ "$STATIC" != "true" ]; then
+            run+=(-L /usr/aarch64-linux-gnu)
+          fi
+          "${run[@]}" "$bin" --version | tee version.txt
+          [ "$(cat version.txt)" = "nullroute $VERSION" ]
+          "${run[@]}" "$bin" run --dry-run --port 5432 --allow example.com -- true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-${{ matrix.target }}
+          path: dist/nullroute-${{ needs.guard.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Collect the archives, write and verify SHA256SUMS, and keep the lot as ONE
+  # workflow-run artifact. Run artifacts, not a release: nothing leaves this
+  # workflow run.
+  checksums:
+    name: SHA256SUMS
+    needs: [guard, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: out
+      - name: Write and verify SHA256SUMS
+        working-directory: out
+        run: |
+          set -euo pipefail
+          ls -l
+          count=$(find . -maxdepth 1 -name 'nullroute-*.tar.gz' | wc -l)
+          if [ "$count" -ne 4 ]; then
+            echo "::error::expected 4 archives, found $count"
+            exit 1
+          fi
+          sha256sum nullroute-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets-${{ needs.guard.outputs.version }}
+          path: |
+            out/nullroute-*.tar.gz
+            out/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
