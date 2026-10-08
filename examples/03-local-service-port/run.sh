@@ -69,46 +69,53 @@ echo "=================================================================="
 echo " STEP 4: Demonstrating bidirectional isolation"
 echo " A server listening INSIDE the sandbox cannot be reached from host!"
 echo "=================================================================="
-python3 -c "
-import socket, subprocess, sys, time
+# We pass NULLROUTE via environment variable to handle spaces/quotes safely,
+# bind port 0 dynamically inside sandbox to avoid host collisions,
+# and enforce a 30s timeout to prevent hanging.
+NULLROUTE_BIN="$NULLROUTE" timeout 30 python3 -c '
+import os, socket, subprocess, sys, time
 
-inner_code = '''
+nullroute_bin = os.environ["NULLROUTE_BIN"]
+
+inner_code = """
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.bind(('127.0.0.1', 43219))
+s.bind(("127.0.0.1", 0))
+port = s.getsockname()[1]
 s.listen(1)
-print('SANDBOX_LISTENING', flush=True)
+print(f"SANDBOX_LISTENING:{port}", flush=True)
 time.sleep(3)
-'''
+"""
 
 proc = subprocess.Popen(
-    ['$NULLROUTE', 'run', '--', 'python3', '-c', inner_code],
+    [nullroute_bin, "run", "--", "python3", "-c", inner_code],
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
     text=True
 )
 
 line = proc.stdout.readline()
-if 'SANDBOX_LISTENING' not in line:
-    print('Error: sandbox server failed to start:', line.strip(), file=sys.stderr)
+if "SANDBOX_LISTENING:" not in line:
+    print("Error: sandbox server failed to start:", line.strip(), file=sys.stderr)
     proc.terminate()
     sys.exit(1)
 
-print('Sandbox process status:', line.strip())
+sandbox_port = int(line.strip().split(":")[1])
+print(f"Sandbox process status: SANDBOX_LISTENING on private port {sandbox_port}")
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(1.0)
 try:
-    s.connect(('127.0.0.1', 43219))
-    print('ERROR: Host reached sandbox port!', file=sys.stderr)
+    s.connect(("127.0.0.1", sandbox_port))
+    print(f"ERROR: Host reached sandbox port {sandbox_port}!", file=sys.stderr)
     s.close()
     proc.terminate()
     proc.wait()
     sys.exit(1)
 except Exception as e:
-    print('Host attempt to reach sandbox port refused (expected isolation):', e)
+    print(f"Host attempt to reach sandbox port {sandbox_port} refused (expected isolation):", e)
 finally:
     s.close()
     proc.terminate()
     proc.wait()
-"
+'

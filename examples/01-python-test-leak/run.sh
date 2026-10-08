@@ -13,12 +13,17 @@ cd "$SCRIPT_DIR"
 echo "=================================================================="
 echo " STEP 1: Running python test normally (NO nullroute)"
 echo " Notice how the test silently reaches out to GitHub API..."
+echo " (Note: This step requires live internet connectivity)"
 echo "=================================================================="
-set +e
-python3 test_payment.py
-NORMAL_STATUS=$?
-set -e
-echo "Normal run exit code: $NORMAL_STATUS"
+if curl -s --connect-timeout 2 -I https://api.github.com &>/dev/null; then
+    set +e
+    python3 test_payment.py
+    NORMAL_STATUS=$?
+    set -e
+    echo "Normal run exit code: $NORMAL_STATUS"
+else
+    echo "skipping step 1: host is currently offline or api.github.com is unreachable."
+fi
 
 echo ""
 echo "=================================================================="
@@ -40,28 +45,72 @@ fi
 
 echo ""
 echo "=================================================================="
-echo " STEP 3: Running with --strict and --allow (Demonstrating breach report)"
-echo " With --allow and --strict, attempts to reach unauthorized hosts"
-echo " are recorded and force nullroute to exit 1."
+echo " STEP 3: Breach Reporting with --report-json and --allow"
+echo " When an unallowed host is targeted, nullroute captures the attempt."
+echo " We verify the breach report directly from JSON output."
 echo "=================================================================="
 REPORT_FILE="$(mktemp --suffix=.json)"
 set +e
-# Allow a benign host (e.g. example.com), so the test's call to api.github.com
-# is captured by the proxy allowlist check and triggers --strict exit 1
-"$NULLROUTE" run --strict --allow example.com --report-json "$REPORT_FILE" -- python3 test_payment.py
-STRICT_STATUS=$?
+# Allow a benign host (example.com); the test targets api.github.com
+"$NULLROUTE" run --allow example.com --report-json "$REPORT_FILE" -- python3 test_payment.py
 set -e
 
-echo "Strict run exit code: $STRICT_STATUS (Expected: 1 from --strict violation)"
-if [[ -f "$REPORT_FILE" ]]; then
-    echo "Breach report captured:"
-    cat "$REPORT_FILE"
-    rm -f "$REPORT_FILE"
-fi
+echo "Verifying breach report captures the unallowed destination..."
+python3 -c "
+import json, sys
+
+with open('$REPORT_FILE') as f:
+    report = json.load(f)
+
+blocked = report.get('blocked', [])
+targets = [b.get('target') for b in blocked]
+print(f'Blocked targets in report: {targets}')
+
+if any('api.github.com' in t for t in targets):
+    print('✔ Verified: api.github.com was correctly intercepted and recorded.')
+else:
+    print('✘ Error: api.github.com not found in breach report!', file=sys.stderr)
+    sys.exit(1)
+"
+rm -f "$REPORT_FILE"
 
 echo ""
 echo "=================================================================="
-echo " STEP 4: Running with surgical --allow api.github.com"
+echo " STEP 4: Demonstrating --strict enforcement"
+echo " A command that swallows network errors and exits 0 is forced to"
+echo " exit 1 by --strict when unauthorized traffic was attempted."
+echo "=================================================================="
+REPORT_FILE="$(mktemp --suffix=.json)"
+set +e
+# curl attempts api.github.com (blocked), but the command pipeline exits 0 (|| true)
+"$NULLROUTE" run --strict --allow example.com --report-json "$REPORT_FILE" -- sh -c "curl -s https://api.github.com || true"
+STRICT_EXIT=$?
+set -e
+
+STRICT_EXIT="$STRICT_EXIT" REPORT_PATH="$REPORT_FILE" python3 -c '
+import json, os, sys
+
+strict_exit = int(os.environ["STRICT_EXIT"])
+report_path = os.environ["REPORT_PATH"]
+
+with open(report_path) as f:
+    report = json.load(f)
+
+strict_failed = report.get("strict_failed", False)
+exit_code = report.get("exit_code", -1)
+print(f"Report strict_failed={strict_failed}, command exit_code={exit_code}, nullroute status={strict_exit}")
+
+if strict_exit == 1 and strict_failed:
+    print("✔ Verified: --strict converted exit 0 into exit 1 due to recorded breach.")
+else:
+    print("✘ Error: --strict failed to enforce exit 1!", file=sys.stderr)
+    sys.exit(1)
+'
+rm -f "$REPORT_FILE"
+
+echo ""
+echo "=================================================================="
+echo " STEP 5: Running with surgical --allow api.github.com"
 echo " (Opt-in external test; checks internet connectivity first)"
 echo "=================================================================="
 if curl -s --connect-timeout 2 -I https://api.github.com &>/dev/null; then
