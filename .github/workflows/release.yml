@@ -16,9 +16,6 @@ on:
     tags: ["v*"]
   # Dry-run the whole pipeline from any branch, without a tag.
   workflow_dispatch:
-  # TEMPORARY (test run only; removed before merge)
-  pull_request:
-    paths: [".github/workflows/release.yml"]
 
 # Read-only token, workflow-wide. Don't add write scopes here: a release
 # workflow that can write is one bug away from publishing.
