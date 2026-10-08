@@ -118,6 +118,7 @@ pub fn run_hermetic(
     lifecycle::become_subreaper();
     let blocked = signals::block()?;
     let child_mask = blocked.child_mask();
+    hold_for_test();
     // The parent-death signal is tied to the forking thread (lifecycle.rs).
     debug_assert!(
         lifecycle::on_main_thread(),
@@ -137,6 +138,9 @@ pub fn run_hermetic(
         cmd.pre_exec(move || {
             // First, so the child can't outlive nullroute even during setup.
             lifecycle::die_with_parent(parent)?;
+            // Opened now, read at the end: the namespace changes below may
+            // change what the child can open (signals.rs).
+            let parent_status = child_mask.open_parent_status()?;
             if libc::unshare(flags) != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -156,8 +160,9 @@ pub fn run_hermetic(
             }
             // Re-arm after the user-namespace credential change (lifecycle.rs).
             lifecycle::die_with_parent(parent)?;
-            // Last: unblock, so nothing is delivered before setup is done.
-            child_mask.restore()?;
+            // Last: unblock, so nothing is delivered before setup is done. A
+            // SIGINT/SIGQUIT that reached only nullroute is passed on here.
+            child_mask.restore(parent_status)?;
             Ok(())
         });
     }
@@ -221,6 +226,28 @@ pub fn run_hermetic(
     drop(dns_files);
     status
 }
+
+/// Test hook (debug builds only): with NULLROUTE_TEST_HOLD_BEFORE_SPAWN=PATH,
+/// create PATH and wait until it is removed (at most 10 s), right after the
+/// signals are blocked and before the command is forked. Lets a test land a
+/// signal in that window deterministically instead of racing for it.
+#[cfg(debug_assertions)]
+fn hold_for_test() {
+    let Some(path) = std::env::var_os("NULLROUTE_TEST_HOLD_BEFORE_SPAWN") else {
+        return;
+    };
+    let path = std::path::Path::new(&path);
+    if std::fs::write(path, b"holding\n").is_err() {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn hold_for_test() {}
 
 /// The namespaces the child unshares: always user + net, plus a mount
 /// namespace when there are sockets to hide or resolver sockets to mask, or

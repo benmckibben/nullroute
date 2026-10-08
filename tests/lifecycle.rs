@@ -161,9 +161,17 @@ fn command_starts_with_no_signals_blocked() {
 
 /// Send `sig` (to nullroute, or to its process group when `group`) a few
 /// milliseconds after launch, many times with varying delays so it lands in
-/// every startup phase. Either nullroute had not started the command yet and
-/// died of the signal (nothing else running), or the command got it: exit
-/// `trapped` from its trap, or 128+sig if it hadn't set the trap yet.
+/// every startup phase. Whichever phase it lands in, it must have the effect
+/// it would have had on the command run without nullroute, never silently
+/// vanish, and never leave the command running:
+/// - before nullroute blocks its signals: nullroute dies of it (the command
+///   doesn't exist yet, `command.pid` is never written);
+/// - while the command is being set up (SIGINT: also if it landed before the
+///   command was forked, see `signal_before_the_command_exists`):
+///   the child dies of it before running anything, nullroute exits 128+sig,
+///   again without `command.pid`;
+/// - once the command runs: it gets the signal, exiting `trapped` from its
+///   trap, or 128+sig if it hadn't installed the trap yet.
 fn signal_right_after_launch(name: &str, sig: libc::c_int, group: bool, trapped: i32) {
     let trap = match sig {
         libc::SIGTERM => "TERM",
@@ -190,18 +198,24 @@ fn signal_right_after_launch(name: &str, sig: libc::c_int, group: bool, trapped:
         unsafe { libc::kill(if group { -pid } else { pid }, sig) };
         let status = wait_with_timeout(nr);
 
+        let started = read_pid(&pidfile);
         if status.signal() == Some(sig) {
-            // Only acceptable before the command was spawned.
-            let started = read_pid(&pidfile);
             assert!(
                 started.is_none(),
                 "run {i}: nullroute died of signal {sig} after starting the command (pid {started:?}); \
                  the signal was lost to the command"
             );
-        } else {
+        } else if started.is_some() {
             assert!(
                 status.code() == Some(trapped) || status.code() == Some(128 + sig),
                 "run {i}: signal {sig} didn't reach the command: {status:?}"
+            );
+        } else {
+            // The command never ran: its child was stopped by the signal first.
+            assert_eq!(
+                status.code(),
+                Some(128 + sig),
+                "run {i}: the command never started, yet nullroute didn't report the signal: {status:?}"
             );
         }
         if let Some(p) = read_pid(&pidfile) {
@@ -218,6 +232,121 @@ fn sigterm_right_after_launch_reaches_the_command() {
 #[test]
 fn sigint_to_the_group_right_after_launch_reaches_the_command() {
     signal_right_after_launch("int", libc::SIGINT, true, 43);
+}
+
+/// Run nullroute (in its own process group, with core dumps off so a SIGQUIT
+/// doesn't leave a core file) held right after it blocked its signals and
+/// before it forks the command (debug-only test hook, see sandbox.rs). Returns
+/// once it is held, with the path to release it by removing.
+#[cfg(debug_assertions)]
+fn held_before_spawn(cl: &mut Cleanup, script: &str) -> PathBuf {
+    let hold = cl.file("hold");
+    let mut cmd = nullroute(&["sh", "-c", script]);
+    cmd.env("NULLROUTE_TEST_HOLD_BEFORE_SPAWN", &hold);
+    cmd.process_group(0);
+    // SAFETY: only setrlimit, which is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            let none = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            libc::setrlimit(libc::RLIMIT_CORE, &none);
+            Ok(())
+        });
+    }
+    cl.nullroutes.push(cmd.spawn().unwrap());
+    poll("nullroute to reach the hold", || {
+        hold.exists().then_some(())
+    });
+    hold
+}
+
+/// The window the sweep above can only hit by luck, made certain: the signal
+/// reaches nullroute while the command does not exist yet (so only nullroute is
+/// in the process group to get it). It used to be dropped, and the command that
+/// started afterwards never saw it: Ctrl-C during startup was lost and the
+/// command ran on, with nullroute waiting for it forever.
+#[cfg(debug_assertions)]
+fn signal_before_the_command_exists(sig: libc::c_int, group: bool) {
+    let mut cl = Cleanup::new(&format!("early-{sig}-{group}"));
+    let pidfile = cl.file("command.pid");
+    let script = format!(
+        "echo $$ > {}; while :; do sleep 0.02; done",
+        pidfile.display()
+    );
+    let hold = held_before_spawn(&mut cl, &script);
+    let nr = &mut cl.nullroutes[0];
+    let pid = nr.id() as libc::pid_t;
+    unsafe { libc::kill(if group { -pid } else { pid }, sig) };
+    std::fs::remove_file(&hold).unwrap();
+
+    let status = wait_with_timeout(nr);
+    assert_eq!(
+        status.code(),
+        Some(128 + sig),
+        "the signal sent before the command existed was lost: {status:?}"
+    );
+    assert!(
+        read_pid(&pidfile).is_none(),
+        "the command ran although it was interrupted before it started"
+    );
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug-only test hook")]
+fn sigint_to_the_group_before_the_command_exists_stops_it_from_running() {
+    #[cfg(debug_assertions)]
+    signal_before_the_command_exists(libc::SIGINT, true);
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug-only test hook")]
+fn sigquit_to_the_group_before_the_command_exists_stops_it_from_running() {
+    #[cfg(debug_assertions)]
+    signal_before_the_command_exists(libc::SIGQUIT, true);
+}
+
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "needs the debug-only test hook")]
+fn sigint_to_nullroute_alone_before_the_command_exists_is_treated_the_same() {
+    // Indistinguishable from the group case at that point (signals.rs).
+    #[cfg(debug_assertions)]
+    signal_before_the_command_exists(libc::SIGINT, false);
+}
+
+#[test]
+fn sigint_to_the_group_while_running_reaches_the_command_once() {
+    // Once the command exists the terminal's group delivery is all it needs:
+    // nullroute must not add a second copy, and a SIGINT sent to nullroute
+    // alone stays ignored (README, "Signals and process lifetime").
+    let mut cl = Cleanup::new("int-once");
+    let pidfile = cl.file("command.pid");
+    let hits = cl.file("hits");
+    let script = format!(
+        "trap 'echo x >> {}' INT; trap 'exit 42' TERM; echo $$ > {}; while :; do sleep 0.02; done",
+        hits.display(),
+        pidfile.display()
+    );
+    let mut cmd = nullroute(&["sh", "-c", &script]);
+    cmd.process_group(0);
+    cl.nullroutes.push(cmd.spawn().unwrap());
+    poll("the command to start", || read_pid(&pidfile));
+    let nr = &mut cl.nullroutes[0];
+    let pid = nr.id() as libc::pid_t;
+    let count = || std::fs::read_to_string(&hits).map_or(0, |s| s.lines().count());
+
+    unsafe { libc::kill(-pid, libc::SIGINT) };
+    poll("the command to see the SIGINT", || {
+        (count() >= 1).then_some(())
+    });
+    unsafe { libc::kill(pid, libc::SIGINT) }; // nullroute alone: ignored
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(count(), 1, "the command saw a different number of SIGINTs");
+    assert!(nr.try_wait().unwrap().is_none(), "nullroute exited");
+
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    assert_eq!(wait_with_timeout(nr).code(), Some(42));
 }
 
 #[test]

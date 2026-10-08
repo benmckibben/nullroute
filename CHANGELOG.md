@@ -83,7 +83,11 @@ Findings from a security review of the first version, all fixed before release:
   jobs, daemons, even `setsid` ones) is killed before nullroute exits.
 - SIGTERM, SIGHUP, SIGINT and SIGQUIT that arrive while the command is starting
   are no longer lost or fatal to nullroute; the command starts with the signal
-  mask it would normally have.
+  mask it would normally have. A SIGINT/SIGQUIT that reaches nullroute before
+  the command exists (Ctrl-C right after launch, sent to the process group) is
+  passed on to it instead of being dropped, so it stops the command before it
+  runs; it used to be swallowed, and the command then ran with nullroute
+  waiting for it.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.
