@@ -1,0 +1,9 @@
+{
+  "name": "untrusted-package-demo",
+  "version": "1.0.0",
+  "description": "Demonstrates sandboxing untrusted npm install / postinstall scripts",
+  "scripts": {
+    "postinstall": "node postinstall.js",
+    "build": "node -e \"console.log('Build complete without network.')\""
+  }
+}
