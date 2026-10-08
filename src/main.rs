@@ -51,6 +51,10 @@ enum Cmd {
     /// Run a command in a fresh network namespace with only loopback.
     ///
     /// Example: nullroute run -- pytest -x
+    #[command(
+        override_usage = "nullroute run [OPTIONS] -- <COMMAND> [ARGS]...",
+        after_help = "Note: Place the command and any of its arguments after '--' so flags are not parsed by nullroute.\nExample: nullroute run --port 5432 -- pytest -x"
+    )]
     Run {
         /// Make the host's localhost:PORT reachable as localhost:PORT inside.
         /// Repeat or comma-separate: --port 5432 --port 6379, or --port 5432,6379.
