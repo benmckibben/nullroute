@@ -258,7 +258,7 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu qemu-user
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
 
       - name: Build
         env:
