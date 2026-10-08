@@ -4,17 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-NULLROUTE=""
-if [[ -x "$REPO_ROOT/target/debug/nullroute" ]]; then
-    NULLROUTE="$REPO_ROOT/target/debug/nullroute"
-elif [[ -x "$REPO_ROOT/target/release/nullroute" ]]; then
-    NULLROUTE="$REPO_ROOT/target/release/nullroute"
-elif command -v nullroute &>/dev/null; then
-    NULLROUTE="nullroute"
-else
-    echo "nullroute binary not found! Run 'cargo build' in $REPO_ROOT first." >&2
-    exit 1
-fi
+source "$REPO_ROOT/examples/common-preflight.sh"
+preflight_check
+NULLROUTE="$(find_nullroute "$REPO_ROOT")"
 
 PORT=54321
 
@@ -32,20 +24,69 @@ sleep 0.5
 
 echo ""
 echo "=================================================================="
-echo " STEP 1: Verify host can reach mock service directly"
+echo " STEP 1: Host reaches service directly"
 echo "=================================================================="
-curl -s http://127.0.0.1:$PORT
+curl -s "http://127.0.0.1:$PORT"
 
 echo ""
 echo "=================================================================="
-echo " STEP 2: Run under nullroute WITHOUT --port"
-echo " In a fresh network namespace, host 127.0.0.1:$PORT is invisible!"
+echo " STEP 2: Sealed under nullroute WITHOUT --port"
+echo " Private sandbox loopback: host 127.0.0.1:$PORT is completely invisible."
 echo "=================================================================="
-"$NULLROUTE" run -- curl -s --connect-timeout 2 http://127.0.0.1:$PORT || echo "-> Connection failed as expected! (Network unreachable or connection refused)"
+set +e
+"$NULLROUTE" run -- curl -s --connect-timeout 2 "http://127.0.0.1:$PORT"
+SEALED_STATUS=$?
+set -e
+if [[ $SEALED_STATUS -ne 0 ]]; then
+    echo "-> Sealed call failed as expected! (Exit code: $SEALED_STATUS)"
+else
+    echo "-> Unexpected success without --port!"
+    exit 1
+fi
 
 echo ""
 echo "=================================================================="
-echo " STEP 3: Run under nullroute WITH --port $PORT"
-echo " The host port is surgically bridged into the sandbox loopback!"
+echo " STEP 3: Bridged with --port $PORT"
+echo " Host service is surgically bridged into the sandbox's localhost."
 echo "=================================================================="
-"$NULLROUTE" run --port "$PORT" -- curl -s http://127.0.0.1:$PORT
+"$NULLROUTE" run --port "$PORT" -- curl -s "http://127.0.0.1:$PORT"
+
+echo ""
+echo "=================================================================="
+echo " STEP 4: Demonstrating bidirectional isolation"
+echo " A server listening INSIDE the sandbox cannot be reached from host!"
+echo "=================================================================="
+python3 -c "
+import socket, subprocess, time
+
+inner_code = '''
+import socket, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', 43219))
+s.listen(1)
+print('SANDBOX_LISTENING', flush=True)
+time.sleep(3)
+'''
+
+proc = subprocess.Popen(
+    ['$NULLROUTE', 'run', '--', 'python3', '-c', inner_code],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    text=True
+)
+
+line = proc.stdout.readline()
+print('Sandbox process status:', line.strip())
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(1.0)
+try:
+    s.connect(('127.0.0.1', 43219))
+    print('ERROR: Host reached sandbox port!')
+except Exception as e:
+    print('Host attempt to reach sandbox port refused (expected isolation):', e)
+finally:
+    s.close()
+    proc.terminate()
+    proc.wait()
+"

@@ -4,29 +4,47 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-NULLROUTE=""
-if [[ -x "$REPO_ROOT/target/debug/nullroute" ]]; then
-    NULLROUTE="$REPO_ROOT/target/debug/nullroute"
-elif [[ -x "$REPO_ROOT/target/release/nullroute" ]]; then
-    NULLROUTE="$REPO_ROOT/target/release/nullroute"
-elif command -v nullroute &>/dev/null; then
-    NULLROUTE="nullroute"
-else
-    echo "nullroute binary not found! Run 'cargo build' in $REPO_ROOT first." >&2
-    exit 1
-fi
+source "$REPO_ROOT/examples/common-preflight.sh"
+preflight_check
+NULLROUTE="$(find_nullroute "$REPO_ROOT")"
 
 cd "$SCRIPT_DIR"
 
+# DEFENSE-IN-DEPTH: Run with a disposable temporary HOME and unset SSH_AUTH_SOCK
+# nullroute seals the NETWORK namespace, but Unix domain sockets like SSH_AUTH_SOCK
+# and host files are NOT isolated by network namespaces alone.
+DEMO_TMP_HOME="$(mktemp -d)"
+cleanup() {
+    rm -rf "$DEMO_TMP_HOME"
+}
+trap cleanup EXIT
+
 echo "=================================================================="
-echo " STEP 1: Running untrusted postinstall hook normally (NO nullroute)"
-echo " Notice how the script can freely dial out and exfiltrate data..."
+echo " STEP 1: Running postinstall hook directly (leaks to example.com)"
 echo "=================================================================="
-node postinstall.js || true
+if curl -s --connect-timeout 2 -I https://example.com &>/dev/null; then
+    set +e
+    HOME="$DEMO_TMP_HOME" node postinstall.js
+    set -e
+else
+    echo "skipping step 1: host is currently offline."
+fi
 
 echo ""
 echo "=================================================================="
-echo " STEP 2: Running under nullroute sandbox"
-echo " Notice: instant network failure, host environment safe."
+echo " STEP 2: Running under nullroute sandbox with --strict"
+echo " Notice: instant network drop. Egress blocked."
+echo " Note: We explicitly unset SSH_AUTH_SOCK or pass --hide-socket"
+echo " to ensure local agent sockets are guarded."
 echo "=================================================================="
-"$NULLROUTE" run -- node postinstall.js || true
+set +e
+HOME="$DEMO_TMP_HOME" SSH_AUTH_SOCK="" "$NULLROUTE" run --strict -- node postinstall.js
+STATUS=$?
+set -e
+
+if [[ $STATUS -ne 0 ]]; then
+    echo "-> Exfiltration attempt was successfully blocked! Exit code: $STATUS"
+else
+    echo "-> Unexpected: process exited 0 under nullroute."
+    exit 1
+fi
