@@ -1,8 +1,12 @@
 # Example 4: Surgical Host Allowlisting with `--allow`
 
-`nullroute` isn't an all-or-nothing blunt instrument. When your integration test or build actually needs access to specific third-party APIs (e.g., GitHub, Stripe), `--allow` sets up a surgical allowlist.
+`nullroute` isn't an all-or-nothing blunt instrument. When your integration test or build actually needs access to specific third-party APIs or external resources, `--allow` sets up a surgical allowlist.
 
-Unlisted domains return `403 Forbidden` through the proxy (or fail name resolution through the DNS sinkhole), and `nullroute` prints a clear summary of blocked destinations.
+## Key Invariants
+
+1. **Bare Sealed Runs vs Allowlist:** In a bare sealed run (`nullroute run -- <cmd>`), loopback is isolated and outbound traffic fails immediately at the socket layer; no breach report is written because no proxy is running.
+2. **Proxy and DNS Sinkhole:** When `--allow` is provided, `nullroute` spins up an internal proxy and DNS sinkhole.
+3. **Breach Reporting:** Unlisted domains return `403 Forbidden` through the proxy (or fail name resolution through the DNS sinkhole), and `nullroute` captures every blocked attempt in the breach report (`--report-json`).
 
 ## Quick Demo
 
@@ -14,16 +18,17 @@ Run the demo script:
 
 Or step-by-step:
 
-### 1. Completely sealed (default):
+### 1. Completely sealed (default, socket error, silent drop):
 ```bash
-nullroute run -- curl https://api.github.com
+nullroute run -- curl http://example.com
 ```
 
 ### 2. Surgical allowlist:
 ```bash
-nullroute run --allow api.github.com -- curl https://api.github.com
+nullroute run --allow example.com -- curl http://example.com
 ```
-Attempting to reach an unallowed host (`api.stripe.com`) will be blocked and reported:
+
+Attempting to reach an unallowed host (`example.org`) will be intercepted and reported:
 ```bash
-nullroute run --allow api.github.com -- curl https://api.stripe.com
+nullroute run --allow example.com -- curl http://example.org
 ```
