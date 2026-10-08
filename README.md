@@ -227,20 +227,23 @@ Not listed: a direct connection to an IP address fails inside the kernel
 ("network unreachable") without reaching nullroute. Proxy requests, DNS lookups
 and hidden sockets are listed.
 
-**Signals and process lifetime.** Ctrl-C reaches the command as usual;
-nullroute itself ignores SIGINT/SIGQUIT so it can still print the report, then
-exits with the command's status (130). SIGTERM and SIGHUP sent to nullroute are
-forwarded to the command, also when they arrive while the command is still
-starting. The command never outlives nullroute: if nullroute is killed outright
-(SIGKILL, the OOM killer, a crash), the kernel SIGKILLs the command too. When
-the command exits, anything it left running in the sandbox (background jobs,
-daemons, even ones that called `setsid`) is killed before nullroute exits,
-since nothing outside can reach it once nullroute's relays are gone. One gap: if
-nullroute itself is SIGKILLed, the command's own child processes are orphaned
-rather than killed (a parent-death signal only covers direct children), and a
-command that is itself a set-user-ID or file-capability binary (`ping` on
-many distros) survives too, because exec clears the setting. Send nullroute
-SIGTERM first (as `timeout` and CI runners do) so it can clean up.
+**Signals and process lifetime.** Ctrl-C reaches the command as usual; nullroute
+itself ignores SIGINT/SIGQUIT so it can still print the report, then exits with
+the command's status (130). SIGTERM and SIGHUP sent to nullroute are forwarded
+to the command, also when they arrive while the command is still starting. A
+SIGINT/SIGQUIT that reaches nullroute before the command exists (Ctrl-C right
+after you hit enter) is passed on to it as well: it stops the command before it
+runs, instead of vanishing while the command runs on. The command never outlives
+nullroute: if nullroute is killed outright (SIGKILL, the OOM killer, a crash),
+the kernel SIGKILLs the command too. When the command exits, anything it left
+running in the sandbox (background jobs, daemons, even ones that called
+`setsid`) is killed before nullroute exits, since nothing outside can reach it
+once nullroute's relays are gone. One gap: if nullroute itself is SIGKILLed, the
+command's own child processes are orphaned rather than killed (a parent-death
+signal only covers direct children), and a command that is itself a set-user-ID
+or file-capability binary (`ping` on many distros) survives too, because exec
+clears the setting. Send nullroute SIGTERM first (as `timeout` and CI runners
+do) so it can clean up.
 
 ## Seeing the sandbox: `--inspect`
 
