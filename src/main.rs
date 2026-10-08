@@ -219,8 +219,12 @@ fn main() -> ExitCode {
                 return ExitCode::from(2);
             }
             if ports.len() > forward::MAX_PORTS {
-                eprintln!("nullroute: at most {} --port values", forward::MAX_PORTS);
-                return ExitCode::from(125);
+                eprintln!(
+                    "nullroute: at most {} --port values (got {})",
+                    forward::MAX_PORTS,
+                    ports.len()
+                );
+                return ExitCode::from(2);
             }
             let mut seal = seal_docker_sockets;
             if seal_docker {
