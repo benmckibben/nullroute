@@ -1,5 +1,9 @@
 /target
 
+# Rendered by `vhs demo/nullroute-demo.tape` (see demo/README.md)
+/demo/demo.gif
+/demo/demo.mp4
+
 # OpenClaw agent workspace files
 /AGENTS.md
 /IDENTITY.md
