@@ -11,7 +11,7 @@ readme = "README.md"
 keywords = ["sandbox", "network", "namespace", "security", "ci"]
 categories = ["command-line-utilities", "development-tools::testing"]
 # Only what's needed to build, test and understand the crate (see "cargo package --list").
-include = ["src/**", "tests/**", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE", "Cargo.toml", "Cargo.lock"]
+include = ["src/**", "tests/**", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/Cargo.toml", "/Cargo.lock"]
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
