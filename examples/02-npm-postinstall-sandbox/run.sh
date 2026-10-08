@@ -10,9 +10,10 @@ NULLROUTE="$(find_nullroute "$REPO_ROOT")"
 
 cd "$SCRIPT_DIR"
 
-# DEFENSE-IN-DEPTH: Run with a disposable temporary HOME and unset SSH_AUTH_SOCK
-# nullroute seals the NETWORK namespace, but Unix domain sockets like SSH_AUTH_SOCK
-# and host files are NOT isolated by network namespaces alone.
+# DEFENSE-IN-DEPTH: Run with a disposable temporary HOME and unset SSH_AUTH_SOCK.
+# Note: Network namespaces isolate TCP/UDP/DNS, NOT filesystem or host Unix domain sockets.
+# Unsetting SSH_AUTH_SOCK via `env -u` drops the environment pointer;
+# for true protection against hostile code accessing existing sockets, use `--hide-socket`.
 DEMO_TMP_HOME="$(mktemp -d)"
 cleanup() {
     if [[ -n "${DEMO_TMP_HOME:-}" && -d "$DEMO_TMP_HOME" ]]; then
@@ -34,18 +35,16 @@ fi
 
 echo ""
 echo "=================================================================="
-echo " STEP 2: Running under nullroute sandbox with --strict"
-echo " Notice: instant network drop. Egress blocked."
-echo " Note: We explicitly unset SSH_AUTH_SOCK or pass --hide-socket"
-echo " to ensure local agent sockets are guarded."
+echo " STEP 2: Running under nullroute sandbox (Network drop)"
+echo " Notice: instant network drop. Egress blocked at socket layer."
 echo "=================================================================="
 set +e
-HOME="$DEMO_TMP_HOME" SSH_AUTH_SOCK="" "$NULLROUTE" run --strict -- node postinstall.js
+HOME="$DEMO_TMP_HOME" env -u SSH_AUTH_SOCK "$NULLROUTE" run -- node postinstall.js
 STATUS=$?
 set -e
 
 if [[ $STATUS -ne 0 ]]; then
-    echo "-> Exfiltration attempt was successfully blocked! Exit code: $STATUS"
+    echo "-> Exfiltration attempt was successfully blocked! Node exit code: $STATUS"
 else
     echo "-> Unexpected: process exited 0 under nullroute."
     exit 1

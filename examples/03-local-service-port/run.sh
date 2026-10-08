@@ -8,7 +8,8 @@ source "$REPO_ROOT/examples/common-preflight.sh"
 preflight_check
 NULLROUTE="$(find_nullroute "$REPO_ROOT")"
 
-PORT=54321
+# 1. Dynamically find a free port to avoid race conditions and collisions
+PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("", 0)); print(s.getsockname()[1]); s.close()')
 
 echo "Starting background mock service on host 127.0.0.1:$PORT..."
 python3 "$SCRIPT_DIR/mock_db_service.py" "$PORT" &
@@ -19,8 +20,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait briefly for service to bind
-sleep 0.5
+# 2. Poll until the service is actively accepting connections instead of arbitrary sleep
+READY=0
+for _ in {1..50}; do
+    if curl -s "http://127.0.0.1:$PORT" &>/dev/null; then
+        READY=1
+        break
+    fi
+    sleep 0.05
+done
+
+if [[ $READY -ne 1 ]]; then
+    echo "Error: mock service failed to start on port $PORT" >&2
+    exit 125
+fi
 
 echo ""
 echo "=================================================================="
@@ -57,7 +70,7 @@ echo " STEP 4: Demonstrating bidirectional isolation"
 echo " A server listening INSIDE the sandbox cannot be reached from host!"
 echo "=================================================================="
 python3 -c "
-import socket, subprocess, time
+import socket, subprocess, sys, time
 
 inner_code = '''
 import socket, time
@@ -76,13 +89,22 @@ proc = subprocess.Popen(
 )
 
 line = proc.stdout.readline()
+if 'SANDBOX_LISTENING' not in line:
+    print('Error: sandbox server failed to start:', line.strip(), file=sys.stderr)
+    proc.terminate()
+    sys.exit(1)
+
 print('Sandbox process status:', line.strip())
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(1.0)
 try:
     s.connect(('127.0.0.1', 43219))
-    print('ERROR: Host reached sandbox port!')
+    print('ERROR: Host reached sandbox port!', file=sys.stderr)
+    s.close()
+    proc.terminate()
+    proc.wait()
+    sys.exit(1)
 except Exception as e:
     print('Host attempt to reach sandbox port refused (expected isolation):', e)
 finally:

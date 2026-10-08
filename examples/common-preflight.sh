@@ -13,11 +13,11 @@ preflight_check() {
         echo "Warning: nullroute is designed for unprivileged users. Running as root allows bypassing socket decoys." >&2
     fi
 
-    # 3. User namespace checks
+    # 3. User namespace sysctl checks
     if [[ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] && \
        [[ "$(< /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" -eq 1 ]]; then
         echo "Error: unprivileged user namespaces are restricted by AppArmor." >&2
-        echo "Hint: sysctl -w kernel.apparmor_restrict_unprivileged_userns=0" >&2
+        echo "Note: Disabling this relaxes system-wide containment (sysctl -w kernel.apparmor_restrict_unprivileged_userns=0)." >&2
         exit 125
     fi
 
@@ -32,6 +32,14 @@ preflight_check() {
         echo "Error: max_user_namespaces is 0." >&2
         exit 125
     fi
+
+    # 4. Runtime functional probe (covers Docker seccomp profiles, container limits)
+    if command -v unshare &>/dev/null; then
+        if ! unshare --user --net --map-current-user true 2>/dev/null; then
+            echo "Error: unshare probe failed (unprivileged user+net namespaces blocked by container seccomp or security policy)." >&2
+            exit 125
+        fi
+    fi
 }
 
 find_nullroute() {
@@ -44,8 +52,6 @@ find_nullroute() {
         command -v nullroute
     else
         echo "Error: nullroute binary not found. Build it with 'cargo build' in $repo_root first." >&2
-        # Exit 125 indicates a pre-execution / setup prerequisite failure, distinct from
-        # exit 1 (strict blocked) or exit 2 (bad arguments).
         exit 125
     fi
 }

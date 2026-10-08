@@ -16,7 +16,7 @@ elif command -v nullroute &>/dev/null; then
     NULLROUTE="nullroute"
 else
     echo "nullroute binary not found! Run 'cargo build' in $REPO_ROOT first." >&2
-    exit 1
+    exit 125
 fi
 
 type_cmd() {
@@ -49,7 +49,11 @@ sleep 1
 
 echo -e "\033[1;33m[Scene 3] Surgical egress allowlisting (--allow api.github.com):\033[0m"
 type_cmd "nullroute run --allow api.github.com -- python3 examples/01-python-test-leak/test_payment.py"
-"$NULLROUTE" run --allow api.github.com -- python3 "$REPO_ROOT/examples/01-python-test-leak/test_payment.py"
+if curl -s --connect-timeout 2 -I https://api.github.com &>/dev/null; then
+    "$NULLROUTE" run --allow api.github.com -- python3 "$REPO_ROOT/examples/01-python-test-leak/test_payment.py" || true
+else
+    echo "skipping live network call: host is currently offline."
+fi
 echo ""
 sleep 1
 
