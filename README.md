@@ -17,6 +17,17 @@ other host fails immediately with "network unreachable", and DNS lookups fail
 (with `--allow`, only allowed names resolve; see below).
 The exit code is passed through, so it drops into CI unchanged.
 
+## Installing
+
+nullroute is built from source (Rust 1.88 or newer, Linux only; see
+[Requirements](#requirements)):
+
+```bash
+git clone https://github.com/benmckibben/nullroute
+cd nullroute
+cargo install --locked --path .   # installs nullroute into ~/.cargo/bin
+```
+
 ## Reaching local services: `--port`
 
 The sandbox has its own loopback, so a database on your machine's
@@ -27,7 +38,7 @@ that port: inside, `localhost:5432` (IPv4 or IPv6) reaches the host's
 (`-p 127.0.0.1:5432:5432`).
 
 If nothing is listening on the host, the connection is closed and nullroute warns
-once per port.
+once per port. At most 64 ports can be bridged.
 
 ## Letting chosen hosts through: `--allow`
 
@@ -198,10 +209,19 @@ CLI reconnects).
 }
 ```
 
-Exit codes nullroute adds to the command's own: `2` for bad arguments
-(including an unwritable `--report-json`; nothing is run), `125` if nullroute
-itself fails to set up the sandbox, `1` from `--strict`, and `74` if the
-`--report-json` file couldn't be written after a successful run.
+**Exit codes.** The command's own exit code is passed through (`128+N` if signal
+`N` killed it). nullroute adds these:
+
+| Code | When |
+|---|---|
+| `1` | `--strict` and something was blocked, though the command succeeded |
+| `2` | bad arguments, and nothing is run: unknown or invalid options, an `--allow`, `--resolve` or `--port` value that can't work, `--seal-docker-pulls` without a sealed socket, an unwritable `--report-json` |
+| `74` | the `--report-json` file couldn't be written after a run that would have exited 0 (a non-zero exit is kept) |
+| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused), the command couldn't be started (not found, not executable), socket hiding couldn't be prepared, or more than 64 `--port` values were given |
+
+The command can exit with any of these itself, so they only mean something when
+the command isn't known to use them. (`125` is what Docker and Podman use for
+"the runner failed".)
 
 Not listed: a direct connection to an IP address fails inside the kernel
 ("network unreachable") without reaching nullroute. Proxy requests, DNS lookups
@@ -236,10 +256,12 @@ nullroute: inspect: sandbox topology
   unix sockets:
     blocked (403 decoy):
       /run/containerd/containerd.sock
+      /run/dbus/system_bus_socket
     sealed (--seal-docker proxy):
       /run/docker.sock
     masked (resolver bypass):
       /run/systemd/resolve/io.systemd.Resolve
+  docker pulls:    any (the daemon may contact any registry or URL)
   upstream proxy:  http://127.0.0.1:3128 (allow: api.github.com)
   dns sinkhole:    127.0.0.1:53 (udp, tcp; other names get NXDOMAIN)
     api.github.com -> 127.77.0.1 (ports 80, 443)
@@ -459,7 +481,10 @@ Recent Docker CLIs fetch `docker build https://...` and git contexts
 themselves (inside the sandbox, under its network rules) and send the daemon a
 plain build, so `remote=` only comes from other API clients.
 
-## Status: v0.7, Linux only
+## Status: pre-1.0, Linux only
+
+nullroute hasn't had a 1.0 release; options and output formats may still change
+(see the [changelog](CHANGELOG.md)).
 
 | | |
 |---|---|
@@ -482,11 +507,34 @@ plain build, so `remote=` only comes from other API clients.
 ### What nullroute is not
 
 nullroute stops **accidental** network access. It is not a security boundary
-for hostile code. The command still sees your whole filesystem and runs as you,
-and only the sockets listed above are hidden by default: other local daemons
-with a Unix socket (the session D-Bus, an SSH agent, a local proxy) stay
-reachable unless you `--hide-socket` them. For untrusted code use a real sandbox such as a VM, gVisor
-or bubblewrap with a locked-down filesystem.
+for hostile code. For untrusted code use a real sandbox such as a VM, gVisor
+or bubblewrap with a locked-down filesystem. Specifically, these are **not**
+protected:
+
+- **The filesystem and everything else that isn't the network.** The command
+  sees your whole filesystem and runs as you. There is no PID namespace (it can
+  see and signal your other processes), no seccomp filter and no resource limits.
+- **Other Unix sockets.** Only the sockets listed above are hidden by default.
+  Other local daemons reachable through a socket file (the session D-Bus, an SSH
+  or GPG agent, a display server, a local proxy) stay reachable unless you
+  `--hide-socket` them, and anything they can do for the command goes
+  unchecked.
+- **File descriptors the command inherits.** A socket that nullroute's parent
+  opened before starting it (and left inheritable) belongs to the host's
+  network namespace and keeps working inside the sandbox. Start nullroute from a
+  shell or CI step that hasn't opened network connections for it.
+- **Running nullroute as root.** The sandbox assumes an unprivileged user. As
+  uid 0 the command is root inside its own namespaces, keeps its capabilities,
+  and can unmount the socket decoys and masks (it still can't reach the host's
+  network namespace). Don't run it as root (CI jobs normally don't need to).
+- **What you let through.** Anything reachable through `--port`, `--allow`,
+  `--allow-socket` and a Docker socket given to `--seal-docker` is reachable.
+  Data can leave through those channels, including as host names in DNS
+  lookups and registry requests (see [the Docker caveats](#letting-docker-tests-run-with-sealed-containers)).
+- **The kernel.** User and network namespaces enlarge the kernel's attack
+  surface, and a kernel bug can defeat them.
+
+See [SECURITY.md](SECURITY.md) for how to report a way around the isolation.
 
 ## How it works
 
@@ -496,8 +544,9 @@ or bubblewrap with a locked-down filesystem.
    needed) plus a new network namespace, which starts with only a loopback device.
 2. Maps your real uid/gid into the user namespace, so tools don't think they're root.
 3. Brings `lo` up (it starts down).
-4. `exec`s your command. It holds no capabilities after exec, so it can't add
-   interfaces, change routes, or create another namespace to get out.
+4. `exec`s your command. Run as an ordinary user (not root), it holds no
+   capabilities after exec, so it can't add interfaces, change routes, or create
+   another namespace to get out.
 
 This is enforced by the kernel, not by environment variables or library hooks, so
 it also covers raw sockets, UDP, subprocesses and statically linked binaries.
@@ -505,8 +554,9 @@ it also covers raw sockets, UDP, subprocesses and statically linked binaries.
 Socket hiding adds a mount namespace (`CLONE_NEWNS`): nullroute binds a Unix
 listener in a private temp dir for each hidden socket, and the child, after
 entering the new namespaces, makes all mounts private and bind-mounts each decoy
-over its target path. Nothing changes on the host. The command can't undo it:
-after exec it holds no capabilities, and unmounting needs `CAP_SYS_ADMIN`.
+over its target path. Nothing changes on the host. The command can't undo it
+(when nullroute isn't run as root): after exec it holds no capabilities, and
+unmounting needs `CAP_SYS_ADMIN`.
 
 `--port` works by having the child, once inside the new namespace, open a
 listening socket on `127.0.0.1:PORT` (and `[::1]:PORT`) and hand it to the parent
@@ -527,22 +577,31 @@ relays the connections on the host's network.
 
 ## Requirements
 
-Linux only (x86_64 and aarch64; glibc or musl, so static musl builds work). On
-macOS, FreeBSD and other targets the build stops with a single "nullroute only
-supports Linux" error.
-
-Unprivileged user namespaces must be enabled. On Ubuntu 23.10+ AppArmor restricts
-them by default (`kernel.apparmor_restrict_unprivileged_userns=1`); nullroute prints a
-hint if namespace creation is refused.
+- **Linux only**, x86_64 and aarch64 (CI tests x86_64 and builds both; glibc or musl,
+  so static musl builds work). On macOS, FreeBSD and other targets the
+  build stops with a single "nullroute only supports Linux" error.
+- **Unprivileged user namespaces must be enabled**, and mount namespaces are used
+  for socket hiding and the DNS sinkhole. On Ubuntu 23.10+ AppArmor restricts
+  user namespaces by default (`kernel.apparmor_restrict_unprivileged_userns=1`);
+  nullroute prints a hint if namespace creation is refused. Containers and some
+  hardened hosts (`user.max_user_namespaces=0`, a seccomp profile that blocks
+  `unshare`) refuse them too; run nullroute as an ordinary user, not root.
+- A kernel with `/proc/<pid>/task/<tid>/children` (`CONFIG_PROC_CHILDREN`,
+  enabled on mainstream distributions) lets nullroute find and kill what the
+  command leaves running; without it, leftovers aren't cleaned up.
+- **Docker** (only for `--seal-docker`): a daemon reachable on a Unix socket.
+- **Rust 1.88 or newer** to build from source.
 
 ## Development
 
 ```bash
-cargo test                                   # integration tests run the real binary
-cargo clippy --all-targets -- -D warnings
-cargo fmt
-cargo check --target x86_64-unknown-linux-musl   # CI also checks aarch64 musl/gnu
+cargo test --locked                          # integration tests run the real binary
+cargo clippy --all-targets --locked -- -D warnings
+cargo fmt --all
+cargo check --locked --target x86_64-unknown-linux-musl   # CI also checks aarch64 musl/gnu
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full list of checks CI runs.
 
 ## License
 
