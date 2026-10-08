@@ -12,6 +12,10 @@ nullroute run -- go test ./...
 nullroute run --port 5432,6379 -- pytest   # local Postgres + Redis still reachable
 ```
 
+<p align="center">
+  <img src="demo/demo.gif" alt="nullroute 15-second terminal demo" width="760" />
+</p>
+
 Inside, the command has a loopback interface and nothing else. Connecting to any
 other host fails immediately with "network unreachable", and DNS lookups fail
 (with `--allow`, only allowed names resolve; see below).
@@ -594,6 +598,17 @@ relays the connections on the host's network.
   command leaves running; without it, leftovers aren't cleaned up.
 - **Docker** (only for `--seal-docker`): a daemon reachable on a Unix socket.
 - **Rust 1.88 or newer** to build from source.
+
+## Examples
+
+Turnkey, runnable examples are in [`examples/`](examples/):
+
+- [`examples/01-python-test-leak`](examples/01-python-test-leak/): Catching unmocked external API calls in test suites and enforcing `--strict` in CI.
+- [`examples/02-npm-postinstall-sandbox`](examples/02-npm-postinstall-sandbox/): Sandboxing untrusted package hooks with defense-in-depth Unix socket hygiene.
+- [`examples/03-local-service-port`](examples/03-local-service-port/): Bridging host databases/containers via `--port` with bidirectional loopback isolation.
+- [`examples/04-allowlist-surgical-bridge`](examples/04-allowlist-surgical-bridge/): Surgical egress allowlisting and breach reporting (`--report-json`).
+
+Each example is self-contained and runnable via `./run.sh` in under 5 seconds.
 
 ## Development
 
