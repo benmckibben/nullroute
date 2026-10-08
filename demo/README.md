@@ -21,5 +21,7 @@ vhs demo/nullroute-demo.tape     # writes demo/demo.gif and demo/demo.mp4
 VHS needs `ttyd` and `ffmpeg` on PATH (see the VHS README), and the tape needs
 `python3` and access to example.com. A hidden preamble in the tape `cd`s into
 `demo/` and puts `target/debug` and `target/release` on PATH before recording
-starts, so neither the `cd` nor the PATH setup shows up in the GIF. The rendered
-GIF/MP4 are git-ignored; they are not committed and not part of the published crate.
+starts, so neither the `cd` nor the PATH setup shows up in the GIF. `demo.gif` is
+committed (the README embeds it), so re-rendering changes a tracked file: re-render
+and commit it deliberately, not as a side effect of unrelated work. `demo.mp4` is
+git-ignored and not committed. Neither is part of the published crate.
