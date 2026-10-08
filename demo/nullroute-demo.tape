@@ -1,34 +1,34 @@
 # nullroute: The 15-Second Aha! Demo
-# Generates a crisp terminal demo showing zero-leak isolation in action.
-# Compatible with VHS (https://github.com/charmbracelet/vhs)
-
 Output demo.gif
 Output demo.mp4
 
-Set FontSize 18
-Set Width 900
-Set Height 520
-Set Padding 20
+Set FontSize 16
+Set Width 960
+Set Height 580
+Set Padding 18
 Set Theme "Catppuccin Mocha"
 Set FontFamily "JetBrains Mono"
-Set TypingSpeed 40ms
+Set TypingSpeed 35ms
 
-# Scene 1: The Leaky Test
-Type "python3 examples/01-python-test-leak/test_payment.py"
+# Scene 1: The Leaky Call
+Type "python3 test_leak.py"
 Enter
 Sleep 2.5s
 
-# Scene 2: The Instant Seal
-Type "nullroute run -- python3 examples/01-python-test-leak/test_payment.py"
+# Scene 2: Instant Seal
+Type "nullroute run -- python3 test_leak.py"
 Enter
 Sleep 3s
 
-# Scene 3: Surgical Bridge with --allow
-Type "nullroute run --allow example.com -- python3 examples/01-python-test-leak/test_payment.py"
+# Scene 3: Surgical Bridge
+Type "nullroute run --allow example.com -- python3 test_leak.py"
 Enter
 Sleep 3.5s
 
-# Scene 4: Summary & Inspect
+# Scene 4: Inspect Topology
+Type "clear"
+Enter
+Sleep 0.5s
 Type "nullroute run --allow example.com --port 5432 --inspect --dry-run -- true"
 Enter
-Sleep 4s
+Sleep 4.5s
