@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
   workflow_dispatch:
+  # Weekly dependency audit, so new RustSec advisories against the locked
+  # dependency tree show up without a push. Only the cargo-deny job runs on
+  # schedule; the build/test jobs skip (they gate on event_name below).
+  schedule:
+    - cron: "17 14 * * 1" # Mondays 14:17 UTC
 
 # Read-only token: CI never needs to write to the repo. No publishing here.
 permissions:
@@ -26,6 +31,7 @@ jobs:
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -40,6 +46,7 @@ jobs:
   clippy:
     name: clippy
     runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -55,6 +62,7 @@ jobs:
   test:
     name: test (${{ matrix.toolchain }})
     runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -92,6 +100,7 @@ jobs:
   cross-check:
     name: check (${{ matrix.target }})
     runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -119,6 +128,7 @@ jobs:
   test-musl:
     name: test (x86_64-unknown-linux-musl)
     runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,6 +154,7 @@ jobs:
   unsupported-targets:
     name: non-Linux build fails cleanly
     runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -171,3 +182,19 @@ jobs:
             echo "::error::expected exactly 1 error, got $errors"
             exit 1
           fi
+
+  # Dependency audit against deny.toml: RustSec advisories (vulnerable, unsound,
+  # unmaintained, yanked), licence allow-list, bans (wildcards, duplicates) and
+  # sources (crates.io only). The only job that also runs on the weekly schedule.
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features

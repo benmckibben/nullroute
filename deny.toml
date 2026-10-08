@@ -1,0 +1,42 @@
+# cargo-deny policy for nullroute: https://embarkstudios.github.io/cargo-deny/
+# Checked in CI by the "cargo-deny" job (.github/workflows/ci.yml).
+# Run locally with: cargo deny --all-features check
+
+[graph]
+# No [graph] targets: check the dependency tree for every platform, so a
+# Windows/macOS-only transitive crate can't slip past the audit.
+all-features = true
+
+[advisories]
+# RustSec advisory DB. With version 2, vulnerability and unsound advisories are
+# always errors; only an explicit, commented entry in `ignore` can waive one.
+version = 2
+# Fail on unmaintained crates anywhere in the tree (direct or transitive): the
+# tree is small, and an abandoned crate is worth a red build to look at.
+unmaintained = "all"
+# Cargo.lock is used with --locked everywhere, so a yanked version in it should
+# be bumped, not shipped.
+yanked = "deny"
+# Exceptions must name a specific advisory ID and say why it doesn't apply.
+ignore = []
+
+[licenses]
+version = 2
+# nullroute itself is MIT OR Apache-2.0. Only licences that actually appear in the
+# dependency tree are allowed; anything new fails until reviewed and added here.
+#   Unicode-3.0: unicode-ident (Unicode data tables), via proc-macro2/syn.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.93
+
+[bans]
+# Duplicate versions bloat the build but are usually upstream's to fix: warn.
+multiple-versions = "warn"
+# `version = "*"` requirements are never acceptable.
+wildcards = "deny"
+
+[sources]
+# Only crates.io; no other registries and no git dependencies.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
