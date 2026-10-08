@@ -121,7 +121,7 @@ if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     if [[ $ALLOWED_STATUS -eq 0 ]]; then
         echo "Allowed run succeeded cleanly!"
     else
-        echo "skipping: external request failed (network or upstream error, exit code: $ALLOWED_STATUS)"
+        echo "Error: allowed run failed despite online connectivity (exit code: $ALLOWED_STATUS)" >&2; exit $ALLOWED_STATUS
     fi
 else
     echo "skipping: offline or external connectivity to example.com unavailable."
