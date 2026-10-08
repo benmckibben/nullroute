@@ -183,6 +183,62 @@ jobs:
             exit 1
           fi
 
+  # The offline-safe parts of the developer examples. NULLROUTE_EXAMPLES_OFFLINE=1
+  # makes examples 01 and 03 skip (loudly) every step that needs the public
+  # internet, so this job cannot flake on example.com or its rate limits, while
+  # everything else still runs and asserts (sealed run fails, --report-json
+  # records the blocked target, --strict turns exit 0 into 1, --port bridging).
+  # Each script ends with "examples: <name>: N assertions run, M skipped (...)";
+  # the greps below pin the exact counts, so a silently skipped assertion fails
+  # the job. Examples 02 (needs node, and its only offline-safe check is a sealed
+  # run) and 04 (almost entirely about live allowed hosts) are not run here.
+  examples:
+    name: examples (offline-safe)
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: examples
+
+      # ubuntu-24.04 runners ship shellcheck.
+      - name: shellcheck examples and demo scripts
+        run: |
+          shellcheck --version
+          shellcheck -x -P SCRIPTDIR examples/*.sh examples/*/run.sh demo/*.sh
+
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --net --map-current-user true
+
+      - run: cargo build --locked
+
+      - name: Example 01 (python test leak)
+        env:
+          NULLROUTE_EXAMPLES_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          ./examples/01-python-test-leak/run.sh 2>&1 | tee "$RUNNER_TEMP/example-01.log"
+          # Steps 2-4 assert; the two internet steps (1 and 5) are the only skips.
+          grep -Fx 'examples: 01-python-test-leak: 3 assertions run, 2 skipped (offline mode)' "$RUNNER_TEMP/example-01.log"
+
+      - name: Example 03 (local service port)
+        env:
+          NULLROUTE_EXAMPLES_OFFLINE: "1"
+        run: |
+          set -euo pipefail
+          ./examples/03-local-service-port/run.sh 2>&1 | tee "$RUNNER_TEMP/example-03.log"
+          # Loopback only: all four assertions run, nothing is skipped.
+          grep -Fx 'examples: 03-local-service-port: 4 assertions run, 0 skipped (offline mode)' "$RUNNER_TEMP/example-03.log"
+
   # Dependency audit against deny.toml: RustSec advisories (vulnerable, unsound,
   # unmaintained, yanked), licence allow-list, bans (wildcards, duplicates) and
   # sources (crates.io only). The only job that also runs on the weekly schedule.

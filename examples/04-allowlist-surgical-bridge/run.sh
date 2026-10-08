@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# shellcheck source=../common-preflight.sh
 source "$REPO_ROOT/examples/common-preflight.sh"
 preflight_check
 NULLROUTE="$(find_nullroute "$REPO_ROOT")"
@@ -24,6 +25,7 @@ set -e
 
 if [[ $EXAMPLE_BLOCKED -ne 0 && $ORG_BLOCKED -ne 0 ]]; then
     echo "-> Egress blocked as expected (non-zero exits)."
+    assertion_passed
 else
     echo "-> Error: requests escaped sandbox without --allow!" >&2
     exit 1
@@ -34,7 +36,9 @@ echo "=================================================================="
 echo " STEP 2: Run with --allow example.com"
 echo " (Opt-in external test; checks internet connectivity first)"
 echo "=================================================================="
-if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
+if examples_offline; then
+    skip_step "step 2" "allowing example.com needs live internet access"
+elif curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     echo "Checking example.com (allowed):"
     set +e
     "$NULLROUTE" run --allow example.com -- curl -s -f -o /dev/null -w "%{http_code}\n" http://example.com
@@ -45,6 +49,7 @@ if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
         exit 1
     fi
     echo "-> example.com reached successfully."
+    assertion_passed
     
     echo "Checking example.org (not allowed, should return 403 Forbidden via proxy):"
     REPORT_FILE="$(mktemp --suffix=.json)"
@@ -56,6 +61,7 @@ if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     
     if [[ $UNALLOWED_RC -ne 0 ]]; then
         echo "-> example.org received 403 Forbidden and was blocked as expected!"
+        assertion_passed
     else
         echo "Error: unallowed host example.org was not blocked by proxy!" >&2
         rm -f "$REPORT_FILE"
@@ -80,7 +86,11 @@ else:
     print("✘ Error: example.org was not recorded in breach report!", file=sys.stderr)
     sys.exit(1)
 '
+    assertion_passed
     rm -f "$REPORT_FILE"
 else
-    echo "skipping step 2: host is currently offline or example.com is unreachable."
+    skip_step "step 2" "host is currently offline or example.com is unreachable."
 fi
+
+echo ""
+examples_summary "04-allowlist-surgical-bridge"

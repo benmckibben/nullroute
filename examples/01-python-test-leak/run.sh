@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# shellcheck source=../common-preflight.sh
 source "$REPO_ROOT/examples/common-preflight.sh"
 preflight_check
 NULLROUTE="$(find_nullroute "$REPO_ROOT")"
@@ -15,14 +16,16 @@ echo " STEP 1: Running python test normally (NO nullroute)"
 echo " Notice how the test silently reaches out to example.com..."
 echo " (Note: This step requires live internet connectivity)"
 echo "=================================================================="
-if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
+if examples_offline; then
+    skip_step "step 1" "the unsandboxed call needs live internet access to example.com"
+elif curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     set +e
     python3 test_payment.py
     NORMAL_STATUS=$?
     set -e
     echo "Normal run exit code: $NORMAL_STATUS"
 else
-    echo "skipping step 1: host is currently offline or example.com is unreachable."
+    skip_step "step 1" "host is currently offline or example.com is unreachable."
 fi
 
 echo ""
@@ -36,8 +39,13 @@ set +e
 TEST_STATUS=$?
 set -e
 
-if [[ $TEST_STATUS -ne 0 ]]; then
+# 125 means nullroute itself failed to start the sandbox, which proves nothing.
+if [[ $TEST_STATUS -eq 125 ]]; then
+    echo "-> Error: nullroute failed to start the sandbox (exit code 125)!" >&2
+    exit 1
+elif [[ $TEST_STATUS -ne 0 ]]; then
     echo "-> Test failed as expected when external network was sealed! (exit code: $TEST_STATUS)"
+    assertion_passed
 else
     echo "-> Unexpected: test succeeded without network!"
     exit 1
@@ -72,6 +80,7 @@ else:
     print('✘ Error: example.com not found in breach report!', file=sys.stderr)
     sys.exit(1)
 "
+assertion_passed
 rm -f "$REPORT_FILE"
 
 echo ""
@@ -106,6 +115,7 @@ else:
     print("✘ Error: --strict failed to enforce exit 1!", file=sys.stderr)
     sys.exit(1)
 '
+assertion_passed
 rm -f "$REPORT_FILE"
 
 echo ""
@@ -113,16 +123,22 @@ echo "=================================================================="
 echo " STEP 5: Running with surgical --allow example.com"
 echo " (Opt-in external test; checks internet connectivity first)"
 echo "=================================================================="
-if curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
+if examples_offline; then
+    skip_step "step 5" "the allowed run needs live internet access to example.com"
+elif curl -sf --connect-timeout 2 -I http://example.com &>/dev/null; then
     set +e
     "$NULLROUTE" run --allow example.com -- python3 test_payment.py
     ALLOWED_STATUS=$?
     set -e
     if [[ $ALLOWED_STATUS -eq 0 ]]; then
         echo "Allowed run succeeded cleanly!"
+        assertion_passed
     else
         echo "Error: allowed run failed despite online connectivity (exit code: $ALLOWED_STATUS)" >&2; exit $ALLOWED_STATUS
     fi
 else
-    echo "skipping: offline or external connectivity to example.com unavailable."
+    skip_step "step 5" "offline or external connectivity to example.com unavailable."
 fi
+
+echo ""
+examples_summary "01-python-test-leak"

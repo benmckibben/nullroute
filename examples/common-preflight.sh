@@ -1,5 +1,50 @@
 #!/usr/bin/env bash
-# Common preflight checks for nullroute examples
+# Common preflight checks and helpers for nullroute examples.
+#
+# Offline mode: set NULLROUTE_EXAMPLES_OFFLINE=1 to skip the steps that need the
+# public internet (calls to example.com / example.org and the curl connectivity
+# probes). Every skip is announced loudly and counted. All steps that do not
+# need upstream connectivity (sealed runs, --report-json, --strict, --port, ...)
+# still run and assert. Scripts that use the helpers below end with a summary:
+#
+#   examples: <name>: N assertions run, M skipped (<mode>)
+#
+# so CI can check that the expected assertions really ran, not just that the
+# script exited 0. The default (unset) behaviour is unchanged.
+
+EXAMPLES_ASSERTIONS=0
+EXAMPLES_SKIPPED=0
+
+# True when NULLROUTE_EXAMPLES_OFFLINE=1.
+examples_offline() {
+    [[ "${NULLROUTE_EXAMPLES_OFFLINE:-}" == "1" ]]
+}
+
+# Call right after an assertion has passed (a failing assertion exits the script).
+assertion_passed() {
+    EXAMPLES_ASSERTIONS=$((EXAMPLES_ASSERTIONS + 1))
+}
+
+# skip_step <step> <reason>: announce and count a skipped step.
+skip_step() {
+    EXAMPLES_SKIPPED=$((EXAMPLES_SKIPPED + 1))
+    if examples_offline; then
+        echo "skipping $1: $2 (offline mode, NOT VERIFIED)"
+    else
+        echo "skipping $1: $2"
+    fi
+}
+
+# examples_summary <name>: print the assertion-count line (call last, on success).
+examples_summary() {
+    local mode="online"
+    if examples_offline; then
+        mode="offline mode"
+    elif [[ $EXAMPLES_SKIPPED -gt 0 ]]; then
+        mode="upstream unreachable"
+    fi
+    echo "examples: $1: $EXAMPLES_ASSERTIONS assertions run, $EXAMPLES_SKIPPED skipped ($mode)"
+}
 
 preflight_check() {
     # 1. OS Check: Linux only

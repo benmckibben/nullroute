@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
+# shellcheck source=../common-preflight.sh
 source "$REPO_ROOT/examples/common-preflight.sh"
 preflight_check
 NULLROUTE="$(find_nullroute "$REPO_ROOT")"
@@ -39,7 +40,13 @@ echo ""
 echo "=================================================================="
 echo " STEP 1: Host reaches service directly"
 echo "=================================================================="
-curl -s "http://127.0.0.1:$PORT"
+DIRECT_BODY="$(curl -s "http://127.0.0.1:$PORT")"
+echo "$DIRECT_BODY"
+if [[ "$DIRECT_BODY" != *"Hello from host local database service!"* ]]; then
+    echo "-> Error: unexpected response from the host service: $DIRECT_BODY" >&2
+    exit 1
+fi
+assertion_passed
 
 echo ""
 echo "=================================================================="
@@ -50,8 +57,13 @@ set +e
 "$NULLROUTE" run -- curl -s --connect-timeout 2 "http://127.0.0.1:$PORT"
 SEALED_STATUS=$?
 set -e
-if [[ $SEALED_STATUS -ne 0 ]]; then
+# 125 means nullroute itself failed to start the sandbox, which proves nothing.
+if [[ $SEALED_STATUS -eq 125 ]]; then
+    echo "-> Error: nullroute failed to start the sandbox (exit code 125)!" >&2
+    exit 1
+elif [[ $SEALED_STATUS -ne 0 ]]; then
     echo "-> Sealed call failed as expected! (Exit code: $SEALED_STATUS)"
+    assertion_passed
 else
     echo "-> Unexpected success without --port!"
     exit 1
@@ -62,7 +74,13 @@ echo "=================================================================="
 echo " STEP 3: Bridged with --port $PORT"
 echo " Host service is surgically bridged into the sandbox's localhost."
 echo "=================================================================="
-"$NULLROUTE" run --port "$PORT" -- curl -s "http://127.0.0.1:$PORT"
+BRIDGED_BODY="$("$NULLROUTE" run --port "$PORT" -- curl -s "http://127.0.0.1:$PORT")"
+echo "$BRIDGED_BODY"
+if [[ "$BRIDGED_BODY" != *"Hello from host local database service!"* ]]; then
+    echo "-> Error: bridged call did not reach the host service: $BRIDGED_BODY" >&2
+    exit 1
+fi
+assertion_passed
 
 echo ""
 echo "=================================================================="
@@ -119,3 +137,7 @@ finally:
     proc.terminate()
     proc.wait()
 '
+assertion_passed
+
+echo ""
+examples_summary "03-local-service-port"
