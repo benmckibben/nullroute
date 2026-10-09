@@ -134,8 +134,11 @@ pub fn run_bounded<T: Send + 'static>(
     })?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::Builder::new().spawn(move || {
-        let _permit = permit;
-        let _ = tx.send(f());
+        let result = f();
+        // Release the slot before the result becomes visible: the caller may
+        // start the next lookup the moment it has this one's answer.
+        drop(permit);
+        let _ = tx.send(result);
     })?;
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
@@ -311,6 +314,19 @@ mod tests {
         assert_eq!(calls, 4);
         // Two retried errors paused instead of spinning.
         assert!(start.elapsed() >= ACCEPT_BACKOFF * 2);
+    }
+
+    #[test]
+    fn a_finished_lookup_has_released_its_slot_when_run_bounded_returns() {
+        // One slot: if the helper thread released it only after sending the
+        // result, the next call could find it still taken and fail at once with
+        // "too many name lookups".
+        let l = Limiter::new(1);
+        for i in 0..2000u32 {
+            let got = run_bounded(&l, Duration::from_secs(5), move || Ok(i));
+            assert_eq!(got.unwrap(), i, "call {i}");
+            assert_eq!(l.active(), 0, "call {i}");
+        }
     }
 
     #[test]
