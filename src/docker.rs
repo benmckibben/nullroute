@@ -124,8 +124,18 @@ fn proxy(
     // is always rewritten. The only way out of parsing is a genuine protocol
     // switch (see Hijack); anything else ends with the connection.
     loop {
-        let Some(mut req) = read_request(&mut client_r)? else {
-            return Ok(()); // client closed cleanly
+        let mut req = match read_request_with(&mut client_r, Some(&mut client_w)) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Ok(()), // client closed cleanly
+            Err(e) => {
+                let Some(rj) = rejection(&e) else {
+                    return Err(e);
+                };
+                // Not a silent close: say why (and the connection ends, since
+                // the rest of the request is unread).
+                refuse(&mut client_w, report, rj.code, "request", rj.message, true)?;
+                return Ok(());
+            }
         };
         // A streamed (build) body is still in client_r: refusing such a
         // request must close the connection, or its body would be parsed as
@@ -181,6 +191,38 @@ fn proxy(
             continue;
         }
 
+        if !policy.allow_existing
+            && let Some(g) = req.guarded()
+        {
+            match check_existing(upstream, &req, &g) {
+                Ok(Existing::Sealed(target)) => req.forward_target = Some(target),
+                Ok(Existing::Refuse(b)) => {
+                    report.record(Kind::Docker, &b.target, &b.why, || {
+                        format!("nullroute: --seal-docker: refused {} ({})", b.target, b.why)
+                    });
+                    write_error(&mut client_w, 403, &b.message, false)?;
+                    continue;
+                }
+                Ok(Existing::Missing(message)) => {
+                    write_error(&mut client_w, 404, &message, false)?;
+                    continue;
+                }
+                Err(e) => {
+                    // Can't tell whether the container has a network: don't
+                    // let the request through.
+                    refuse(
+                        &mut client_w,
+                        report,
+                        502,
+                        "container check",
+                        &format!("couldn't check the container with the Docker daemon ({e})"),
+                        false,
+                    )?;
+                    continue;
+                }
+            }
+        }
+
         let body = if req.is_create() {
             match rewrite_create(&req.body, report) {
                 Some(b) => b,
@@ -219,6 +261,9 @@ fn proxy(
             req.body.clone()
         };
         if let Some(framing) = req.stream {
+            if req.expects_continue() {
+                client_w.write_all(CONTINUE)?;
+            }
             up_w.write_all(&req.render_head(None))?;
             forward_body(&mut client_r, &mut up_w, framing)?;
         } else {
@@ -226,7 +271,14 @@ fn proxy(
             up_w.write_all(&body)?;
         }
 
-        let resp = read_response_head(&mut up_r)?;
+        let mut resp = read_response_head(&mut up_r)?;
+        // Interim responses (100 Continue, 103 Early Hints) come before the
+        // real one: pass them on and wait for it. A 101 is the exception; it
+        // is the answer.
+        while resp.status / 100 == 1 && resp.status != 101 {
+            client_w.write_all(&resp.head)?;
+            resp = read_response_head(&mut up_r)?;
+        }
         if resp.status == 101 && !req.may_upgrade() {
             // Only attach and exec-start may become raw streams. Anything
             // else that switches protocols is a tunnel we can't parse
@@ -549,12 +601,18 @@ struct Request {
     /// The path segments the daemon routes on (see canonical_route), or why
     /// they can't be determined.
     route: Result<Vec<String>, &'static str>,
+    /// The `vX.Y` prefix of the path, if any (kept when the target is pinned).
+    api_version: Option<String>,
     /// A rewritten request target to forward instead of `path`.
     forward_target: Option<String>,
 }
 
 impl Request {
     fn new(method: &str, path: &str, version: &str, headers: Vec<(String, String)>) -> Request {
+        let (api_version, route) = match canonical_parts(path) {
+            Ok((v, segs)) => (v, Ok(segs)),
+            Err(why) => (None, Err(why)),
+        };
         Request {
             method: method.into(),
             path: path.into(),
@@ -562,7 +620,8 @@ impl Request {
             headers,
             body: Vec::new(),
             stream: None,
-            route: canonical_route(path),
+            route,
+            api_version,
             forward_target: None,
         }
     }
@@ -650,6 +709,50 @@ impl Request {
         None
     }
 
+    /// Requests that run code in, start, resume, attach to or write into an
+    /// existing container (or an exec instance), which `--seal-docker` only
+    /// allows for containers that have no network (see `check_existing`).
+    ///
+    /// An allowlist, not a denylist: every `/containers/{ref}/{op}` and
+    /// `/exec/{ref}/{op}` is guarded except the operations known to be reads or
+    /// to neither run code nor start anything (SAFE_CONTAINER_OPS), so an endpoint
+    /// added in a later Docker version is guarded until it is looked at. The
+    /// reference may contain slashes (the daemon's route is `{name:.*}`, and
+    /// legacy links are named `parent/alias`).
+    fn guarded(&self) -> Option<Guarded> {
+        let s = self.segs();
+        let method = self.method.to_ascii_uppercase();
+        let exec = match s.first().map(String::as_str) {
+            Some("containers") => false,
+            Some("exec") => true,
+            _ => return None,
+        };
+        // containers/json, /create, /prune, DELETE /containers/{ref}, and the
+        // like have no operation segment.
+        if s.len() < 3 {
+            return None;
+        }
+        let ws = !exec && s.len() >= 4 && s[s.len() - 2] == "attach" && s[s.len() - 1] == "ws";
+        let (end, op) = if ws {
+            (s.len() - 2, "attach/ws")
+        } else {
+            (s.len() - 1, s[s.len() - 1].as_str())
+        };
+        let safe: &[(&str, &str)] = if exec {
+            SAFE_EXEC_OPS
+        } else {
+            SAFE_CONTAINER_OPS
+        };
+        if safe.iter().any(|(m, o)| *m == method && *o == op) {
+            return None;
+        }
+        Some(Guarded {
+            exec,
+            reference: s[1..end].join("/"),
+            op: op.to_string(),
+        })
+    }
+
     /// `POST /containers/{id}/attach` or `POST /exec/{id}/start`: the only
     /// endpoints whose response may become a raw stream without a 101.
     fn is_stream_endpoint(&self) -> bool {
@@ -705,6 +808,12 @@ impl Request {
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    /// `Expect: 100-continue` (the only expectation accepted).
+    fn expects_continue(&self) -> bool {
+        self.header("expect")
+            .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
     }
 
     fn wants_close(&self) -> bool {
@@ -821,6 +930,11 @@ impl Request {
         let mut s = format!("{} {} {}\r\n", self.method, target, self.version);
         let mut wrote_len = false;
         for (name, value) in &self.headers {
+            // Answered here (see read_request_with); a second one from the
+            // daemon would reach the client out of turn.
+            if name.eq_ignore_ascii_case("expect") {
+                continue;
+            }
             match body_len {
                 Some(len) if name.eq_ignore_ascii_case("content-length") => {
                     s.push_str(&format!("Content-Length: {len}\r\n"));
@@ -853,9 +967,74 @@ fn matches_exactly(segs: &[String], pat: &[&str]) -> bool {
     segs.len() == pat.len() && ends_with(segs, pat)
 }
 
+/// A request that is answered with an HTTP error instead of being parsed
+/// further (and whose connection is then closed): carried inside the
+/// `io::Error` that `read_request` returns.
+#[derive(Debug)]
+struct Reject {
+    code: u16,
+    message: &'static str,
+}
+
+impl std::fmt::Display for Reject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for Reject {}
+
+fn reject(code: u16, message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, Reject { code, message })
+}
+
+fn rejection(e: &io::Error) -> Option<&Reject> {
+    e.get_ref()?.downcast_ref::<Reject>()
+}
+
+/// Read one line of a request head into `line`, counting it against the
+/// head's size limit. A line without a newline within the limit is 431, not
+/// something to buffer without bound.
+fn read_head_line<R: BufRead>(
+    reader: &mut R,
+    used: &mut usize,
+    line: &mut String,
+) -> io::Result<usize> {
+    let room = (MAX_HEAD - *used) as u64;
+    let n = reader
+        .by_ref()
+        .take(room + 1)
+        .read_line(line)
+        .map_err(|e| {
+            if e.kind() == io::ErrorKind::InvalidData {
+                reject(400, "the request head is not valid UTF-8")
+            } else {
+                e
+            }
+        })?;
+    *used += n;
+    if *used > MAX_HEAD {
+        return Err(reject(431, "the request head is too large"));
+    }
+    Ok(n)
+}
+
+#[cfg(test)]
 fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
+    read_request_with(reader, None)
+}
+
+/// Read one request. `interim` is where a `100 Continue` goes: a client that
+/// sent `Expect: 100-continue` waits for it before sending the body, so it is
+/// sent here, right before the body is read, and the header is not forwarded
+/// (the daemon would answer it a second time).
+fn read_request_with<R: BufRead>(
+    reader: &mut R,
+    interim: Option<&mut dyn Write>,
+) -> io::Result<Option<Request>> {
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    let mut total = 0usize;
+    if read_head_line(reader, &mut total, &mut line)? == 0 {
         return Ok(None);
     }
     let mut parts = line.trim_end().splitn(3, ' ');
@@ -863,20 +1042,15 @@ fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
     let path = parts.next().unwrap_or("").to_string();
     let version = parts.next().unwrap_or("HTTP/1.1").to_string();
     if method.is_empty() || path.is_empty() {
-        return Err(io::Error::other("malformed request line"));
+        return Err(reject(400, "malformed request line"));
     }
 
     let mut headers = Vec::new();
     let mut content_length = 0u64;
-    let mut total = line.len();
     loop {
         let mut h = String::new();
-        if reader.read_line(&mut h)? == 0 {
+        if read_head_line(reader, &mut total, &mut h)? == 0 {
             return Err(io::ErrorKind::UnexpectedEof.into());
-        }
-        total += h.len();
-        if total > MAX_HEAD {
-            return Err(io::Error::other("request head too large"));
         }
         let trimmed = h.trim_end();
         if trimmed.is_empty() {
@@ -887,20 +1061,26 @@ fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
             if name.eq_ignore_ascii_case("content-length") {
                 // Digits only, like Go (Rust's parser would also take "+5").
                 if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
-                    return Err(io::Error::other("bad Content-Length"));
+                    return Err(reject(400, "bad Content-Length"));
                 }
                 content_length = value
                     .parse()
-                    .map_err(|_| io::Error::other("bad Content-Length"))?;
+                    .map_err(|_| reject(400, "bad Content-Length"))?;
             }
             headers.push((name, value));
         }
     }
     let mut req = Request::new(&method, &path, &version, headers);
+    if req.header("expect").is_some() && !req.expects_continue() {
+        // Answering anything but 100-continue is optional; refusing is what
+        // the daemon does, and the client won't send a body after that.
+        return Err(reject(417, "only Expect: 100-continue is supported"));
+    }
     if req.is_build() {
         // The build context can be large and the classic builder sends it
         // chunked: stream it instead of buffering. (Whether a chunked body is
-        // acceptable is decided by unframeable().)
+        // acceptable is decided by unframeable(); a 100 Continue is sent by
+        // the caller, once it has decided to read the body.)
         req.stream = Some(if req.header("transfer-encoding").is_some() {
             Framing::Chunked
         } else {
@@ -909,13 +1089,26 @@ fn read_request<R: BufRead>(reader: &mut R) -> io::Result<Option<Request>> {
         return Ok(Some(req));
     }
     if content_length > MAX_BODY as u64 {
-        return Err(io::Error::other("request body too large for --seal-docker"));
+        return Err(reject(
+            413,
+            "the request body is too large for --seal-docker",
+        ));
+    }
+    if req.expects_continue()
+        && content_length > 0
+        && let Some(w) = interim
+    {
+        w.write_all(CONTINUE)?;
+        w.flush()?;
     }
     let mut body = vec![0u8; content_length as usize];
     reader.read_exact(&mut body)?;
     req.body = body;
     Ok(Some(req))
 }
+
+/// The interim response a client waiting on `Expect: 100-continue` needs.
+const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
 /// Copy a streamed request body from the client to the daemon, exactly as
 /// framed. Chunked bodies are parsed strictly (hex size, CRLF everywhere, no
@@ -1063,7 +1256,13 @@ fn go_fold_eq(key: &str, ascii_name: &str) -> bool {
 /// one), then routes with an optional `/v{version}` prefix. We do the same and
 /// drop that prefix. A trailing slash is dropped too: the daemon 404s such a
 /// path, so treating it like the slash-less one only errs on the safe side.
+#[cfg(test)]
 fn canonical_route(target: &str) -> Result<Vec<String>, &'static str> {
+    canonical_parts(target).map(|(_, segs)| segs)
+}
+
+/// `canonical_route`, also returning the `vX.Y` prefix that was dropped.
+fn canonical_parts(target: &str) -> Result<(Option<String>, Vec<String>), &'static str> {
     if !target.starts_with('/') {
         return Err("request target is not an absolute path");
     }
@@ -1091,10 +1290,12 @@ fn canonical_route(target: &str) -> Result<Vec<String>, &'static str> {
             s => segs.push(s.to_string()),
         }
     }
-    if segs.first().is_some_and(|v| is_api_version(v)) {
-        segs.remove(0);
-    }
-    Ok(segs)
+    let version = if segs.first().is_some_and(|v| is_api_version(v)) {
+        Some(segs.remove(0))
+    } else {
+        None
+    };
+    Ok((version, segs))
 }
 
 /// `v1.43` and friends: Docker's `/v{version:[0-9.]+}` route prefix.
@@ -1220,6 +1421,9 @@ pub struct Policy {
     pub allow: Allowlist,
     /// --port: localhost registries `allowlisted` lets the daemon read from.
     pub ports: Vec<u16>,
+    /// `--seal-docker-allow-existing`: don't restrict running code in, starting
+    /// and attaching to containers that have a network.
+    pub allow_existing: bool,
 }
 
 /// A request --seal-docker-pulls refuses: report target and reason, and the
@@ -1623,6 +1827,10 @@ fn write_error(client: &mut UnixStream, code: u16, msg: &str, close: bool) -> io
     let body = format!("{{\"message\":{}}}", crate::report::json_string(msg));
     let reason = match code {
         400 => "Bad Request",
+        404 => "Not Found",
+        413 => "Content Too Large",
+        417 => "Expectation Failed",
+        431 => "Request Header Fields Too Large",
         502 => "Bad Gateway",
         _ => "Forbidden",
     };
@@ -1632,6 +1840,237 @@ fn write_error(client: &mut UnixStream, code: u16, msg: &str, close: bool) -> io
         "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{conn}\r\n{body}",
         body.len()
     )
+}
+
+// ---- existing containers ----------------------------------------------------
+
+/// Container operations that are reads, or neither run code nor start
+/// anything: (method, operation). Everything else under `/containers/{ref}/`
+/// is guarded.
+const SAFE_CONTAINER_OPS: &[(&str, &str)] = &[
+    ("GET", "json"),
+    ("GET", "top"),
+    ("GET", "logs"),
+    ("GET", "changes"),
+    ("GET", "export"),
+    ("GET", "stats"),
+    ("GET", "archive"),
+    ("HEAD", "archive"),
+    ("POST", "resize"),
+    ("POST", "stop"),
+    ("POST", "kill"),
+    ("POST", "pause"),
+    ("POST", "wait"),
+    ("POST", "rename"),
+];
+
+/// The same for `/exec/{ref}/`: reading an exec instance, and resizing its terminal.
+const SAFE_EXEC_OPS: &[(&str, &str)] = &[("GET", "json"), ("POST", "resize")];
+
+/// A request that addresses an existing container or exec instance.
+struct Guarded {
+    exec: bool,
+    /// What the client called it: a name, an id or a prefix of one.
+    reference: String,
+    /// `start`, `exec`, `attach/ws`...
+    op: String,
+}
+
+impl Guarded {
+    /// What the operation does, for the message: "start", "run a command in"...
+    fn verb(&self) -> &'static str {
+        if self.exec {
+            return "run an exec instance of";
+        }
+        match self.op.as_str() {
+            "exec" => "run a command in",
+            "start" => "start",
+            "restart" => "restart",
+            "unpause" => "unpause",
+            "attach" | "attach/ws" => "attach to",
+            "archive" => "copy files into",
+            "update" => "update",
+            _ => "operate on",
+        }
+    }
+}
+
+/// What `check_existing` decided.
+enum Existing {
+    /// The container has no network: forward, pinned to its full id.
+    Sealed(String),
+    /// Refused.
+    Refuse(PullBlock),
+    /// The daemon has no such container or exec instance (answer 404 with this).
+    Missing(String),
+}
+
+/// Characters a container name, id or exec id can contain (and `/`, for link
+/// names). Anything else can't be a reference, and isn't worth percent-encoding.
+fn plausible_reference(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 256
+        && r.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'/'))
+}
+
+/// A container with no network at all: `NetworkMode` none and attached to no
+/// network but `none`. That is what `--seal-docker` makes of every container
+/// the command creates, so those (also ones made in an earlier run) can be
+/// used; a container that has a network can't, because running code in it
+/// would be running code with a network.
+fn is_sealed(inspect: &serde_json::Value) -> Result<(), String> {
+    let mode = inspect["HostConfig"]["NetworkMode"]
+        .as_str()
+        .unwrap_or("unknown");
+    if mode != "none" {
+        return Err(format!("NetworkMode={mode}"));
+    }
+    if let Some(nets) = inspect["NetworkSettings"]["Networks"].as_object()
+        && let Some(other) = nets.keys().find(|k| k.as_str() != "none")
+    {
+        return Err(format!("attached to the {other} network"));
+    }
+    Ok(())
+}
+
+/// Decide whether a guarded request may go to the daemon. The daemon is asked
+/// about the container the reference resolves to (so names, id prefixes and
+/// link names are resolved by the same code that will run the request), and
+/// the request is pinned to the full id it found, so a name can't be moved to
+/// a different container in between. `Err` when the daemon can't be asked
+/// (fail closed).
+fn check_existing(upstream: &Path, req: &Request, g: &Guarded) -> io::Result<Existing> {
+    let reference = g.reference.as_str();
+    let (what, no_such) = if g.exec {
+        ("exec instance", "No such exec instance")
+    } else {
+        ("container", "No such container")
+    };
+    if !plausible_reference(reference) {
+        return Ok(Existing::Refuse(PullBlock {
+            target: format!("{what}s/{}", g.op),
+            why: format!("not a {what} name or id"),
+            message: format!(
+                "nullroute --seal-docker refused a request naming a {what} that can't be a valid one."
+            ),
+        }));
+    }
+    let missing = || Existing::Missing(format!("{no_such}: {reference}"));
+    let get = |path: String| -> io::Result<Option<serde_json::Value>> {
+        let (status, body) = daemon_get(upstream, &path)?;
+        match status {
+            200 => Ok(Some(serde_json::from_slice(&body).map_err(|_| {
+                io::Error::other("the daemon's answer was not JSON")
+            })?)),
+            404 => Ok(None),
+            other => Err(io::Error::other(format!("the daemon answered {other}"))),
+        }
+    };
+    // For an exec instance: which container it belongs to, and its full id.
+    let (container_ref, exec_id) = if g.exec {
+        let Some(ex) = get(format!("/exec/{reference}/json"))? else {
+            return Ok(missing());
+        };
+        let id = ex["ID"].as_str().unwrap_or_default().to_string();
+        let ctr = ex["ContainerID"].as_str().unwrap_or_default().to_string();
+        if id.is_empty() || ctr.is_empty() {
+            return Err(io::Error::other("the daemon's exec answer had no ID"));
+        }
+        (ctr, Some(id))
+    } else {
+        (reference.to_string(), None)
+    };
+    let Some(inspect) = get(format!("/containers/{container_ref}/json"))? else {
+        return Ok(missing());
+    };
+    let id = inspect["Id"].as_str().unwrap_or_default();
+    if id.is_empty() {
+        return Err(io::Error::other("the daemon's container answer had no Id"));
+    }
+    if let Err(why) = is_sealed(&inspect) {
+        let ctr = inspect["Name"]
+            .as_str()
+            .map(|n| n.trim_start_matches('/'))
+            .filter(|n| !n.is_empty())
+            .unwrap_or(&container_ref);
+        let ctr = shown(ctr);
+        return Ok(Existing::Refuse(PullBlock {
+            target: format!("{}/{}", if g.exec { "exec" } else { "containers" }, g.op),
+            why: format!("container {ctr} has a network ({why})"),
+            message: format!(
+                "nullroute blocked trying to {} container {ctr}: it has a network ({why}), and --seal-docker only lets the command run code in, start or attach to containers that have none (the ones it creates here). Create the container through the sandbox, or pass --seal-docker-allow-existing to allow this; that unseals the container's network.",
+                g.verb()
+            ),
+        }));
+    }
+    let prefix = req
+        .api_version
+        .as_deref()
+        .map(|v| format!("/{v}"))
+        .unwrap_or_default();
+    let query = req.path.split_once('?').map(|(_, q)| format!("?{q}"));
+    let query = query.unwrap_or_default();
+    Ok(Existing::Sealed(match exec_id {
+        Some(e) => format!("{prefix}/exec/{e}/{}{query}", g.op),
+        None => format!("{prefix}/containers/{id}/{}{query}", g.op),
+    }))
+}
+
+/// Biggest answer `daemon_get` reads (a container's JSON is a few KiB).
+const MAX_INSPECT: usize = 8 * 1024 * 1024;
+
+/// One `GET` to the daemon on a connection of its own, so it can't interleave
+/// with the client's: (status, body).
+fn daemon_get(upstream: &Path, target: &str) -> io::Result<(u16, Vec<u8>)> {
+    let timeout = Some(std::time::Duration::from_secs(10));
+    let mut c = UnixStream::connect(upstream)?;
+    c.set_read_timeout(timeout)?;
+    c.set_write_timeout(timeout)?;
+    write!(
+        c,
+        "GET {target} HTTP/1.1\r\nHost: docker\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    )?;
+    let mut r = BufReader::new(c);
+    let mut resp = read_response_head(&mut r)?;
+    while resp.status / 100 == 1 {
+        resp = read_response_head(&mut r)?;
+    }
+    let mut body = Vec::new();
+    let limit = MAX_INSPECT as u64;
+    if resp.chunked {
+        loop {
+            let mut size_line = String::new();
+            r.by_ref().take(MAX_CHUNK_LINE).read_line(&mut size_line)?;
+            let size = u64::from_str_radix(size_line.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| io::Error::other("bad chunk size from the daemon"))?;
+            if size == 0 {
+                break;
+            }
+            if body.len() as u64 + size > limit {
+                return Err(io::Error::other("the daemon's answer is too large"));
+            }
+            let before = body.len();
+            r.by_ref().take(size).read_to_end(&mut body)?;
+            if (body.len() - before) as u64 != size {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let mut crlf = [0u8; 2];
+            r.read_exact(&mut crlf)?;
+        }
+    } else if let Some(len) = resp.content_length {
+        if len > MAX_INSPECT {
+            return Err(io::Error::other("the daemon's answer is too large"));
+        }
+        body.resize(len, 0);
+        r.read_exact(&mut body)?;
+    } else {
+        r.take(limit + 1).read_to_end(&mut body)?;
+        if body.len() as u64 > limit {
+            return Err(io::Error::other("the daemon's answer is too large"));
+        }
+    }
+    Ok((resp.status, body))
 }
 
 /// Two-way copy between the command's connection and the real daemon until both
@@ -1804,6 +2243,8 @@ mod tests {
     struct FakeDaemon {
         path: PathBuf,
         seen: std::sync::mpsc::Receiver<(String, String, Vec<u8>)>,
+        /// A request with an `Expect` header reached the daemon.
+        saw_expect: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl FakeDaemon {
@@ -1818,13 +2259,31 @@ mod tests {
             let path = dir.join("docker.sock");
             let l = std::os::unix::net::UnixListener::bind(&path).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
+            let saw_expect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let expect_flag = saw_expect.clone();
             thread::spawn(move || {
                 for conn in l.incoming().flatten() {
                     let tx = tx.clone();
+                    let expect_flag = expect_flag.clone();
                     thread::spawn(move || {
                         let mut w = conn.try_clone().unwrap();
                         let mut r = BufReader::new(conn);
                         while let Ok(Some(mut req)) = read_request(&mut r) {
+                            if req.header("expect").is_some() {
+                                expect_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            // Inspection by the guard isn't a client request.
+                            if req.method == "GET"
+                                && let Some(resp) = fake_inspect(&req.path)
+                            {
+                                if w.write_all(resp.as_bytes()).is_err() {
+                                    return;
+                                }
+                                continue;
+                            }
+                            if req.path.contains("fake-100") {
+                                let _ = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                            }
                             if let Some(f) = req.stream {
                                 let mut body = Vec::new();
                                 if forward_body(&mut r, &mut body, f).is_err() {
@@ -1858,7 +2317,11 @@ mod tests {
                     });
                 }
             });
-            FakeDaemon { path, seen: rx }
+            FakeDaemon {
+                path,
+                seen: rx,
+                saw_expect,
+            }
         }
 
         /// Run the sealing proxy for one client connection; returns our end.
@@ -1896,6 +2359,62 @@ mod tests {
             if let Some(d) = self.path.parent() {
                 let _ = std::fs::remove_dir_all(d);
             }
+        }
+    }
+
+    /// What the fake daemon says when the guard asks about a container or an
+    /// exec instance: a reference starting with "bridged" has a bridge network,
+    /// "missing" doesn't exist, anything else has no network (NetworkMode
+    /// none). Container answers are Content-Length framed, exec ones chunked.
+    fn fake_inspect(path: &str) -> Option<String> {
+        let segs = canonical_route(path).ok()?;
+        let framed = |body: String| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let chunked = |body: String| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            )
+        };
+        let not_found = || {
+            "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+                .to_string()
+        };
+        match segs.as_slice() {
+            [c, rest @ .., j] if c == "containers" && j == "json" && !rest.is_empty() => {
+                let r = rest.join("/");
+                if r.starts_with("missing") {
+                    return Some(not_found());
+                }
+                let bridged = r.starts_with("bridged");
+                let (mode, id) = if bridged {
+                    ("bridge", "b".repeat(64))
+                } else {
+                    ("none", "a".repeat(64))
+                };
+                Some(framed(format!(
+                    r#"{{"Id":"{id}","Name":"/{r}","HostConfig":{{"NetworkMode":"{mode}"}},"NetworkSettings":{{"Networks":{{"{mode}":{{}}}}}}}}"#
+                )))
+            }
+            [e, r, j] if e == "exec" && j == "json" => {
+                if r.starts_with("missing") {
+                    return Some(not_found());
+                }
+                let ctr = if r.starts_with("bridged") {
+                    "bridged-ctr"
+                } else {
+                    "sealed-ctr"
+                };
+                Some(chunked(format!(
+                    r#"{{"ID":"{}","ContainerID":"{ctr}"}}"#,
+                    "e".repeat(64)
+                )))
+            }
+            _ => None,
         }
     }
 
@@ -2695,6 +3214,7 @@ mod tests {
             pulls,
             allow: Allowlist::parse(&allow).unwrap(),
             ports: ports.to_vec(),
+            allow_existing: false,
         }
     }
 
@@ -3145,5 +3665,355 @@ mod tests {
         assert_eq!(out.matches("HTTP/1.1 404").count(), 4, "{out}");
         drop(c);
         assert_eq!(d.requests().len(), 4);
+    }
+    // ---- existing containers ------------------------------------------------
+
+    fn guarded(method: &str, path: &str) -> Option<(bool, String, String)> {
+        req(method, path)
+            .guarded()
+            .map(|g| (g.exec, g.reference, g.op))
+    }
+
+    #[test]
+    fn operations_that_run_or_start_code_are_guarded() {
+        let g = |m, p| guarded(m, p);
+        let ctr = |r: &str, op: &str| Some((false, r.to_string(), op.to_string()));
+        assert_eq!(g("POST", "/containers/abc/start"), ctr("abc", "start"));
+        assert_eq!(
+            g("POST", "/v1.43/containers/abc/restart?t=1"),
+            ctr("abc", "restart")
+        );
+        assert_eq!(g("POST", "/containers/abc/unpause"), ctr("abc", "unpause"));
+        assert_eq!(g("POST", "/containers/abc/update"), ctr("abc", "update"));
+        assert_eq!(
+            g("POST", "/containers/abc/attach?stream=1"),
+            ctr("abc", "attach")
+        );
+        assert_eq!(
+            g("GET", "/containers/abc/attach/ws"),
+            ctr("abc", "attach/ws")
+        );
+        assert_eq!(g("POST", "/containers/abc/exec"), ctr("abc", "exec"));
+        assert_eq!(
+            g("PUT", "/containers/abc/archive?path=/"),
+            ctr("abc", "archive")
+        );
+        // Spelled differently, same route.
+        assert_eq!(g("POST", "/containers%2Fabc/star%74"), ctr("abc", "start"));
+        assert_eq!(
+            g("POST", "//containers/./x/../abc/start"),
+            ctr("abc", "start")
+        );
+        // An endpoint this version doesn't know is guarded until someone looks at it.
+        assert_eq!(
+            g("POST", "/containers/abc/futureop"),
+            ctr("abc", "futureop")
+        );
+        // A reference may contain slashes: the daemon's route is {name:.*},
+        // and a legacy link is named parent/alias.
+        assert_eq!(
+            g("POST", "/containers/web/db/start"),
+            ctr("web/db", "start")
+        );
+        assert_eq!(
+            g("POST", "/containers/web%2Fdb/start"),
+            ctr("web/db", "start")
+        );
+        assert_eq!(g("POST", "/containers/json/start"), ctr("json", "start"));
+        // Exec instances.
+        let ex = |r: &str, op: &str| Some((true, r.to_string(), op.to_string()));
+        assert_eq!(g("POST", "/v1.43/exec/e1/start"), ex("e1", "start"));
+        assert_eq!(g("POST", "/exec/e1/futureop"), ex("e1", "futureop"));
+    }
+
+    #[test]
+    fn reads_and_harmless_operations_are_not_guarded() {
+        for (m, p) in [
+            ("GET", "/containers/json"),
+            ("POST", "/containers/create?name=x"),
+            ("POST", "/containers/prune"),
+            ("DELETE", "/containers/abc?force=1"),
+            ("GET", "/containers/abc/json"),
+            ("GET", "/containers/abc/top"),
+            ("GET", "/containers/abc/logs?follow=1"),
+            ("GET", "/containers/abc/changes"),
+            ("GET", "/containers/abc/export"),
+            ("GET", "/containers/abc/stats"),
+            ("GET", "/containers/abc/archive?path=/etc"),
+            ("HEAD", "/containers/abc/archive?path=/etc"),
+            ("POST", "/containers/abc/stop"),
+            ("POST", "/containers/abc/kill"),
+            ("POST", "/containers/abc/pause"),
+            ("POST", "/containers/abc/wait"),
+            ("POST", "/containers/abc/resize"),
+            ("POST", "/containers/abc/rename?name=y"),
+            ("GET", "/exec/e1/json"),
+            ("POST", "/exec/e1/resize"),
+            ("POST", "/images/create?fromImage=alpine"),
+            ("GET", "/_ping"),
+            ("POST", "/commit?container=abc"),
+            // Not the daemon's route: it answers 404 whatever we do.
+            ("POST", "/x/containers/abc/start"),
+        ] {
+            assert_eq!(guarded(m, p), None, "{m} {p}");
+        }
+    }
+
+    #[test]
+    fn only_containers_without_a_network_count_as_sealed() {
+        let v = |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap();
+        assert!(is_sealed(&v(r#"{"HostConfig":{"NetworkMode":"none"}}"#)).is_ok());
+        assert!(is_sealed(&v(
+            r#"{"HostConfig":{"NetworkMode":"none"},"NetworkSettings":{"Networks":{"none":{}}}}"#
+        ))
+        .is_ok());
+        for bad in [
+            r#"{}"#,
+            r#"{"HostConfig":{}}"#,
+            r#"{"HostConfig":{"NetworkMode":"default"}}"#,
+            r#"{"HostConfig":{"NetworkMode":"host"}}"#,
+            r#"{"HostConfig":{"NetworkMode":"bridge"}}"#,
+            r#"{"HostConfig":{"NetworkMode":"container:abc"}}"#,
+            r#"{"HostConfig":{"NetworkMode":"None"}}"#,
+            r#"{"HostConfig":{"NetworkMode":"none"},"NetworkSettings":{"Networks":{"bridge":{}}}}"#,
+        ] {
+            assert!(is_sealed(&v(bad)).is_err(), "{bad}");
+        }
+    }
+
+    /// Send `raw` and return what came back for one response.
+    fn exchange(c: &mut UnixStream, raw: &str) -> String {
+        c.write_all(raw.as_bytes()).unwrap();
+        read_responses(c, 1)
+    }
+
+    #[test]
+    fn start_exec_and_attach_on_a_container_with_a_network_are_refused() {
+        let d = FakeDaemon::start("guard-refuse");
+        let mut c = d.client();
+        for (m, p, what) in [
+            ("POST", "/v1.43/containers/bridged1/start", "start"),
+            ("POST", "/containers/bridged1/restart", "restart"),
+            ("POST", "/containers/bridged1/unpause", "unpause"),
+            ("POST", "/containers/bridged1/update", "update"),
+            ("POST", "/containers/bridged1/attach?stream=1", "attach to"),
+            ("POST", "/containers/bridged1/exec", "run a command in"),
+            (
+                "PUT",
+                "/containers/bridged1/archive?path=/tmp",
+                "copy files into",
+            ),
+            (
+                "POST",
+                "/exec/bridged-exec/start",
+                "run an exec instance of",
+            ),
+        ] {
+            let r = exchange(&mut c, &http(m, p, "", "{}"));
+            assert!(r.starts_with("HTTP/1.1 403"), "{m} {p}: {r}");
+            assert!(r.contains("--seal-docker-allow-existing"), "{r}");
+            assert!(r.contains(&format!("trying to {what} container")), "{r}");
+            assert!(r.contains("NetworkMode=bridge"), "{r}");
+        }
+        // The connection is still usable, and nothing reached the daemon.
+        let r = exchange(&mut c, &http("GET", "/_ping", "", ""));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        drop(c);
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+    }
+
+    #[test]
+    fn operations_on_a_sealed_container_are_pinned_to_its_full_id() {
+        let d = FakeDaemon::start("guard-pin");
+        let mut c = d.client();
+        let id = "a".repeat(64);
+        for (m, p, want) in [
+            (
+                "POST",
+                "/v1.43/containers/mine/start?detachKeys=x",
+                format!("/v1.43/containers/{id}/start?detachKeys=x"),
+            ),
+            (
+                "POST",
+                "/containers/mine/exec",
+                format!("/containers/{id}/exec"),
+            ),
+            (
+                "PUT",
+                "/v1.43/containers/mine/archive?path=%2Ftmp",
+                format!("/v1.43/containers/{id}/archive?path=%2Ftmp"),
+            ),
+            (
+                "POST",
+                "/v1.43/exec/sealed-exec/start",
+                format!("/v1.43/exec/{}/start", "e".repeat(64)),
+            ),
+        ] {
+            let r = exchange(&mut c, &http(m, p, "", "{}"));
+            // The fake daemon has no such route: its 404 means the request got through.
+            assert!(r.starts_with("HTTP/1.1 404"), "{m} {p}: {r}");
+            let seen = d.requests();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!((seen[0].0.as_str(), seen[0].1.as_str()), (m, want.as_str()));
+        }
+    }
+
+    #[test]
+    fn unknown_containers_get_the_daemons_404_without_reaching_it() {
+        let d = FakeDaemon::start("guard-404");
+        let mut c = d.client();
+        let r = exchange(&mut c, &http("POST", "/containers/missing1/start", "", ""));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        assert!(r.contains("No such container: missing1"), "{r}");
+        let r = exchange(&mut c, &http("POST", "/exec/missing-exec/start", "", ""));
+        assert!(r.contains("No such exec instance: missing-exec"), "{r}");
+        drop(c);
+        assert!(d.requests().is_empty());
+    }
+
+    #[test]
+    fn allow_existing_forwards_the_request_unchanged() {
+        let d = FakeDaemon::start("guard-allow");
+        let mut c = d.client_with(Policy {
+            allow_existing: true,
+            ..Policy::default()
+        });
+        let r = exchange(&mut c, &http("POST", "/containers/bridged1/start", "", ""));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        drop(c);
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert_eq!(reqs[0].1, "/containers/bridged1/start");
+    }
+
+    // ---- Expect: 100-continue, interim responses, oversized requests ----------
+
+    #[test]
+    fn expect_continue_gets_its_100_before_the_body_and_is_not_forwarded() {
+        let d = FakeDaemon::start("expect");
+        let mut c = d.client();
+        let body = HOST_CREATE;
+        // A client that waits for the interim response before sending the body.
+        let head = format!(
+            "POST /containers/create HTTP/1.1\r\nHost: docker\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        c.write_all(head.as_bytes()).unwrap();
+        let mut got = [0u8; 25];
+        c.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"HTTP/1.1 100 Continue\r\n\r\n");
+        c.write_all(body.as_bytes()).unwrap();
+        let r = read_responses(&mut c, 1);
+        assert!(r.starts_with("HTTP/1.1 404"), "the final response: {r}");
+        // The same connection carries the next request: nothing was held back.
+        let r = exchange(&mut c, &http("GET", "/_ping", "", ""));
+        assert!(r.starts_with("HTTP/1.1 404"), "{r}");
+        drop(c);
+        assert!(!d.saw_expect.load(std::sync::atomic::Ordering::SeqCst));
+        assert_creates_sealed(&d.requests());
+    }
+
+    #[test]
+    fn interim_responses_from_the_daemon_are_passed_on_before_the_final_one() {
+        let d = FakeDaemon::start("interim");
+        let mut c = d.client();
+        c.write_all(http("POST", "/fake-100", "", "").as_bytes())
+            .unwrap();
+        let r = read_responses(&mut c, 2);
+        assert!(
+            r.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 404 Not Found"),
+            "{r}"
+        );
+        // Nothing left over: the next response belongs to the next request.
+        let r = exchange(&mut c, &http("POST", "/fake-100", "", ""));
+        assert!(
+            r.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 404"),
+            "{r}"
+        );
+    }
+
+    #[test]
+    fn a_build_with_expect_continue_gets_its_100_when_the_body_is_wanted() {
+        let d = FakeDaemon::start("expect-build");
+        let mut c = d.client();
+        let ctx = "tar-bytes";
+        let head = format!(
+            "POST /build?t=x HTTP/1.1\r\nHost: docker\r\nExpect: 100-continue\r\nContent-Length: {}\r\n\r\n",
+            ctx.len()
+        );
+        c.write_all(head.as_bytes()).unwrap();
+        let mut got = [0u8; 25];
+        c.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"HTTP/1.1 100 Continue\r\n\r\n");
+        c.write_all(ctx.as_bytes()).unwrap();
+        assert!(read_responses(&mut c, 1).starts_with("HTTP/1.1 404"));
+        drop(c);
+        let reqs = d.requests();
+        assert_eq!(reqs.len(), 1, "{reqs:?}");
+        assert_eq!(reqs[0].2, ctx.as_bytes());
+        assert!(!d.saw_expect.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn other_expectations_are_refused_with_417() {
+        let d = FakeDaemon::start("expect-other");
+        let mut c = d.client();
+        let r = exchange(
+            &mut c,
+            &http(
+                "POST",
+                "/containers/create",
+                "Expect: something-else\r\n",
+                "{}",
+            ),
+        );
+        assert!(r.starts_with("HTTP/1.1 417"), "{r}");
+        drop(c);
+        assert!(d.requests().is_empty());
+    }
+
+    #[test]
+    fn oversized_headers_get_431_not_a_silent_close() {
+        let d = FakeDaemon::start("431");
+        // Many headers.
+        let mut c = d.client();
+        let big = format!("X-Fill: {}\r\n", "a".repeat(1000)).repeat(40);
+        let r = exchange(&mut c, &http("GET", "/_ping", &big, ""));
+        assert!(r.starts_with("HTTP/1.1 431"), "{}", &r[..r.len().min(200)]);
+        assert!(r.contains("Connection: close"), "{r}");
+        assert!(r.contains("the request head is too large"), "{r}");
+        // One line with no end: the proxy doesn't buffer it without bound.
+        let mut c = d.client();
+        let line = format!(
+            "GET /_ping HTTP/1.1\r\nX-Fill: {}",
+            "a".repeat(MAX_HEAD + 10)
+        );
+        c.write_all(line.as_bytes()).unwrap();
+        let r = read_responses(&mut c, 1);
+        assert!(r.starts_with("HTTP/1.1 431"), "{}", &r[..r.len().min(200)]);
+        // A request line that is too long.
+        let mut c = d.client();
+        let line = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(MAX_HEAD + 10));
+        c.write_all(line.as_bytes()).unwrap();
+        assert!(read_responses(&mut c, 1).starts_with("HTTP/1.1 431"));
+        assert!(d.requests().is_empty());
+    }
+
+    #[test]
+    fn oversized_bodies_get_413_and_bad_heads_get_400() {
+        let d = FakeDaemon::start("413");
+        let mut c = d.client();
+        let head = format!(
+            "POST /containers/create HTTP/1.1\r\nHost: docker\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY + 1
+        );
+        c.write_all(head.as_bytes()).unwrap();
+        let r = read_responses(&mut c, 1);
+        assert!(r.starts_with("HTTP/1.1 413"), "{r}");
+        let mut c = d.client();
+        let r = exchange(&mut c, "GET\r\n\r\n");
+        assert!(r.starts_with("HTTP/1.1 400"), "{r}");
+        assert!(d.requests().is_empty());
     }
 }

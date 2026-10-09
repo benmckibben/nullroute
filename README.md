@@ -414,8 +414,9 @@ calls (`no_new_privs` stays set).
 can't use Docker) and `--allow-socket` (it can, and its containers get full
 network). The command uses Docker normally, but nullroute rewrites each
 container-create request to `NetworkMode: none`, forces classic-builder builds
-onto `--network none`, and refuses the API calls that would hand out a network
-it can't take back:
+onto `--network none`, refuses the API calls that would hand out a network
+it can't take back, and refuses to run code in, start or attach to a container
+that already has one:
 
 ```bash
 nullroute run --seal-docker -- pytest        # tests may start containers; none get network
@@ -427,6 +428,7 @@ nullroute run --seal-docker --seal-docker-pulls none -- pytest  # and the daemon
 |---|---|
 | `--seal-docker` | Seal the standard Docker socket paths (`/var/run/docker.sock`, rootless, Docker Desktop, `DOCKER_HOST=unix://`). |
 | `--seal-docker-socket PATH` | Seal this Docker API socket (repeatable). |
+| `--seal-docker-allow-existing` | Also let the command run code in, start, restart, attach to or copy files into containers that have a network (see [Containers that already exist](#containers-that-already-exist)). This unseals them. Needs `--seal-docker` or `--seal-docker-socket` (exit 2 otherwise). |
 | `--seal-docker-pulls MODE` | What the Docker daemon may contact for the command: `any` (default), `allowlisted` or `none`. See [Registry access](#registry-access---seal-docker-pulls). Needs `--seal-docker` or `--seal-docker-socket` (exit 2 otherwise). |
 
 The sealed container still runs and can mount volumes, but it has no network at
@@ -438,6 +440,7 @@ services. A requested `--network` (including `host`) is overridden to `none`.
 | `POST /containers/create` | rewritten: `NetworkMode: none`, networking settings dropped |
 | `POST /build` (classic builder) | rewritten: `networkmode=none`, so `RUN` steps have no network; the context is streamed through |
 | `POST /build?version=2`, `/grpc`, `/session` (BuildKit / buildx) | refused: a BuildKit build picks each step's network inside a gRPC stream nullroute can't rewrite |
+| `POST /containers/{id}/exec`, `/start`, `/restart`, `/unpause`, `/update`, `/attach`, `GET .../attach/ws`, `PUT .../archive`, `POST /exec/{id}/start` | refused unless the container has no network (see below) |
 | `POST /networks/{id}/connect` | refused |
 | `POST /services/create`, `/services/{id}/update` | refused: Swarm tasks get networks |
 | `POST /swarm/init`, `/swarm/join` | refused: a swarm manager could schedule such tasks here |
@@ -446,6 +449,41 @@ services. A requested `--network` (including `host`) is overridden to `none`.
 
 Refusals are Docker-style errors (`Error response from daemon: nullroute
 blocked ...`) and show up in the report as `docker` entries.
+
+#### Containers that already exist
+
+Rewriting what the command *creates* isn't enough: a container that already
+exists, say a database on the default bridge network that you started
+earlier, has a network, and `docker exec` into it would run the command's code
+with that network (a `docker exec db sh -c 'echo x | nc 172.17.0.1 9999'` from
+inside the sandbox reached a listener on the host). So under `--seal-docker`
+the Docker API operations that run code in, start, resume, attach to or write
+into a container (`exec`, `start`, `restart`, `unpause`, `update`, `attach`
+and its WebSocket form, `PUT archive`, and starting an exec instance) are only
+forwarded for a container that has **no network**: `NetworkMode: none` and
+attached to no other network. That includes everything the command created
+(also in an earlier run); the daemon is asked, so names, id prefixes and link
+names can't be used to slip past, and the request is sent to the container's
+full id. Any other container gets a `403` that names the flag:
+
+```
+Error response from daemon: nullroute blocked trying to run a command in container db: it has a network (NetworkMode=bridge), and --seal-docker only lets the command run code in, start or attach to containers that have none (the ones it creates here). Create the container through the sandbox, or pass --seal-docker-allow-existing to allow this; that unseals the container's network.
+```
+
+Reads are unaffected (`inspect`, `logs`, `ps`, `top`, `diff`, `export`, `stats`,
+`cp` out of a container), and so are stop, kill, pause, rename and remove.
+The list of operations that are *not* guarded is explicit, and an endpoint a
+later Docker version adds under `/containers/{id}/` is guarded until someone
+looks at it. `--seal-docker-allow-existing` turns the check off for people who
+really want the command to drive existing containers; it unseals them. (`docker
+cp` *into* a container isn't supported under `--seal-docker` at all: the CLI
+uploads the archive chunked, which the proxy doesn't accept.)
+
+Malformed or oversized requests get an answer rather than a silent close:
+`431` for a request head over 64 KiB, `413` for a body over 4 MiB, `417` for an
+`Expect` other than `100-continue`. `Expect: 100-continue` is answered by
+nullroute (the client gets its `100 Continue` before it sends the body) and not
+forwarded to the daemon.
 
 **Building images.** `docker build` uses BuildKit (buildx) by default, and
 BuildKit builds can't be sealed, so under `--seal-docker` they fail with a
@@ -580,7 +618,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
 | Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents |
 | Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
-| Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); not a boundary for hostile images |
+| Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); running code in, starting or attaching to existing containers that have a network is refused; not a boundary for hostile images |
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
 | Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |

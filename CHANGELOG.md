@@ -108,8 +108,24 @@ Findings from a security review of the first version, all fixed before release:
   filtered. `--no-seccomp` turns the filter off; `no_new_privs` stays. See the
   README for the effect on setuid and file-capability binaries.
 
+- `--seal-docker` only rewrote container creation, so containers that already
+  existed were unsealed: `docker exec db sh -c 'echo x | nc 172.17.0.1 9999'`
+  from inside the sandbox delivered data to a listener on the host, and
+  `start`, `restart`, `unpause`, `attach`, `update` and copying files in were the
+  same. Under `--seal-docker` those operations (and starting an exec instance)
+  are now refused with a `403` that names the flag unless the container has no
+  network (`NetworkMode: none`): the ones created through the sandbox, in this
+  or an earlier run, still work. Reads (`inspect`, `logs`, `ps`, `cp` out) are
+  unaffected. `--seal-docker-allow-existing` opts out and unseals them.
+
 ### Fixed
 
+- The `--seal-docker` proxy now handles `Expect: 100-continue` (it used to
+  forward only the interim `100 Continue` and hold the real response until the
+  next request, so a client such as `curl` hung), answers an oversized request
+  head with `431` (and an oversized body with `413`, a malformed request line
+  or an unsupported `Expect` with `400`/`417`) instead of silently closing the
+  connection, and no longer buffers a header line without bound.
 - `--seal-docker` no longer prints a "not found, ignoring" warning for each
   standard Docker socket that doesn't exist on the machine (it warned twice on
   an ordinary host). Only a `--seal-docker-socket` path that can't be used is

@@ -102,6 +102,14 @@ enum Cmd {
         #[arg(long = "seal-docker-pulls", value_name = "MODE", value_enum)]
         seal_docker_pulls: Option<docker::PullPolicy>,
 
+        /// With --seal-docker: also let the command run code in, start, restart,
+        /// attach to or copy files into containers that have a network (ones it
+        /// didn't create here: docker exec, docker start...). By default those
+        /// are refused, because the code would run with that network. This
+        /// unseals them.
+        #[arg(long = "seal-docker-allow-existing")]
+        seal_docker_allow_existing: bool,
+
         /// Let this host through (repeatable or comma-separated):
         /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
         /// optionally :PORT. Proxy-aware clients go through an HTTP(S) proxy;
@@ -174,6 +182,7 @@ fn main() -> ExitCode {
             seal_docker,
             seal_docker_sockets,
             seal_docker_pulls,
+            seal_docker_allow_existing,
             allow,
             resolve,
             no_dns,
@@ -188,6 +197,12 @@ fn main() -> ExitCode {
             if seal_docker_pulls.is_some() && !seal_docker && seal_docker_sockets.is_empty() {
                 eprintln!(
                     "nullroute: --seal-docker-pulls only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
+                );
+                return ExitCode::from(2);
+            }
+            if seal_docker_allow_existing && !seal_docker && seal_docker_sockets.is_empty() {
+                eprintln!(
+                    "nullroute: --seal-docker-allow-existing only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
                 );
                 return ExitCode::from(2);
             }
@@ -265,6 +280,7 @@ fn main() -> ExitCode {
                     pulls,
                     allow: allowlist.clone(),
                     ports: ports.clone(),
+                    allow_existing: seal_docker_allow_existing,
                 });
             }
             let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
