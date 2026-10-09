@@ -120,6 +120,12 @@ Findings from a security review of the first version, all fixed before release:
 
 ### Fixed
 
+- The README no longer says the command has "a loopback interface and nothing
+  else": it now says what is isolated (the network namespace plus the hardening
+  listed) and what is not (the filesystem, `/proc` and signalling of your other
+  processes, IPC and `/dev/shm`, inherited credentials, display servers and other
+  unlisted Unix sockets), and SECURITY.md lists the default-hidden sockets and
+  the seccomp filter as in scope.
 - The `--seal-docker` proxy now handles `Expect: 100-continue` (it used to
   forward only the interim `100 Continue` and hold the real response until the
   next request, so a client such as `curl` hung), answers an oversized request

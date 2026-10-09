@@ -16,9 +16,17 @@ nullroute run --port 5432,6379 -- pytest   # local Postgres + Redis still reacha
   <img src="demo/demo.gif" alt="nullroute 15-second terminal demo" width="760" />
 </p>
 
-Inside, the command has a loopback interface and nothing else. Connecting to any
-other host fails immediately with "network unreachable", and DNS lookups fail
-(with `--allow`, only allowed names resolve; see below).
+Inside, the command runs in its own network namespace: a loopback interface and
+no other network device. Connecting to any other host fails immediately with
+"network unreachable", and DNS lookups fail (with `--allow`, only allowed names
+resolve; see below). Because a network namespace doesn't cover everything that
+can reach a network, nullroute also hides the Unix sockets of services that act
+outside it (container runtimes, D-Bus, systemd, snapd, SSH and GPG agents),
+sets `no_new_privs` and denies a few kernel interfaces that lead out of the
+namespace (AF_VSOCK sockets, io_uring, terminal input injection). That is the
+whole of it: nullroute isolates the **network**, not the filesystem, the
+processes or the credentials of the command (see [What nullroute is
+not](#what-nullroute-is-not)).
 The exit code is passed through, so it drops into CI unchanged.
 
 ## Installing
@@ -610,7 +618,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 
 | | |
 |---|---|
-| Hermetic mode (no network but the sandbox's own loopback) | ✅ |
+| Network namespace isolation (no network but the sandbox's own loopback) | ✅ |
 | No root needed | ✅ (unprivileged user namespaces) |
 | Runs as you, not as root inside | ✅ |
 | Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails, `127`/`126` if the command isn't found/executable) |
@@ -635,13 +643,29 @@ or bubblewrap with a locked-down filesystem. Specifically, these are **not**
 protected:
 
 - **The filesystem and everything else that isn't the network.** The command
-  sees your whole filesystem and runs as you. There is no PID namespace (it can
-  see and signal your other processes), no seccomp filter and no resource limits.
-- **Other Unix sockets.** Only the sockets listed above are hidden by default.
-  Other local daemons reachable through a socket file (the session D-Bus, an SSH
-  or GPG agent, a display server, a local proxy) stay reachable unless you
+  sees your whole filesystem (the mount namespace is a private copy, created only
+  to hide sockets, not a different view) and runs as you. There is no PID
+  namespace: your other processes are visible in `/proc` (their command lines
+  are readable) and can be signalled (`kill -0` on a host process works). The
+  kernel does refuse the command `/proc/PID/environ`, `cwd` and `exe` of those
+  processes, and, with Yama's default `ptrace_scope=1`, `ptrace` attach (both
+  checked on one host; don't rely on them: Yama can be set to 0). The IPC,
+  UTS, cgroup and time namespaces are the host's: System V IPC and POSIX shared
+  memory (`/dev/shm`) are shared with the host, and the hostname is the host's.
+  There are no resource limits, and the seccomp filter is only the short list
+  above, not a syscall sandbox.
+- **Credentials, by design.** The command inherits your environment variables
+  and can read the files you can: tokens, `~/.ssh` keys, cloud credentials. With
+  no route out they can't be sent anywhere, but anything you open (`--port`,
+  `--allow`, `--allow-socket`) is open to all of it. The SSH agent and gpg-agent
+  sockets are hidden, not the key files.
+- **Unix sockets that aren't on the default list.** Display servers (X11,
+  Wayland), the accessibility bus, PulseAudio/PipeWire, a local proxy, and any
+  other daemon reachable through a socket file stay reachable unless you
   `--hide-socket` them, and anything they can do for the command goes
-  unchecked.
+  unchecked. (The reasoning for X11 and Wayland is in [the session
+  section](#the-users-session-d-bus-systemd-snapd-agents).) Sockets that appear
+  after the command starts aren't hidden either.
 - **File descriptors the command inherits.** A socket that nullroute's parent
   opened before starting it (and left inheritable) belongs to the host's
   network namespace and keeps working inside the sandbox. Start nullroute from a
