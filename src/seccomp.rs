@@ -183,6 +183,24 @@ impl Filter {
     }
 }
 
+/// Can this kernel load seccomp filters at all (`CONFIG_SECCOMP_FILTER`)?
+/// Asked in the parent before forking, so a kernel without it runs the command
+/// unfiltered (with a warning) instead of failing to start it. Loading a
+/// filter from a null pointer fails with `EFAULT` where the feature exists and
+/// `EINVAL` where it doesn't, without installing anything.
+pub fn available() -> bool {
+    // SAFETY: a prctl whose pointer argument is null; the kernel reports EFAULT
+    // when it tries to read the program and loads nothing.
+    let r = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+            std::ptr::null::<libc::sock_fprog>(),
+        )
+    };
+    r != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
+}
+
 /// Only `no_new_privs`, for `--no-seccomp`. A single `prctl` (async-signal-safe).
 pub fn set_no_new_privs() -> io::Result<()> {
     // SAFETY: plain prctl with integer arguments.
@@ -560,6 +578,15 @@ mod tests {
         assert_eq!(DENIED_FAMILIES[0].0, libc::AF_BLUETOOTH as u32);
         assert_eq!(DENIED_FAMILIES[2].0, libc::AF_VSOCK as u32);
         assert_eq!(DENIED_IOCTLS[0].0, libc::TIOCSTI as u32);
+    }
+
+    #[test]
+    fn probing_for_seccomp_installs_nothing() {
+        // SAFETY: reads this process's seccomp mode.
+        let mode = || unsafe { libc::prctl(libc::PR_GET_SECCOMP) };
+        let before = mode();
+        let _ = available();
+        assert_eq!(mode(), before, "probing must not install a filter");
     }
 
     #[test]

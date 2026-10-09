@@ -112,9 +112,15 @@ pub fn run_hermetic(
     };
     let flags = namespace_flags(need_mount_ns);
     // Built here because building allocates; the child only installs it.
-    let seccomp_filter = if use_seccomp {
-        seccomp::Filter::new()
+    let seccomp_filter = if !use_seccomp {
+        None
+    } else if let Some(f) = seccomp::Filter::new().filter(|_| seccomp::available()) {
+        Some(f)
     } else {
+        eprintln!(
+            "nullroute: warning: this kernel or architecture can't load the seccomp filter; \
+             running without it (no_new_privs is still set)"
+        );
         None
     };
     let pool_address = dns.is_some();
