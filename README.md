@@ -13,7 +13,7 @@ nullroute run --port 5432,6379 -- pytest   # local Postgres + Redis still reacha
 ```
 
 <p align="center">
-  <img src="demo/demo.gif" alt="nullroute 15-second terminal demo" width="760" />
+  <img src="demo/demo.gif" alt="nullroute terminal demo (about 20 seconds)" width="760" />
 </p>
 
 Inside, the command has a loopback interface and nothing else. Connecting to any
@@ -23,14 +23,18 @@ The exit code is passed through, so it drops into CI unchanged.
 
 ## Installing
 
-nullroute is built from source (Rust 1.88 or newer, Linux only; see
-[Requirements](#requirements)):
+There are no release binaries and no published crate yet, so today you build it
+from source (Rust 1.88 or newer, Linux only; see [Requirements](#requirements)):
 
 ```bash
 git clone https://github.com/benmckibben/nullroute
 cd nullroute
 cargo install --locked --path .   # installs nullroute into ~/.cargo/bin
 ```
+
+Don't run `cargo install nullroute`: the name on crates.io currently holds only
+an empty 0.0.0 placeholder, which is not this program. This section will change
+when a release exists.
 
 ## Reaching local services: `--port`
 
@@ -107,7 +111,7 @@ Other details:
   - a plain-HTTP request through the proxy must have a `Host` header that names
     the host it is sent to (or another allowed host), exactly one `Host` header,
     or none; anything else gets `403` (or `400` for several) and is reported as
-    `proxy` block;
+    a `proxy` block;
   - the first TLS record of a tunnel (the proxy's `CONNECT` and the sinkhole's
     relayed connections) is read before anything reaches the host: a ClientHello
     whose server name (SNI) isn't the tunnel's host or another allowed host is
@@ -139,14 +143,6 @@ Other details:
 
 ### Clients that ignore proxy variables: the DNS sinkhole
 
-**Without `--allow`.** The resolver still runs: it answers every name with
-`NXDOMAIN` ("Name or service not known") and records the lookup as a `dns` block
-(see [the report](#what-got-blocked-the-report-and---strict)), so a plain
-`nullroute run --strict` catches a test that looks a name up and swallows the
-error. A lookup also fails the same way with and without `--allow`: an answer
-that is final, not the retryable "Temporary failure in name resolution" that a
-resolver with no route gives, which clients such as musl's sit out for seconds.
-
 ```bash
 nullroute run --allow db.staging.example.com:5432 -- psql -h db.staging.example.com
 nullroute run --allow api.github.com -- ./my-static-binary   # ports 80 and 443
@@ -177,6 +173,14 @@ sinkhole that maps those names:
    name and dialled from the host's network, with the same rules as the proxy:
    resolved on the host, loopback results refused. TLS stays end-to-end, and the
    client sends the right SNI/`Host` because it dialled by name.
+
+**Without `--allow` host names** the resolver still runs: it answers every name
+with `NXDOMAIN` ("Name or service not known") and records the lookup as a `dns`
+block (see [the report](#what-got-blocked-the-report-and---strict)), so a plain
+`nullroute run --strict` catches a test that looks a name up and swallows the
+error. A lookup fails the same way with and without `--allow`: with an answer
+that is final, not the retryable "Temporary failure in name resolution" that a
+resolver with no route gives, which clients such as musl's sit out for seconds.
 
 | Flag | Effect |
 |---|---|
@@ -277,9 +281,10 @@ CLI reconnects).
 The command can exit with any of these itself, so they only mean something when
 the command isn't known to use them. In particular a `1` is either the command's
 own or `--strict`'s: with `--report-json`, `"strict_failed": true` says that
-nullroute turned a success into `1` (see [docs/report-json.md](docs/report-json.md)). (Like Docker: `125` for "the runner failed", `126` and `127` for the
-contained command that couldn't be invoked or found. Usage errors are `2`, as
-for most CLIs.)
+nullroute turned a success into `1` (see [docs/report-json.md](docs/report-json.md)).
+(Like Docker: `125` for "the runner failed", `126` and `127` for the contained
+command that couldn't be invoked or found. Usage errors are `2`, as for most
+CLIs.)
 
 **What `--strict` can't see.** A direct connection to an IP address (`connect()` to
 `93.184.216.34:443`, no name lookup) fails inside the kernel with "network
@@ -289,10 +294,12 @@ such a command tried, and it passes if the command swallows the error. Proxy
 requests, DNS lookups and hidden sockets are listed. A program that talks to
 hard-coded IP addresses is only caught by its own failure.
 
-**Signals and process lifetime.** Ctrl-C reaches the command as usual; nullroute
-itself ignores SIGINT/SIGQUIT so it can still print the report, then exits with
-the command's status (130). SIGTERM and SIGHUP sent to nullroute are forwarded
-to the command, also when they arrive while the command is still starting. A
+**Signals and process lifetime.** Ctrl-C (which a terminal sends to the whole
+foreground process group) reaches the command as usual; nullroute itself ignores
+SIGINT/SIGQUIT so it can still print the report, then exits with the command's
+status (130 if the command died of SIGINT). SIGTERM and SIGHUP sent to nullroute
+are forwarded to the command, also when they arrive while the command is still
+starting. A running command receives each of these signals once. A
 SIGINT/SIGQUIT that reaches nullroute before the command exists (Ctrl-C right
 after you hit enter) is passed on to it as well: it stops the command before it
 runs, instead of vanishing while the command runs on. The command never outlives
@@ -657,6 +664,63 @@ relays the connections on the host's network.
 - **Docker** (only for `--seal-docker`): a daemon reachable on a Unix socket.
 - **Rust 1.88 or newer** to build from source.
 
+## Troubleshooting
+
+**`could not create an unprivileged user namespace` (exit 125).** nullroute needs
+unprivileged user namespaces; the kernel or a security layer refused one. The
+message names the usual causes:
+
+- *Ubuntu 23.10 and later*: AppArmor restricts them
+  (`sysctl kernel.apparmor_restrict_unprivileged_userns`). Fixing this needs an
+  administrator: either lift the restriction or give the `nullroute` binary an
+  AppArmor profile that allows `userns`.
+- *Other distributions*: `sysctl user.max_user_namespaces` (0 disables them) or, on
+  some Debian kernels, `kernel.unprivileged_userns_clone`.
+- *Inside a container*: Docker's default seccomp profile blocks `unshare`, so
+  `docker run debian /path/to/nullroute run -- true` fails with this message
+  (checked); with `--security-opt seccomp=unconfined` it works. As root inside the
+  container nullroute is [not a boundary](#what-nullroute-is-not), so also pass
+  `--user UID:GID` (checked: works as uid 1000). Nested rootless Podman and
+  Docker work when the outer environment allows user namespaces (not tested).
+- *WSL*: WSL 2 works (this is where nullroute is developed). WSL 1 has no network
+  namespaces.
+
+**My command can't reach the network.** That is the point. Connecting to an IP
+address fails with "Network is unreachable"; a name lookup fails with "Name or
+service not known" and a `blocked DNS lookup of NAME` line. To let something
+through, name it: `--allow api.example.com` for the internet, `--port 5432` for a
+service on this machine's localhost. `nullroute run --inspect --dry-run -- true`
+shows what a given set of flags sets up, and `--strict` turns any blocked attempt
+into exit 1 even if the command swallowed the error.
+
+**`Temporary failure in name resolution`.** Without `--no-dns` nullroute's
+resolver answers every lookup (names that are not allowed get "Name or service
+not known"), so this message means a lookup bypassed it: you passed `--no-dns`, or
+the client talks to a hard-coded resolver (`dig @8.8.8.8`, DNS-over-HTTPS) that
+has no route out. It is a message about the sandbox, not about the name.
+
+**A connection to an allowed name is refused or closed.** Only the allowed ports
+are relayed: without `:PORT`, 80 and 443. For a database use
+`--allow db.example.com:5432`. An IP address in `--allow` works through the proxy
+only, not for a direct `connect()`. A request whose `Host` header or TLS server
+name names a different host than the one you connected to is refused (see
+[What that doesn't stop](#letting-chosen-hosts-through---allow)).
+
+**Exit code 1 (or 125): the command's or nullroute's?** Add `--report-json
+report.json` and read `strict_failed` and `exit_code` ([docs/report-json.md](docs/report-json.md)):
+`strict_failed: true` means the command succeeded and `--strict` failed the run.
+`125`, `126` and `127` are nullroute's own when the message on stderr starts with
+`nullroute:`.
+
+**`docker` fails with `nullroute blocked access to /run/docker.sock`.** Container
+sockets are hidden by default. Use `--seal-docker` (containers get no network) or
+`--allow-socket /run/docker.sock` (they get full network access).
+
+**A warning that an allowed address is private.** `--allow 10.0.0.5`, or a name that
+resolves into RFC 1918, carrier-grade NAT or unique-local space, is reachable on
+purpose; the warning is there in case that is a corporate name you did not mean to
+open up. `-q` silences it.
+
 ## Examples
 
 Turnkey, runnable examples are in [`examples/`](examples/):
@@ -666,7 +730,7 @@ Turnkey, runnable examples are in [`examples/`](examples/):
 - [`examples/03-local-service-port`](examples/03-local-service-port/): Bridging host databases/containers via `--port` with bidirectional loopback isolation.
 - [`examples/04-allowlist-surgical-bridge`](examples/04-allowlist-surgical-bridge/): Surgical egress allowlisting and breach reporting (`--report-json`).
 
-Each example is self-contained and runnable via `./run.sh` in under 5 seconds.
+Each example is self-contained and runs with `./run.sh`. With a built binary each takes about a second or less (0.1 to 0.6 s measured; the ones that use the public internet depend on your connection), and `NULLROUTE_EXAMPLES_OFFLINE=1` skips those steps.
 
 ## Development
 

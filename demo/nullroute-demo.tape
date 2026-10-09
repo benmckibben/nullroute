@@ -1,4 +1,4 @@
-# nullroute: The 15-Second Aha! Demo
+# nullroute: the terminal demo (about 20 seconds)
 #
 # Render from the REPOSITORY ROOT:
 #

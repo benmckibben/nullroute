@@ -2,7 +2,7 @@
 
 Turnkey examples demonstrating `nullroute`'s zero-leak isolation, surgical bridging, and sandboxing capabilities.
 
-Each example is self-contained and runnable with `./run.sh` in under 5 seconds.
+Each example is self-contained and runs with `./run.sh`. With a built binary each takes about a second or less (0.1 to 0.6 s measured; the ones that use the public internet depend on your connection).
 
 | Example | Focus | Command |
 |---|---|---|
