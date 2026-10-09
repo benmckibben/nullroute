@@ -266,7 +266,7 @@ fn main() -> ExitCode {
             };
             if !quiet {
                 for w in proxy::private_address_warnings(&allowlist, &overrides) {
-                    eprintln!("{w}");
+                    diagln!("{w}");
                 }
             }
             // The resolver is always on (it records lookups for --strict and

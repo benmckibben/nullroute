@@ -43,6 +43,7 @@ use std::net::{
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 
+use crate::diag::diagln;
 use crate::limits;
 use crate::report::{Kind, Report};
 use crate::sni::{self, Refusal, Verdict};
@@ -777,7 +778,7 @@ pub(crate) fn note_private_peer(host: &str, stream: &TcpStream, quiet: bool) {
         _ => false,
     };
     if first && !quiet {
-        eprintln!(
+        diagln!(
             "nullroute: warning: {host} resolved to {}, a {range} address on your local network",
             peer.ip()
         );
