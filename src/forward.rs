@@ -16,6 +16,8 @@
 //!
 //! `--port` itself: inside, `localhost:PORT` reaches the host's `localhost:PORT`.
 
+use crate::diag::diagln;
+use crate::limits;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -128,14 +130,32 @@ fn cmsg_words(n: usize) -> usize {
     space.div_ceil(8)
 }
 
-/// Create the socketpair and preallocate the child's buffers.
-pub fn prepare(specs: &[Spec]) -> io::Result<(ParentSide, ChildSide)> {
-    if specs.len() > MAX_LISTENERS {
+/// Descriptors nullroute needs besides the listeners (stdio, the socketpair,
+/// the sentinel's pipes, the report file, threads' sockets...).
+const FD_OVERHEAD: u64 = 64;
+
+/// Can `listeners` sockets be created and handed over? Checked by the real run
+/// and by --dry-run alike, so a configuration that would fail doesn't pass a
+/// dry run: at most MAX_LISTENERS, and they (plus a margin) must fit in the
+/// descriptor limit `fd_limit`.
+pub fn check_budget(listeners: usize, fd_limit: u64) -> io::Result<()> {
+    if listeners > MAX_LISTENERS {
         return Err(io::Error::other(format!(
-            "too many listeners ({} > {MAX_LISTENERS})",
-            specs.len()
+            "too many listeners ({listeners} > {MAX_LISTENERS})"
         )));
     }
+    if listeners as u64 + FD_OVERHEAD > fd_limit {
+        return Err(io::Error::other(format!(
+            "too many listeners for the file descriptor limit ({listeners} listeners need about {} descriptors, the limit is {fd_limit}); raise it with ulimit -n",
+            listeners as u64 + FD_OVERHEAD
+        )));
+    }
+    Ok(())
+}
+
+/// Create the socketpair and preallocate the child's buffers.
+pub fn prepare(specs: &[Spec]) -> io::Result<(ParentSide, ChildSide)> {
+    check_budget(specs.len(), crate::limits::effective_nofile_limit())?;
     let mut sv = [0 as libc::c_int; 2];
     // SAFETY: sv is a valid 2-element array. SEQPACKET keeps chunks as messages
     // and, unlike DGRAM, can't silently drop one.
@@ -392,24 +412,43 @@ pub fn serve_port(fd: RawFd, port: u16, warned: Arc<AtomicBool>) {
 fn spawn_acceptor(fd: RawFd, port: u16, warned: Arc<AtomicBool>) {
     // SAFETY: fd is a listening TCP socket we received and now own exclusively.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(inner) = conn else { continue };
-            let warned = warned.clone();
-            thread::spawn(move || match connect_host(port) {
-                Ok(outer) => relay(inner, outer),
-                Err(e) => {
-                    // Once per port: a test retrying in a loop shouldn't flood stderr.
-                    if !warned.swap(true, Ordering::Relaxed) {
-                        eprintln!(
-                            "nullroute: --port {port}: nothing reachable on the host at localhost:{port} ({e})"
-                        );
+    let limit = limits::Limiter::new(limits::max_connections(limits::MAX_CONNECTIONS));
+    limits::spawn_service(move || {
+        limits::accept_loop(
+            || listener.accept().map(|(c, _)| c),
+            |inner| {
+                let warned = warned.clone();
+                let Some(permit) = limit.try_acquire() else {
+                    return; // too many open: dropping it closes it
+                };
+                limits::spawn_conn(permit, move || match connect_host(port) {
+                    Ok(outer) => relay(inner, outer),
+                    Err(e) => {
+                        // Once per port: a test retrying in a loop shouldn't flood stderr.
+                        if !warned.swap(true, Ordering::Relaxed) {
+                            diagln!(
+                                "nullroute: --port {port}: {}",
+                                describe_connect_error(port, &e)
+                            );
+                        }
+                        let _ = inner.shutdown(Shutdown::Both);
                     }
-                    let _ = inner.shutdown(Shutdown::Both);
-                }
-            });
-        }
+                });
+            },
+        );
     });
+}
+
+/// Why connecting to the host's localhost:port failed, for the warning. Out
+/// of file descriptors is nullroute's own problem, not "nothing is listening".
+fn describe_connect_error(port: u16, e: &io::Error) -> String {
+    if limits::is_out_of_fds(e) {
+        format!(
+            "out of file descriptors while connecting to localhost:{port} ({e}); raise the limit (ulimit -n) or open fewer connections"
+        )
+    } else {
+        format!("nothing reachable on the host at localhost:{port} ({e})")
+    }
 }
 
 /// Connect to the host's localhost:port, IPv4 first, then IPv6.
@@ -428,12 +467,48 @@ pub(crate) fn relay(a: TcpStream, b: TcpStream) {
     let (Ok(mut a_read), Ok(mut b_write)) = (a.try_clone(), b.try_clone()) else {
         return;
     };
-    let up = thread::spawn(move || {
+    // If the second thread can't be started, give up on this connection (it is
+    // closed as the streams drop) rather than panic.
+    let Ok(up) = thread::Builder::new().spawn(move || {
         let _ = io::copy(&mut a_read, &mut b_write);
         let _ = b_write.shutdown(Shutdown::Write);
-    });
+    }) else {
+        return;
+    };
     let (mut b_read, mut a_write) = (b, a);
     let _ = io::copy(&mut b_read, &mut a_write);
     let _ = a_write.shutdown(Shutdown::Write);
     let _ = up.join();
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_listener_budget_covers_both_the_count_and_the_descriptor_limit() {
+        assert!(check_budget(MAX_LISTENERS, 1 << 20).is_ok());
+        let e = check_budget(MAX_LISTENERS + 1, 1 << 20).unwrap_err();
+        assert!(
+            e.to_string().contains("too many listeners (1025 > 1024)"),
+            "{e}"
+        );
+        assert!(check_budget(100, 164).is_ok());
+        let e = check_budget(100, 163).unwrap_err();
+        assert!(e.to_string().contains("file descriptor limit"), "{e}");
+    }
+
+    use super::*;
+
+    #[test]
+    fn running_out_of_descriptors_is_not_reported_as_nothing_listening() {
+        let emfile = io::Error::from_raw_os_error(libc::EMFILE);
+        let msg = describe_connect_error(5432, &emfile);
+        assert!(msg.contains("out of file descriptors"), "{msg}");
+        assert!(!msg.contains("nothing reachable"), "{msg}");
+        let refused = io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        let msg = describe_connect_error(5432, &refused);
+        assert!(
+            msg.contains("nothing reachable on the host at localhost:5432"),
+            "{msg}"
+        );
+    }
 }

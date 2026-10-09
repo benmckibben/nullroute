@@ -4,6 +4,8 @@
 // are cfg'd out, so the build stops with this one error instead of dozens of
 // missing-libc-symbol errors; allow(unused) keeps the leftovers quiet.
 #![cfg_attr(not(target_os = "linux"), allow(unused))]
+// Diagnostics go through diag!/diagln! (src/diag.rs), which can't panic.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "nullroute only supports Linux (it relies on Linux network namespaces); build it for a Linux target"
@@ -11,6 +13,8 @@ compile_error!(
 #[cfg(not(target_os = "linux"))]
 fn main() {}
 
+#[cfg(target_os = "linux")]
+mod diag;
 #[cfg(target_os = "linux")]
 mod dns;
 #[cfg(target_os = "linux")]
@@ -24,16 +28,22 @@ mod inspect;
 #[cfg(target_os = "linux")]
 mod lifecycle;
 #[cfg(target_os = "linux")]
+mod limits;
+#[cfg(target_os = "linux")]
 mod proxy;
 #[cfg(target_os = "linux")]
 mod report;
 #[cfg(target_os = "linux")]
 mod sandbox;
 #[cfg(target_os = "linux")]
+mod seccomp;
+#[cfg(target_os = "linux")]
 mod signals;
 #[cfg(target_os = "linux")]
 mod sni;
+mod tmpdir;
 
+use crate::diag::{diag, diagln};
 use clap::{Parser, Subcommand};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitCode;
@@ -63,10 +73,11 @@ enum Cmd {
         #[arg(short, long = "port", value_name = "PORT", value_delimiter = ',', value_parser = clap::value_parser!(u16).range(1..))]
         ports: Vec<u16>,
 
-        /// Also hide this Unix socket (repeatable).
-        ///
-        /// Container-runtime sockets (docker.sock, podman.sock, containerd,
-        /// buildkit) and the system D-Bus are hidden by default.
+        /// Also hide this Unix socket (repeatable), e.g. an X11 or Wayland
+        /// display socket or a local proxy. Container-runtime sockets, the
+        /// system and session D-Bus, the systemd user manager, snapd, SSH and
+        /// keyring agents ($SSH_AUTH_SOCK) and gpg-agent/dirmngr are hidden by
+        /// default (see --dry-run for the list on this machine).
         #[arg(long = "hide-socket", value_name = "PATH")]
         hide_sockets: Vec<std::path::PathBuf>,
 
@@ -76,7 +87,8 @@ enum Cmd {
         /// For example --allow-socket /var/run/docker.sock for tests that start
         /// containers (those containers will have network access), or
         /// --allow-socket /run/dbus/system_bus_socket for the system D-Bus (which
-        /// can resolve names through systemd-resolved).
+        /// can resolve names through systemd-resolved), or --allow-socket
+        /// "$SSH_AUTH_SOCK" to let the command use your SSH agent.
         #[arg(long = "allow-socket", value_name = "PATH")]
         allow_sockets: Vec<std::path::PathBuf>,
 
@@ -102,6 +114,14 @@ enum Cmd {
         /// Hub is --allow docker.io; a registry on localhost is --port.
         #[arg(long = "seal-docker-pulls", value_name = "MODE", value_enum)]
         seal_docker_pulls: Option<docker::PullPolicy>,
+
+        /// With --seal-docker: also let the command run code in, start, restart,
+        /// attach to or copy files into containers that have a network (ones it
+        /// didn't create here: docker exec, docker start...). By default those
+        /// are refused, because the code would run with that network. This
+        /// unseals them.
+        #[arg(long = "seal-docker-allow-existing")]
+        seal_docker_allow_existing: bool,
 
         /// Let this host through (repeatable or comma-separated): api.github.com,
         /// *.stripe.dev (subdomains only), or an IP, each optionally :PORT.
@@ -158,6 +178,13 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         report_json: Option<std::path::PathBuf>,
 
+        /// Don't install the seccomp filter (no_new_privs is still set). By
+        /// default the command can't open AF_VSOCK, Bluetooth, NFC or QIPCRTR
+        /// sockets, can't use io_uring or the TIOCSTI/TIOCLINUX terminal
+        /// ioctls (all fail with an error). Use this for a tool that needs one.
+        #[arg(long = "no-seccomp")]
+        no_seccomp: bool,
+
         /// Print what would be hidden, masked, forwarded and allowed, then exit.
         ///
         /// Lists the hidden and sealed sockets, the masked resolver sockets,
@@ -165,6 +192,13 @@ enum Cmd {
         /// Add --inspect for the full sandbox topology.
         #[arg(long)]
         dry_run: bool,
+
+        /// With --dry-run, also check that this machine lets nullroute create
+        /// the namespaces a run needs (a throw-away process does the real
+        /// setup and exits; nothing is left behind). Without it --dry-run only
+        /// checks the options and the listener/descriptor budget.
+        #[arg(long, requires = "dry_run")]
+        check_sandbox: bool,
 
         /// Print the sandbox topology (namespaces, loopback, bridged ports,
         /// blocked/sealed sockets, proxy) to stderr before running the command.
@@ -175,7 +209,7 @@ enum Cmd {
 
         /// The command to run, followed by its arguments (put them after --).
         #[arg(required = true, last = true, value_name = "COMMAND")]
-        argv: Vec<String>,
+        argv: Vec<std::ffi::OsString>,
     },
 }
 
@@ -190,19 +224,28 @@ fn main() -> ExitCode {
             seal_docker,
             seal_docker_sockets,
             seal_docker_pulls,
+            seal_docker_allow_existing,
             allow,
             resolve,
             no_dns,
             strict,
             quiet,
             report_json,
+            no_seccomp,
             dry_run,
+            check_sandbox,
             inspect,
             argv,
         } => {
             if seal_docker_pulls.is_some() && !seal_docker && seal_docker_sockets.is_empty() {
-                eprintln!(
+                diagln!(
                     "nullroute: --seal-docker-pulls only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
+                );
+                return ExitCode::from(2);
+            }
+            if seal_docker_allow_existing && !seal_docker && seal_docker_sockets.is_empty() {
+                diagln!(
+                    "nullroute: --seal-docker-allow-existing only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
                 );
                 return ExitCode::from(2);
             }
@@ -210,14 +253,14 @@ fn main() -> ExitCode {
             let allowlist = match proxy::Allowlist::parse(&allow) {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("nullroute: {e}");
+                    diagln!("nullroute: {e}");
                     return ExitCode::from(2);
                 }
             };
             let overrides = match proxy::parse_overrides(&resolve, &allowlist) {
                 Ok(o) => o,
                 Err(e) => {
-                    eprintln!("nullroute: {e}");
+                    diagln!("nullroute: {e}");
                     return ExitCode::from(2);
                 }
             };
@@ -237,7 +280,7 @@ fn main() -> ExitCode {
                     Ok(None) if ports.contains(&dns::PORT) => None,
                     Ok(None) => Some(dns::Plan::resolver_only()),
                     Err(e) => {
-                        eprintln!("nullroute: {e}");
+                        diagln!("nullroute: {e}");
                         return ExitCode::from(2);
                     }
                 }
@@ -245,7 +288,7 @@ fn main() -> ExitCode {
             if let Some(path) = &report_json
                 && let Err(e) = report::check_writable(path)
             {
-                eprintln!(
+                diagln!(
                     "nullroute: --report-json {}: can't write the report there: {e}; not running the command",
                     path.display()
                 );
@@ -254,28 +297,34 @@ fn main() -> ExitCode {
             ports.sort_unstable();
             ports.dedup();
             if dns_plan.is_some() && ports.contains(&dns::PORT) {
-                eprintln!(
+                diagln!(
                     "nullroute: --port {} clashes with the DNS sinkhole for --allow; add --no-dns to bridge it",
                     dns::PORT
                 );
                 return ExitCode::from(2);
             }
             if ports.len() > forward::MAX_PORTS {
-                eprintln!(
+                diagln!(
                     "nullroute: at most {} --port values (got {})",
                     forward::MAX_PORTS,
                     ports.len()
                 );
                 return ExitCode::from(2);
             }
-            let mut seal = seal_docker_sockets;
-            if seal_docker {
-                seal.extend(docker::docker_api_sockets());
-            }
-            let mut plan = match hide::plan(&hide_sockets, &allow_sockets, &seal) {
+            let seal_defaults = if seal_docker {
+                docker::docker_api_sockets()
+            } else {
+                Vec::new()
+            };
+            let mut plan = match hide::plan(
+                &hide_sockets,
+                &allow_sockets,
+                &seal_docker_sockets,
+                &seal_defaults,
+            ) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("nullroute: preparing socket hiding: {e}");
+                    diagln!("nullroute: preparing socket hiding: {e}");
                     return ExitCode::from(125);
                 }
             };
@@ -284,6 +333,7 @@ fn main() -> ExitCode {
                     pulls,
                     allow: allowlist.clone(),
                     ports: ports.clone(),
+                    allow_existing: seal_docker_allow_existing,
                 });
             }
             let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
@@ -296,57 +346,54 @@ fn main() -> ExitCode {
                 dns_plan.as_ref(),
                 &dns::bypass_targets(),
             )
-            .with_docker_pulls(pulls);
+            .with_docker_pulls(pulls)
+            .with_seccomp(!no_seccomp);
             if inspect {
-                eprint!("{}", topology.render());
+                diag!("{}", topology.render());
             }
             if dry_run {
+                // What the real run would refuse, say so now: the listener
+                // and descriptor budget, and (opt-in) whether namespaces can
+                // be created at all.
+                let listeners =
+                    sandbox::planned_listeners(&ports, !allowlist.is_empty(), dns_plan.as_ref());
+                if let Err(e) = forward::check_budget(listeners, limits::effective_nofile_limit()) {
+                    diagln!("nullroute: could not set up the sandbox: {e}");
+                    return ExitCode::from(125);
+                }
+                if check_sandbox && let Err(e) = sandbox::probe_namespaces() {
+                    diagln!("nullroute: could not set up the sandbox: {e}");
+                    return ExitCode::from(125);
+                }
                 // Rust ignores SIGPIPE, so a reader that exits early (| head)
-                // would turn println! into a panic (101). Die by the signal
-                // instead, like ls does.
+                // would turn a write error into a panic (101). The listing is
+                // the result of the command, not a diagnostic: die by the
+                // signal instead, like ls does.
                 // SAFETY: restoring the default disposition has no preconditions.
                 unsafe {
                     libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 }
-                match &plan {
-                    None => println!("hidden sockets: none"),
-                    Some(p) => {
-                        p.blocked_targets()
-                            .for_each(|t| println!("hidden socket: {}", t.display()));
-                        p.sealed_targets()
-                            .for_each(|t| println!("sealed docker socket: {}", t.display()));
-                        if p.sealed_targets().next().is_some() {
-                            println!("docker pulls: {}", pulls.describe());
-                        }
+                let mut out = std::io::stdout().lock();
+                let listing = DryRunListing {
+                    plan: plan.as_ref(),
+                    pulls,
+                    masked: &topology.masked,
+                    namespaces: topology.namespaces(),
+                    ports: &ports,
+                    allowed_hosts: &allowed_hosts,
+                    proxy: !allowlist.is_empty(),
+                    dns_plan: dns_plan.as_ref(),
+                    seccomp: !no_seccomp,
+                };
+                return match write_dry_run(&mut out, &listing) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        // Anything but a closed pipe (which killed us above),
+                        // e.g. a full disk: say so, don't panic.
+                        diagln!("nullroute: writing the --dry-run listing: {e}");
+                        ExitCode::from(EXIT_OUTPUT_FAILED as u8)
                     }
-                }
-                for m in &topology.masked {
-                    println!("masked resolver socket: {}", m.display());
-                }
-                for p in &ports {
-                    println!("forwarded port: {p}");
-                }
-                for h in &allowed_hosts {
-                    println!("allowed host: {h}");
-                }
-                if !allowlist.is_empty() {
-                    println!("proxy: http://127.0.0.1:{}", proxy::pick_port(&ports));
-                }
-                match &dns_plan {
-                    Some(d) if d.has_names() => {
-                        println!("dns sinkhole: 127.0.0.1:{}", dns::PORT);
-                        for l in d.describe() {
-                            println!("synthetic address: {l}");
-                        }
-                    }
-                    Some(_) => println!(
-                        "dns resolver: 127.0.0.1:{} (every lookup is refused and recorded)",
-                        dns::PORT
-                    ),
-                    None => {}
-                }
-                println!("namespaces: {}", topology.namespaces().join(", "));
-                return ExitCode::SUCCESS;
+                };
             }
             let report = report::Report::new(quiet);
             let proxy = (!allowlist.is_empty()).then(|| {
@@ -359,11 +406,12 @@ fn main() -> ExitCode {
             let opts = RunOpts {
                 strict,
                 report_json,
+                seccomp: !no_seccomp,
             };
             run(
                 &argv,
                 &ports,
-                plan.as_ref(),
+                plan.as_mut(),
                 proxy,
                 dns.as_ref(),
                 &report,
@@ -371,6 +419,79 @@ fn main() -> ExitCode {
             )
         }
     }
+}
+
+/// The --dry-run listing: what would be hidden, forwarded and allowed.
+struct DryRunListing<'a> {
+    plan: Option<&'a hide::Plan>,
+    pulls: docker::PullPolicy,
+    masked: &'a [std::path::PathBuf],
+    namespaces: Vec<&'static str>,
+    ports: &'a [u16],
+    allowed_hosts: &'a [String],
+    proxy: bool,
+    dns_plan: Option<&'a dns::Plan>,
+    seccomp: bool,
+}
+
+fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::io::Result<()> {
+    let DryRunListing {
+        plan,
+        pulls,
+        masked,
+        namespaces,
+        ports,
+        allowed_hosts,
+        proxy,
+        dns_plan,
+        seccomp,
+    } = l;
+    let (pulls, proxy, seccomp) = (*pulls, *proxy, *seccomp);
+    let (plan, dns_plan) = (*plan, *dns_plan);
+    let (ports, allowed_hosts) = (*ports, *allowed_hosts);
+    match plan {
+        None => writeln!(out, "hidden sockets: none")?,
+        Some(p) => {
+            for t in p.blocked_targets() {
+                writeln!(out, "hidden socket: {}", t.display())?;
+            }
+            for t in p.sealed_targets() {
+                writeln!(out, "sealed docker socket: {}", t.display())?;
+            }
+            if p.sealed_targets().next().is_some() {
+                writeln!(out, "docker pulls: {}", pulls.describe())?;
+            }
+        }
+    }
+    for m in masked.iter() {
+        writeln!(out, "masked resolver socket: {}", m.display())?;
+    }
+    writeln!(out, "seccomp: {}", inspect::hardening(seccomp))?;
+    for p in ports {
+        writeln!(out, "forwarded port: {p}")?;
+    }
+    for h in allowed_hosts {
+        writeln!(out, "allowed host: {h}")?;
+    }
+    if proxy {
+        writeln!(out, "proxy: http://127.0.0.1:{}", proxy::pick_port(ports))?;
+    }
+    match dns_plan {
+        Some(d) if d.has_names() => {
+            writeln!(out, "dns sinkhole: 127.0.0.1:{}", dns::PORT)?;
+            for l in d.describe() {
+                writeln!(out, "synthetic address: {l}")?;
+            }
+        }
+        Some(_) => writeln!(
+            out,
+            "dns resolver: 127.0.0.1:{} (every lookup is refused and recorded)",
+            dns::PORT
+        )?,
+        None => {}
+    }
+    writeln!(out, "namespaces: {}", namespaces.join(", "))?;
+    out.flush()
 }
 
 /// How an --allow value is displayed: trimmed, no trailing dot, lowercase.
@@ -382,25 +503,37 @@ fn normalize_host(h: &str) -> String {
 /// --report-json file couldn't be written at the end (EX_IOERR, sysexits.h).
 const EXIT_REPORT_WRITE_FAILED: i32 = 74;
 
+/// Exit code when the --dry-run listing itself can't be written to stdout
+/// (a full disk, say); same sysexits.h code.
+const EXIT_OUTPUT_FAILED: i32 = 74;
+
 struct RunOpts {
     strict: bool,
     report_json: Option<std::path::PathBuf>,
+    /// Install the seccomp filter (no --no-seccomp).
+    seccomp: bool,
 }
 
 #[cfg(target_os = "linux")]
 fn run(
-    argv: &[String],
+    argv: &[std::ffi::OsString],
     ports: &[u16],
-    hide: Option<&hide::Plan>,
+    hide: Option<&mut hide::Plan>,
     proxy: Option<(u16, std::sync::Arc<proxy::Proxy>)>,
     dns: Option<&std::sync::Arc<dns::Sinkhole>>,
     report: &std::sync::Arc<report::Report>,
     opts: &RunOpts,
 ) -> ExitCode {
-    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report) {
+    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, opts.seccomp) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("nullroute: failed to run {:?}: {e}", argv[0]);
+            if sandbox::command_exit_code(&e).is_some() {
+                diagln!("nullroute: failed to run {:?}: {e}", argv[0]);
+            } else {
+                // Not the command's fault: nothing was started, or the
+                // sandbox around it couldn't be built.
+                diagln!("nullroute: could not set up the sandbox: {e}");
+            }
             // Like docker run and shells: 127 = command not found, 126 = found
             // but not executable. Otherwise 125, "the runner failed", as opposed
             // to the command; keeps the two distinguishable.
@@ -414,19 +547,17 @@ fn run(
         _ => 1,
     };
     if let Some(s) = report.summary() {
-        eprint!("{s}");
+        diag!("{s}");
     }
     let strict_failed = opts.strict && code == 0 && report.has_blocks();
     if strict_failed {
-        eprintln!(
-            "nullroute: --strict: failing because the command tried to reach blocked targets"
-        );
+        diagln!("nullroute: --strict: failing because the command tried to reach blocked targets");
         code = 1;
     }
     if let Some(path) = &opts.report_json
         && let Err(e) = report.write_json(path, argv, code, strict_failed)
     {
-        eprintln!(
+        diagln!(
             "nullroute: --report-json {}: writing the report failed: {e}",
             path.display()
         );

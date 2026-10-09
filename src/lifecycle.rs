@@ -53,6 +53,14 @@ pub fn die_with_parent(parent: libc::pid_t) -> io::Result<()> {
     Ok(())
 }
 
+/// How many threads this process has, from /proc/self/task; None if that
+/// can't be read. nullroute starts its worker threads only after the command
+/// has been forked, so before that it must be 1: the child of a fork in a
+/// multi-threaded process may only call async-signal-safe functions.
+pub fn thread_count() -> Option<usize> {
+    Some(std::fs::read_dir("/proc/self/task").ok()?.count())
+}
+
 /// Make nullroute the reaper of whatever the command orphans, so
 /// [`kill_leftovers`] can find it. Call before spawning. Best effort.
 pub fn become_subreaper() {
@@ -121,4 +129,39 @@ fn children() -> Vec<libc::pid_t> {
 pub fn on_main_thread() -> bool {
     // SAFETY: gettid/getpid have no preconditions.
     unsafe { libc::syscall(libc::SYS_gettid) == libc::getpid() as libc::c_long }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_count_sees_other_threads() {
+        // Other tests start and stop threads at the same time, so a
+        // before/after comparison is unreliable; hold a known number of
+        // threads and check the count is at least that many (plus this one).
+        const HELD: usize = 8;
+        let (stop, hold) = std::sync::mpsc::channel::<()>();
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(hold));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let threads: Vec<_> = (0..HELD)
+            .map(|_| {
+                let hold = hold.clone();
+                let started = started_tx.clone();
+                std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    // Blocks until the sender is dropped.
+                    let _ = hold.lock().unwrap().recv();
+                })
+            })
+            .collect();
+        for _ in 0..HELD {
+            started_rx.recv().unwrap();
+        }
+        assert!(thread_count().unwrap() > HELD);
+        drop(stop);
+        for t in threads {
+            t.join().unwrap();
+        }
+    }
 }

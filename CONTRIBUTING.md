@@ -25,17 +25,22 @@ The integration tests need:
   CI runs `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`.
   Run the tests as an ordinary user, not root.
 - **Docker with an `alpine` image** (`docker pull alpine`) for the
-  `--seal-docker` tests. They print a "skipping" line and pass without it, so
-  check the `--show-output` log when you change Docker handling.
+  `--seal-docker` tests. Without it they print a loud "SKIPPED ... did not
+  test anything" banner and pass; set `NULLROUTE_REQUIRE_DOCKER=1` (CI does) to
+  make that a failure. Each Docker test that runs prints
+  `docker-test-ran: NAME`, and CI checks that all of them did.
 
-To test an older toolchain: `cargo +1.88 test --locked`.
+To test an older toolchain: `cargo +1.88 test --locked`. CI also runs the suite
+with `cargo test --release`; tests that need a debug-only hook
+(`NULLROUTE_TEST_*`) are `#[ignore]`d there with a reason.
 
 ## What CI checks
 
 Every pull request must pass (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)):
 
 - `rustfmt` and `clippy` with warnings as errors;
-- the test suite on stable, on the MSRV (1.88) and on `x86_64-unknown-linux-musl`;
+- the test suite on stable, on the MSRV (1.88), on a `--release` build and on
+  `x86_64-unknown-linux-musl`, with every Docker test required to have run;
 - `cargo check` and `clippy` for the musl and aarch64 targets;
 - that a non-Linux target fails with a single clear error;
 - `cargo-deny` against `deny.toml` (RustSec advisories, licences, bans, sources).

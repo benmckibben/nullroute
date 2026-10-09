@@ -1,6 +1,6 @@
 # Exit codes
 
-Status: **implemented**. Three small items are still open (see [Open](#open)). The user-facing
+Status: **implemented**. One small item is still open (see [Open](#open)). The user-facing
 table is in the [README](../../README.md#what-got-blocked-the-report-and---strict); this note records the
 policy, why it is the way it is, and what was checked.
 
@@ -51,6 +51,7 @@ All codes are produced in `src/main.rs` (`main`, `run`) or by clap before `main`
 | 2 | `run --allow localhost -- true`; `run --resolve foo:1.2.3.4 -- true`; `run --seal-docker-pulls none -- true`; `run --allow x.example --port 53 -- true`; `run --report-json /nonexistent/x.json -- true` | 2, each with its own message |
 | 74 | `run --report-json /dev/full -- true` | 74, `writing the report failed` |
 | 125 | `TMPDIR=/nonexistent run -- true` | 125, `preparing socket hiding: No such file or directory` |
+| 125 | one `--allow` host with 1,101 ports (`--allow x.example:2000 --allow x.example:2001 ...`), with or without `--dry-run` | 125, `could not set up the sandbox: too many listeners (1105 > 1024)` |
 | 126 | `run -- /etc/passwd` | 126, `failed to run "/etc/passwd": Permission denied` (no namespace hint) |
 | 127 | `run -- /nonexistent/cmd` | 127, `failed to run "/nonexistent/cmd": No such file or directory` |
 | 128+N | `run -- sh -c 'kill -TERM $$'` / `kill -INT $$` | 143 / 130 |
@@ -61,14 +62,7 @@ nullroute itself produces 126 and 127 only for a command that cannot be started;
 
 ## Open
 
-1. **`--dry-run` accepts a configuration the real run rejects.** The listener limit (1024) is checked when
-   the sockets are created, so one `--allow` host with 1,100 ports gives `--dry-run` exit 0 and the real run
-   `125` (`too many listeners (1104 > 1024)`). **[verified]** The limit depends on the arguments alone, so it
-   belongs with the exit-2 checks, before `--dry-run` returns.
-2. **"failed to run" is used for everything after the sandbox setup starts**, including failures after the
-   command was already running (resolver start, handover), so the wording is not always accurate. Cosmetic.
-   **[reasoned]**
-3. **`--hide-socket /typo`** prints `no such file, ignoring` and exits 0 (`--allow-socket /typo` is silent), so a
+1. **`--hide-socket /typo`** prints `no such file, ignoring` and exits 0 (`--allow-socket /typo` is silent), so a
    mistyped path leaves the socket reachable. **[verified]** Ignoring missing paths is deliberate for the default
    list (most of those sockets do not exist on most machines); for an explicit flag, exit 2 or a `--strict`
    failure would be safer. Undecided.

@@ -87,13 +87,75 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           unshare --user --net --map-current-user true
 
-      # The --seal-docker tests skip themselves without an alpine image.
       - name: Pull alpine for --seal-docker tests
         run: docker pull alpine
 
-      # --show-output keeps the "skipping: ..." lines visible, so a test that
-      # quietly skipped on the runner is visible in the log.
-      - run: cargo test --locked --no-fail-fast -- --show-output
+      # NULLROUTE_REQUIRE_DOCKER turns the Docker tests' skip into a failure.
+      # --show-output keeps the tests' own output (including any "SKIPPED"
+      # banner and the "docker-test-ran:" lines) in the log.
+      - name: cargo test
+        env:
+          NULLROUTE_REQUIRE_DOCKER: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast -- --show-output 2>&1 | tee test.log
+      # A Docker test that can't run (no daemon, no alpine) skips itself loudly
+      # locally, but must not be able to hide here: the count of tests that
+      # printed "docker-test-ran:" has to equal the number that use Docker.
+      - name: All Docker tests ran
+        run: |
+          ran=$(grep -c '^docker-test-ran: ' test.log || true)
+          expected=$(grep -c '!have_alpine()' tests/seal_docker.rs)
+          echo "docker tests that ran: $ran, in the source: $expected"
+          if [ "$expected" -eq 0 ] || [ "$ran" -ne "$expected" ]; then
+            echo "::error::expected $expected Docker tests to run, $ran did"
+            exit 1
+          fi
+
+  # The release binary is what users run. The suite normally runs against a
+  # debug build, where debug-only test hooks and debug_assertions exist; this
+  # job runs the same integration tests against --release. Tests that need a
+  # debug-only hook are marked #[ignore] with a reason there, and show up as
+  # "ignored" in the summary instead of silently not existing.
+  test-release:
+    name: test (release)
+    runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release
+      - name: Allow unprivileged user namespaces
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare --user --net --map-current-user true
+      - name: Pull alpine for --seal-docker tests
+        run: docker pull alpine
+      - name: cargo test --release
+        env:
+          NULLROUTE_REQUIRE_DOCKER: "1"
+        run: |
+          set -o pipefail
+          cargo test --release --locked --no-fail-fast -- --show-output 2>&1 | tee test.log
+      # A Docker test that can't run (no daemon, no alpine) skips itself loudly
+      # locally, but must not be able to hide here: the count of tests that
+      # printed "docker-test-ran:" has to equal the number that use Docker.
+      - name: All Docker tests ran
+        run: |
+          ran=$(grep -c '^docker-test-ran: ' test.log || true)
+          expected=$(grep -c '!have_alpine()' tests/seal_docker.rs)
+          echo "docker tests that ran: $ran, in the source: $expected"
+          if [ "$expected" -eq 0 ] || [ "$ran" -ne "$expected" ]; then
+            echo "::error::expected $expected Docker tests to run, $ran did"
+            exit 1
+          fi
 
   # The release targets beyond x86_64 glibc: musl's libc types differ (e.g. the
   # ioctl request is c_int, not c_ulong), so keep them compiling.
@@ -147,7 +209,24 @@ jobs:
           unshare --user --net --map-current-user true
       - name: Pull alpine for --seal-docker tests
         run: docker pull alpine
-      - run: cargo test --locked --no-fail-fast --target x86_64-unknown-linux-musl -- --show-output
+      - name: cargo test (musl)
+        env:
+          NULLROUTE_REQUIRE_DOCKER: "1"
+        run: |
+          set -o pipefail
+          cargo test --locked --no-fail-fast --target x86_64-unknown-linux-musl -- --show-output 2>&1 | tee test.log
+      # A Docker test that can't run (no daemon, no alpine) skips itself loudly
+      # locally, but must not be able to hide here: the count of tests that
+      # printed "docker-test-ran:" has to equal the number that use Docker.
+      - name: All Docker tests ran
+        run: |
+          ran=$(grep -c '^docker-test-ran: ' test.log || true)
+          expected=$(grep -c '!have_alpine()' tests/seal_docker.rs)
+          echo "docker tests that ran: $ran, in the source: $expected"
+          if [ "$expected" -eq 0 ] || [ "$ran" -ne "$expected" ]; then
+            echo "::error::expected $expected Docker tests to run, $ran did"
+            exit 1
+          fi
 
   # Non-Linux builds must stop at the single compile_error! in main.rs, not
   # bury it under dozens of missing-libc errors.

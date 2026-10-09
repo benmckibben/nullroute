@@ -30,6 +30,17 @@ pub struct Topology {
     pub dns: Option<Vec<String>>,
     /// `--seal-docker-pulls`, when a Docker socket is sealed.
     pub docker_pulls: Option<docker::PullPolicy>,
+    /// The seccomp filter is installed (no `--no-seccomp`).
+    pub seccomp: bool,
+}
+
+/// What `--inspect` and `--dry-run` say about the seccomp filter.
+pub fn hardening(seccomp: bool) -> String {
+    if seccomp {
+        crate::seccomp::describe()
+    } else {
+        "off (--no-seccomp); no_new_privs is still set".to_string()
+    }
 }
 
 impl Topology {
@@ -62,7 +73,14 @@ impl Topology {
             proxy,
             dns: dns.map(dns::Plan::describe),
             docker_pulls: None,
+            seccomp: true,
         }
+    }
+
+    /// Show whether the seccomp filter is installed (`--no-seccomp`).
+    pub fn with_seccomp(mut self, on: bool) -> Self {
+        self.seccomp = on;
+        self
     }
 
     /// Show the --seal-docker-pulls policy (only if a socket is sealed).
@@ -88,6 +106,7 @@ impl Topology {
     pub fn render(&self) -> String {
         let mut s = String::from("nullroute: inspect: sandbox topology\n");
         let _ = writeln!(s, "  namespaces:      {}", self.namespaces().join(", "));
+        let _ = writeln!(s, "  hardening:       {}", hardening(self.seccomp));
         let pool = if self.dns.is_some() {
             format!(", {}", dns::POOL_CIDR)
         } else {
@@ -174,14 +193,17 @@ mod tests {
             proxy: None,
             dns: None,
             docker_pulls: None,
+            seccomp: true,
         }
     }
 
     #[test]
     fn minimal_topology_reports_none_everywhere() {
+        let hardening = format!("  hardening:       {}", hardening(true));
         let expected = [
             "nullroute: inspect: sandbox topology",
             "  namespaces:      user, net",
+            hardening.as_str(),
             "  loopback:        lo: UP (127.0.0.1, ::1)",
             "  bridged ports:   none",
             "  unix sockets:",
@@ -240,6 +262,7 @@ mod tests {
             proxy: Some((3128, vec!["api.github.com".into(), "*.stripe.dev".into()])),
             dns: Some(vec!["api.github.com -> 127.77.0.1 (ports 80, 443)".into()]),
             docker_pulls: Some(docker::PullPolicy::Allowlisted),
+            seccomp: true,
         };
         let out = t.render();
         assert!(
@@ -299,6 +322,20 @@ mod tests {
 "
             ),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn hardening_line_says_when_seccomp_is_off() {
+        let on = bare().render();
+        assert!(
+            on.contains("  hardening:       no_new_privs; seccomp denies socket("),
+            "{on}"
+        );
+        let off = bare().with_seccomp(false).render();
+        assert!(
+            off.contains("  hardening:       off (--no-seccomp); no_new_privs is still set\n"),
+            "{off}"
         );
     }
 

@@ -7,6 +7,7 @@
 //!    - map our real uid/gid into the user namespace, so the command still runs
 //!      as "you", not as a fake root.
 //!    - bring `lo` up (it starts DOWN), so 127.0.0.1 works inside.
+//!    - set no_new_privs and install a small seccomp filter (seccomp.rs).
 //! 2. exec the command. It keeps no capabilities after exec (it isn't root in
 //!    the namespace), so it can't add interfaces or routes to get back out.
 //!
@@ -21,13 +22,12 @@
 //! `--port` forwarding; see forward.rs. With `--allow`, names resolve through
 //! the DNS sinkhole instead (dns.rs), which needs the mount namespace too.
 
-use std::ffi::CString;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 
 use crate::report::Report;
-use crate::{dns, forward, hide, lifecycle, proxy, signals};
+use crate::{diagln, dns, forward, hide, lifecycle, limits, proxy, seccomp, signals};
 use std::sync::Arc;
 
 /// What a listener created inside the sandbox is for.
@@ -40,16 +40,30 @@ enum Role {
 /// Run `argv` inside a hermetic network namespace and wait for it. Each port in
 /// `ports` is bridged from the sandbox's localhost to the host's.
 pub fn run_hermetic(
-    argv: &[String],
+    argv: &[std::ffi::OsString],
     ports: &[u16],
-    hide: Option<&hide::Plan>,
+    mut hide: Option<&mut hide::Plan>,
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
     dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
+    use_seccomp: bool,
 ) -> io::Result<ExitStatus> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no command given"))?;
+
+    // From here until the signal thread is running, SIGINT/SIGQUIT/SIGTERM/SIGHUP
+    // stay pending instead of hitting nullroute's default action (see
+    // signals.rs). Blocking comes first, before anything is created on disk,
+    // so a signal during setup can't kill nullroute and leave files behind.
+    // Whatever the command orphans is reparented to nullroute, which kills it
+    // once the command is done (lifecycle.rs).
+    lifecycle::become_subreaper();
+    let blocked = signals::block()?;
+    // Relaying uses two descriptors per connection: lift the soft descriptor
+    // limit to the hard one for nullroute itself. The command gets the original
+    // back before exec (below).
+    let nofile_original = limits::raise_nofile_limit();
 
     // Prepare everything that allocates *before* fork. The pre_exec closure runs
     // in the forked child, where allocating is not guaranteed safe.
@@ -57,10 +71,11 @@ pub fn run_hermetic(
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let uid_map = format!("{uid} {uid} 1\n");
     let gid_map = format!("{gid} {gid} 1\n");
+    // Constant C strings: nothing to allocate or fail on.
     let paths = (
-        CString::new("/proc/self/setgroups").unwrap(),
-        CString::new("/proc/self/uid_map").unwrap(),
-        CString::new("/proc/self/gid_map").unwrap(),
+        c"/proc/self/setgroups",
+        c"/proc/self/uid_map",
+        c"/proc/self/gid_map",
     );
 
     // Every listener the parent will serve is created inside the sandbox and
@@ -92,12 +107,19 @@ pub fn run_hermetic(
     // Bind mounts for the private mount namespace: socket decoys, then the
     // sinkhole's resolv.conf (with --allow) and the resolver-socket masks
     // (always: systemd-resolved's varlink socket and nscd would otherwise
-    // resolve names on the host's network). dns_files must outlive the child
-    // (it deletes the sources on drop).
+    // resolve names on the host's network). Their source files live in private
+    // temp dirs that are removed when nullroute exits (tmpdir.rs). They stay
+    // until then on purpose: a nullroute started inside the sandbox bind-mounts
+    // its own decoys over these mounts, which the kernel refuses (ENOENT) once
+    // the mounted files have been unlinked.
+    if let Some(h) = hide.as_deref_mut() {
+        h.prepare()?;
+    }
     let dns_files = Some(dns::Files::create(dns.is_some())?).filter(|f| !f.mounts.is_empty());
     let need_mount_ns = hide.is_some() || dns_files.is_some();
     let mounts = if need_mount_ns {
         let mut m = hide
+            .as_deref()
             .map(|h| h.mount_list())
             .transpose()?
             .unwrap_or_default();
@@ -109,15 +131,21 @@ pub fn run_hermetic(
         None
     };
     let flags = namespace_flags(need_mount_ns);
+    // Built here because building allocates; the child only installs it.
+    let seccomp_filter = if !use_seccomp {
+        None
+    } else if let Some(f) = seccomp::Filter::new().filter(|_| seccomp::available()) {
+        Some(f)
+    } else {
+        diagln!(
+            "nullroute: warning: this kernel or architecture can't load the seccomp filter; \
+             running without it (no_new_privs is still set)"
+        );
+        None
+    };
     let pool_address = dns.is_some();
 
-    // From here until the handlers are installed, SIGINT/SIGQUIT/SIGTERM/SIGHUP
-    // stay pending instead of hitting nullroute's default action (see signals.rs).
-    // Whatever the command orphans is reparented to nullroute, which kills it
-    // once the command is done (lifecycle.rs).
-    lifecycle::become_subreaper();
-    let blocked = signals::block()?;
-    let child_mask = blocked.child_mask();
+    let child_mask = blocked.child_mask()?;
     hold_for_test();
     // The parent-death signal is tied to the forking thread (lifecycle.rs).
     debug_assert!(
@@ -126,14 +154,26 @@ pub fn run_hermetic(
     );
     // SAFETY: getpid has no preconditions.
     let parent = unsafe { libc::getpid() };
+    // A bystander in our process group, to tell group-directed signals from
+    // pid-directed ones (signals.rs). Forked while we are still single-threaded.
+    debug_assert!(
+        lifecycle::thread_count().is_none_or(|n| n == 1),
+        "nullroute must still be single-threaded when it forks"
+    );
+    let sentinel = blocked.spawn_sentinel(parent);
 
     let mut cmd = Command::new(program);
     cmd.args(args);
     if let Some((pp, _)) = &proxy {
         cmd.envs(proxy::env_vars(*pp));
     }
-    // SAFETY: the closure only makes raw syscalls (no allocation, no locks),
-    // which is what pre_exec requires.
+    // SAFETY: pre_exec runs between fork and exec, where only async-signal-safe
+    // operations are allowed. The closure and everything it calls make raw
+    // syscalls on memory prepared before the fork: no allocation (errors are
+    // io::Error::last_os_error / from_raw_os_error, which don't box), no locks,
+    // no std I/O. tests/pre_exec_hygiene.rs checks the functions on this path
+    // for allocating constructs. The sentinel's fork (signals.rs) is made while
+    // nullroute still has a single thread, and the debug_assert above checks it.
     unsafe {
         cmd.pre_exec(move || {
             let mut setup = || -> io::Result<()> {
@@ -146,9 +186,9 @@ pub fn run_hermetic(
                     return Err(io::Error::last_os_error());
                 }
                 // An unprivileged process must deny setgroups before writing gid_map.
-                write_file(&paths.0, b"deny")?;
-                write_file(&paths.1, uid_map.as_bytes())?;
-                write_file(&paths.2, gid_map.as_bytes())?;
+                write_file(paths.0, b"deny")?;
+                write_file(paths.1, uid_map.as_bytes())?;
+                write_file(paths.2, gid_map.as_bytes())?;
                 if let Some(m) = mounts.as_ref() {
                     hide::apply_in_child(m)?;
                 }
@@ -159,8 +199,19 @@ pub fn run_hermetic(
                 if let Some(c) = child_side.as_mut() {
                     c.listen_and_send()?;
                 }
+                if let Some(original) = &nofile_original
+                    && libc::setrlimit(libc::RLIMIT_NOFILE, original) != 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
                 // Re-arm after the user-namespace credential change (lifecycle.rs).
                 lifecycle::die_with_parent(parent)?;
+                // After the last socket and ioctl the setup itself needs (the
+                // filter denies some of them), before the command exists.
+                match seccomp_filter.as_ref() {
+                    Some(f) => f.install()?,
+                    None => seccomp::set_no_new_privs()?,
+                }
                 // Last: unblock, so nothing is delivered before setup is done. A
                 // SIGINT/SIGQUIT that reached only nullroute is passed on here.
                 child_mask.restore(parent_status)?;
@@ -182,12 +233,23 @@ pub fn run_hermetic(
     // the child's socket end.
     drop(cmd);
     let mut child = spawned?;
-    blocked.install(child.id());
-    if let Some(h) = hide
+    let fwd = match blocked.start(child.id(), sentinel) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            lifecycle::kill_leftovers();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("starting the signal forwarder: {e}"),
+            ));
+        }
+    };
+    if let Some(h) = hide.as_deref()
         && let Err(e) = h.start(report)
     {
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = signals::wait_for_exit(&mut child, &fwd);
         lifecycle::kill_leftovers();
         return Err(e);
     }
@@ -196,7 +258,7 @@ pub fn run_hermetic(
             Ok(g) => g,
             Err(e) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = signals::wait_for_exit(&mut child, &fwd);
                 lifecycle::kill_leftovers();
                 return Err(e);
             }
@@ -229,11 +291,10 @@ pub fn run_hermetic(
             }
         }
     }
-    let status = child.wait();
+    let status = signals::wait_for_exit(&mut child, &fwd);
     // The command is done; don't leave anything it started running in a
     // sandbox whose relays are about to go away.
     lifecycle::kill_leftovers();
-    drop(dns_files);
     status
 }
 
@@ -259,6 +320,56 @@ fn hold_for_test() {
 #[cfg(not(debug_assertions))]
 fn hold_for_test() {}
 
+/// How many sockets the sandbox will create for these options: two per
+/// forwarded port (IPv4 and IPv6), two for the proxy, and the sinkhole's.
+/// Shared by the real run and --dry-run.
+pub fn planned_listeners(ports: &[u16], proxy: bool, dns: Option<&dns::Plan>) -> usize {
+    let proxy_ports = if proxy { 2 } else { 0 };
+    ports.len() * 2 + proxy_ports + dns.map_or(0, |d| d.listeners().len())
+}
+
+/// Check that this machine lets nullroute create the namespaces a run needs
+/// (--dry-run --check-sandbox): start a throw-away process that does exactly
+/// the namespace setup of the real child (user, network and mount namespaces,
+/// the uid/gid maps, loopback up) and exits. Nothing is left behind: the
+/// namespaces die with the process. The error is the one a real run would
+/// report, with the same hint about AppArmor / sysctls.
+pub fn probe_namespaces() -> io::Result<()> {
+    let program = std::env::current_exe()?;
+    // SAFETY: getuid/getgid have no preconditions and cannot fail.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let uid_map = format!("{uid} {uid} 1\n");
+    let gid_map = format!("{gid} {gid} 1\n");
+    let flags = namespace_flags(true);
+    let mut cmd = Command::new(program);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure only makes raw syscalls and works on memory
+    // prepared above (the same steps as the real child's setup).
+    unsafe {
+        cmd.pre_exec(move || {
+            let setup = || -> io::Result<()> {
+                if libc::unshare(flags) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                write_file(c"/proc/self/setgroups", b"deny")?;
+                write_file(c"/proc/self/uid_map", uid_map.as_bytes())?;
+                write_file(c"/proc/self/gid_map", gid_map.as_bytes())?;
+                loopback_up()
+            };
+            setup().map_err(|e| {
+                io::Error::from_raw_os_error(
+                    e.raw_os_error().unwrap_or(libc::EIO) | SETUP_ERROR_TAG,
+                )
+            })
+        });
+    }
+    let mut child = cmd.spawn().map_err(classify_spawn_error)?;
+    child.wait().map(drop)
+}
+
 /// The namespaces the child unshares: always user + net, plus a mount
 /// namespace when there are sockets to hide or resolver sockets to mask, or
 /// the DNS sinkhole needs its resolv.conf. Shared with `--inspect`.
@@ -267,7 +378,7 @@ pub fn namespace_flags(mount_ns: bool) -> libc::c_int {
 }
 
 /// open + write + close with raw syscalls (safe to call in pre_exec).
-fn write_file(path: &CString, data: &[u8]) -> io::Result<()> {
+fn write_file(path: &std::ffi::CStr, data: &[u8]) -> io::Result<()> {
     // SAFETY: path is a valid NUL-terminated string; data is a valid slice.
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);

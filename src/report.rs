@@ -12,10 +12,96 @@
 //! nullroute, so it doesn't appear here. Proxy requests, DNS lookups and hidden
 //! sockets do.
 
+use crate::diag::diagln;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// Distinct (kind, target) entries kept. A command that looks up thousands of
+/// generated names would otherwise grow the report, the live output and the
+/// summary without bound. Attempts at targets beyond this are still counted
+/// (and still count as blocks for --strict), just not listed.
+pub const MAX_ENTRIES: usize = 1000;
+/// Live "blocked ..." lines printed per second; the rest wait for the summary.
+pub const MAX_LIVE_LINES_PER_SECOND: u32 = 20;
+
+/// (max entries, max live lines per second), or the debug-build test override
+/// NULLROUTE_TEST_REPORT_LIMITS=ENTRIES,LINES.
+fn limits() -> (usize, u32) {
+    #[cfg(debug_assertions)]
+    if let Some((e, l)) = std::env::var("NULLROUTE_TEST_REPORT_LIMITS")
+        .ok()
+        .as_deref()
+        .and_then(|v| v.split_once(','))
+        && let (Ok(e), Ok(l)) = (e.parse(), l.parse())
+    {
+        return (e, l);
+    }
+    (MAX_ENTRIES, MAX_LIVE_LINES_PER_SECOND)
+}
+
+/// Decides which live lines get printed: at most per_second in each second.
+struct LiveLimiter {
+    per_second: u32,
+    window_start: Option<Instant>,
+    printed: u32,
+    skipped: u64,
+    /// Skipped in total, for the summary.
+    skipped_total: u64,
+}
+
+enum Live {
+    Print,
+    /// Print it, after saying that this many were skipped in the second before.
+    PrintAfterSkipped(u64),
+    Skip,
+}
+
+impl LiveLimiter {
+    fn new(per_second: u32) -> Self {
+        LiveLimiter {
+            per_second,
+            window_start: None,
+            printed: 0,
+            skipped: 0,
+            skipped_total: 0,
+        }
+    }
+
+    fn allow(&mut self, now: Instant) -> Live {
+        let mut note = 0;
+        match self.window_start {
+            Some(t) if now.duration_since(t) < Duration::from_secs(1) => {}
+            _ => {
+                self.window_start = Some(now);
+                self.printed = 0;
+                note = std::mem::take(&mut self.skipped);
+            }
+        }
+        if self.printed < self.per_second {
+            self.printed += 1;
+            if note > 0 {
+                Live::PrintAfterSkipped(note)
+            } else {
+                Live::Print
+            }
+        } else {
+            self.skipped += 1;
+            self.skipped_total += 1;
+            Live::Skip
+        }
+    }
+}
+
+/// What the caps held back.
+#[derive(Default)]
+struct Overflow {
+    /// Attempts at targets that didn't fit in the entry table, by kind class.
+    blocked_attempts: u64,
+    rewritten_attempts: u64,
+}
 
 /// Version of the --report-json layout. Bumped only for a change that can break
 /// a consumer (a field removed or renamed, a meaning changed); new fields and
@@ -64,18 +150,76 @@ pub struct Entry {
     pub count: u64,
 }
 
-#[derive(Default)]
 pub struct Report {
     quiet: bool,
+    max_entries: usize,
     entries: Mutex<BTreeMap<(Kind, String), Entry>>,
+    overflow: Mutex<Overflow>,
+    live: Mutex<LiveLimiter>,
 }
 
 impl Report {
     pub fn new(quiet: bool) -> Arc<Self> {
+        let (max_entries, lines) = limits();
+        Self::with_limits(quiet, max_entries, lines)
+    }
+
+    fn with_limits(quiet: bool, max_entries: usize, live_per_second: u32) -> Arc<Self> {
         Arc::new(Report {
             quiet,
+            max_entries,
             entries: Mutex::new(BTreeMap::new()),
+            overflow: Mutex::new(Overflow::default()),
+            live: Mutex::new(LiveLimiter::new(live_per_second)),
         })
+    }
+
+    /// Count an attempt at a target that doesn't fit in the table.
+    fn note_overflow(&self, kind: Kind) {
+        if let Ok(mut o) = self.overflow.lock() {
+            if kind.is_block() {
+                o.blocked_attempts += 1;
+            } else {
+                o.rewritten_attempts += 1;
+            }
+        }
+    }
+
+    /// (blocked, rewritten) attempts that didn't fit in the table.
+    fn overflow(&self) -> (u64, u64) {
+        self.overflow
+            .lock()
+            .map(|o| (o.blocked_attempts, o.rewritten_attempts))
+            .unwrap_or((0, 0))
+    }
+
+    /// Print a live line unless more than the allowed number have gone out in
+    /// the last second.
+    fn print_live(&self, line: impl FnOnce() -> String) {
+        let verdict = match self.live.lock() {
+            Ok(mut l) => l.allow(Instant::now()),
+            Err(_) => Live::Print,
+        };
+        match verdict {
+            Live::Skip => {}
+            Live::Print => diagln!("{}", line()),
+            Live::PrintAfterSkipped(n) => {
+                diagln!(
+                    "nullroute: ... {n} more message{} suppressed (all of them are in the summary)",
+                    plural(n)
+                );
+                diagln!("{}", line());
+            }
+        }
+    }
+
+    fn live_per_second(&self) -> u32 {
+        self.live.lock().map(|l| l.per_second).unwrap_or(0)
+    }
+
+    /// How many live lines were held back, in total.
+    fn live_skipped(&self) -> u64 {
+        self.live.lock().map(|l| l.skipped_total).unwrap_or(0)
     }
 
     /// Record a blocked (or, for `Kind::Rewritten`, rewritten) attempt. On the first attempt at `target`, print
@@ -91,19 +235,23 @@ impl Report {
             let Ok(mut m) = self.entries.lock() else {
                 return false;
             };
-            let e = m
-                .entry((kind, target.to_string()))
-                .or_insert_with(|| Entry {
-                    kind,
-                    target: target.to_string(),
-                    reason: reason.to_string(),
-                    count: 0,
-                });
+            let key = (kind, target.to_string());
+            if !m.contains_key(&key) && m.len() >= self.max_entries {
+                drop(m);
+                self.note_overflow(kind);
+                return false;
+            }
+            let e = m.entry(key).or_insert_with(|| Entry {
+                kind,
+                target: target.to_string(),
+                reason: reason.to_string(),
+                count: 0,
+            });
             e.count += 1;
             e.count == 1
         };
         if first && !self.quiet {
-            eprintln!("{}", first_line());
+            self.print_live(first_line);
         }
         first
     }
@@ -127,10 +275,12 @@ impl Report {
 
     /// Was anything blocked? Rewrites don't count (this is what --strict checks).
     pub fn has_blocks(&self) -> bool {
-        self.entries
-            .lock()
-            .map(|m| m.keys().any(|(k, _)| k.is_block()))
-            .unwrap_or(false)
+        self.overflow().0 > 0
+            || self
+                .entries
+                .lock()
+                .map(|m| m.keys().any(|(k, _)| k.is_block()))
+                .unwrap_or(false)
     }
 
     /// (blocked, rewritten) entries.
@@ -141,7 +291,8 @@ impl Report {
     /// Human summary, or None if nothing was blocked or rewritten.
     pub fn summary(&self) -> Option<String> {
         let (blocked, rewritten) = self.split();
-        if blocked.is_empty() && rewritten.is_empty() {
+        let (over_blocked, over_rewritten) = self.overflow();
+        if blocked.is_empty() && rewritten.is_empty() && over_blocked + over_rewritten == 0 {
             return None;
         }
         let width = blocked
@@ -160,25 +311,47 @@ impl Report {
                 e.reason
             )
         };
+        let more = |n: u64| {
+            format!(
+                "  ... and {n} more attempt{} at other targets (only the first {} targets are listed)\n",
+                plural(n),
+                self.max_entries
+            )
+        };
         let mut s = String::new();
-        if !blocked.is_empty() {
-            let attempts: u64 = blocked.iter().map(|e| e.count).sum();
+        if !blocked.is_empty() || over_blocked > 0 {
+            let attempts: u64 = blocked.iter().map(|e| e.count).sum::<u64>() + over_blocked;
             s.push_str(&format!(
-                "nullroute: blocked {attempts} attempt{} to reach {} target{}:\n",
+                "nullroute: blocked {attempts} attempt{} to reach {}{} target{}:\n",
                 plural(attempts),
+                if over_blocked > 0 { "at least " } else { "" },
                 blocked.len(),
                 plural(blocked.len() as u64)
             ));
             blocked.iter().for_each(|e| s.push_str(&line(e)));
+            if over_blocked > 0 {
+                s.push_str(&more(over_blocked));
+            }
         }
-        if !rewritten.is_empty() {
-            let n: u64 = rewritten.iter().map(|e| e.count).sum();
+        if !rewritten.is_empty() || over_rewritten > 0 {
+            let n: u64 = rewritten.iter().map(|e| e.count).sum::<u64>() + over_rewritten;
             s.push_str(&format!(
                 "nullroute: rewrote {n} request{} and let {} through (not blocks; --strict ignores these):\n",
                 plural(n),
                 if n == 1 { "it" } else { "them" }
             ));
             rewritten.iter().for_each(|e| s.push_str(&line(e)));
+            if over_rewritten > 0 {
+                s.push_str(&more(over_rewritten));
+            }
+        }
+        let held_back = self.live_skipped();
+        if held_back > 0 {
+            s.push_str(&format!(
+                "nullroute: {held_back} live message{} were held back while the command ran (at most {} per second are printed); the lines above are complete.\n",
+                plural(held_back),
+                self.live_per_second()
+            ));
         }
         Some(s)
     }
@@ -187,7 +360,7 @@ impl Report {
     pub fn write_json(
         &self,
         path: &Path,
-        argv: &[String],
+        argv: &[std::ffi::OsString],
         exit_code: i32,
         strict_failed: bool,
     ) -> io::Result<()> {
@@ -196,7 +369,8 @@ impl Report {
         s.push_str(
             &argv
                 .iter()
-                .map(|a| json_string(a))
+                // JSON text is Unicode: bytes that aren't UTF-8 become U+FFFD here.
+                .map(|a| json_string(&a.to_string_lossy()))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -206,6 +380,13 @@ impl Report {
         s.push_str(&json_list("blocked", &blocked));
         s.push_str(",\n");
         s.push_str(&json_list("rewritten", &rewritten));
+        let (over_blocked, over_rewritten) = self.overflow();
+        if over_blocked + over_rewritten > 0 {
+            // Only present when the cap was hit, so the usual shape is unchanged.
+            s.push_str(&format!(
+                ",\n  \"not_listed\": {{\"blocked_attempts\": {over_blocked}, \"rewritten_attempts\": {over_rewritten}}}"
+            ));
+        }
         s.push_str("\n}\n");
         let mut f = std::fs::File::create(path)?;
         f.write_all(s.as_bytes())
@@ -269,6 +450,84 @@ pub fn json_string(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entries_beyond_the_cap_are_counted_but_not_listed_and_still_block() {
+        let r = Report::with_limits(true, 3, 100);
+        for i in 0..10 {
+            r.record(
+                Kind::Dns,
+                &format!("name{i}.example"),
+                "not allowed",
+                String::new,
+            );
+        }
+        // A second attempt at a listed target still counts on its entry.
+        r.record(Kind::Dns, "name0.example", "not allowed", String::new);
+        assert_eq!(r.entries().len(), 3);
+        assert!(r.has_blocks());
+        let s = r.summary().unwrap();
+        assert!(
+            s.contains("blocked 11 attempts to reach at least 3 targets"),
+            "{s}"
+        );
+        assert!(
+            s.contains(
+                "... and 7 more attempts at other targets (only the first 3 targets are listed)"
+            ),
+            "{s}"
+        );
+        let path = std::env::temp_dir().join(format!("nr-report-cap-{}.json", std::process::id()));
+        r.write_json(&path, &["x".into()], 0, true).unwrap();
+        let json = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            json.contains("\"not_listed\": {\"blocked_attempts\": 7, \"rewritten_attempts\": 0}"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn suppressed_attempts_alone_make_strict_fail_but_rewrites_do_not() {
+        // A full table: everything new is suppressed, yet it is a block.
+        let r = Report::with_limits(true, 0, 100);
+        assert!(!r.has_blocks());
+        r.record(Kind::Rewritten, "create", "forced offline", String::new);
+        assert!(!r.has_blocks(), "a suppressed rewrite is not a block");
+        r.record(Kind::Socket, "/var/run/docker.sock", "hidden", String::new);
+        assert!(
+            r.has_blocks(),
+            "a suppressed block must still fail --strict"
+        );
+        assert!(r.summary().is_some());
+    }
+
+    #[test]
+    fn live_lines_are_limited_per_second_and_the_skipped_ones_are_announced() {
+        let mut l = LiveLimiter::new(2);
+        let t0 = Instant::now();
+        assert!(matches!(l.allow(t0), Live::Print));
+        assert!(matches!(l.allow(t0), Live::Print));
+        assert!(matches!(l.allow(t0), Live::Skip));
+        assert!(matches!(
+            l.allow(t0 + Duration::from_millis(900)),
+            Live::Skip
+        ));
+        // The next second: the first line says how many were held back.
+        assert!(matches!(
+            l.allow(t0 + Duration::from_millis(1100)),
+            Live::PrintAfterSkipped(2)
+        ));
+        assert!(matches!(
+            l.allow(t0 + Duration::from_millis(1200)),
+            Live::Print
+        ));
+        assert!(matches!(
+            l.allow(t0 + Duration::from_millis(1300)),
+            Live::Skip
+        ));
+        assert_eq!(l.skipped_total, 3);
+    }
 
     #[test]
     fn counts_and_prints_once() {
@@ -356,7 +615,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("r.json");
         let r = Report::new(true);
-        let argv = ["true".to_string()];
+        let argv: [std::ffi::OsString; 1] = ["true".into()];
         r.write_json(&path, &argv, 0, false).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
