@@ -1,7 +1,8 @@
 /target
 
-# Rendered by `vhs demo/nullroute-demo.tape` (see demo/README.md)
-/demo/demo.gif
+# `vhs demo/nullroute-demo.tape` (see demo/README.md) renders demo/demo.gif and
+# demo/demo.mp4. The GIF is committed (README.md embeds it), so re-render and
+# commit it deliberately; the MP4 is a by-product and stays ignored.
 /demo/demo.mp4
 
 # OpenClaw agent workspace files

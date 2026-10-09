@@ -6,8 +6,9 @@
 #     vhs demo/nullroute-demo.tape
 #
 # - Output paths below are relative to the directory VHS is started in, so they
-#   assume the repo root. demo/demo.gif and demo/demo.mp4 are git-ignored build
-#   artifacts; do not commit them.
+#   assume the repo root. demo/demo.gif is committed (the README embeds it), so
+#   re-render and commit it deliberately; demo/demo.mp4 is a git-ignored build
+#   artifact.
 # - The hidden preamble (Hide ... Show) cd's into demo/ so the typed
 #   `python3 test_leak.py` resolves, and puts ./target/debug and ./target/release
 #   on PATH so the typed `nullroute` is the one built from this checkout (same

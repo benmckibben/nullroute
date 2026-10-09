@@ -219,9 +219,9 @@ CLI reconnects).
 | Code | When |
 |---|---|
 | `1` | `--strict` and something was blocked, though the command succeeded |
-| `2` | bad arguments, and nothing is run: unknown or invalid options (before or after `run`; the command must follow `--`), an `--allow`, `--resolve` or `--port` value that can't work, `--seal-docker-pulls` without a sealed socket, an unwritable `--report-json` |
+| `2` | bad arguments, and nothing is run: unknown or invalid options (before or after `run`; the command must follow `--`), an `--allow`, `--resolve` or `--port` value that can't work (or more than 64 of them), `--seal-docker-pulls` without a sealed socket, an unwritable `--report-json` |
 | `74` | the `--report-json` file couldn't be written after a run that would have exited 0 (a non-zero exit is kept) |
-| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused), socket hiding couldn't be prepared, or more than 64 `--port` values were given |
+| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused) or socket hiding couldn't be prepared |
 | `126` | the command was found but couldn't be executed (not executable, a directory, ...) |
 | `127` | the command was not found |
 

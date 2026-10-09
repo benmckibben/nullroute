@@ -135,6 +135,33 @@ fn invalid_ports_are_rejected_before_running() {
 }
 
 #[test]
+fn too_many_ports_is_a_usage_error() {
+    let many = (1..=65)
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let o = Command::new(env!("CARGO_BIN_EXE_nullroute"))
+            .args(["run", "--port", &many])
+            .args(extra)
+            .args(["--", "true"])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{extra:?}: {o:?}");
+        assert!(String::from_utf8_lossy(&o.stderr).contains("at most 64 --port values"));
+    }
+    let ok = (1..=64)
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let o = Command::new(env!("CARGO_BIN_EXE_nullroute"))
+        .args(["run", "--dry-run", "--port", &ok, "--", "true"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+}
+
+#[test]
 fn comma_separated_and_repeated_ports_both_work() {
     let (a, b) = (echo_server(), echo_server());
     let script = format!("{}\n{}", ping("127.0.0.1", a), ping("127.0.0.1", b));
