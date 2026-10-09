@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-No release has been made yet. The first release will be 0.1.0 and will contain
-everything listed here. (The name `nullroute` on crates.io currently holds only
-an empty 0.0.0 placeholder, which is not this program.)
+## [0.1.0] - 2026-10-09
+
+The first release.
 
 ### Added
 
@@ -240,4 +240,5 @@ Hardening that the first release ships with:
   only starts sealed containers.
 - musl targets build (the `ioctl` request type differs from glibc).
 
-[Unreleased]: https://github.com/benmckibben/nullroute/commits/master
+[Unreleased]: https://github.com/benmckibben/nullroute/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/benmckibben/nullroute/releases/tag/v0.1.0
