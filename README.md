@@ -104,12 +104,21 @@ Other details:
 
 ### Clients that ignore proxy variables: the DNS sinkhole
 
+**Without `--allow`.** The resolver still runs: it answers every name with
+`NXDOMAIN` ("Name or service not known") and records the lookup as a `dns` block
+(see [the report](#what-got-blocked-the-report-and---strict)), so a plain
+`nullroute run --strict` catches a test that looks a name up and swallows the
+error. A lookup also fails the same way with and without `--allow`: an answer
+that is final, not the retryable "Temporary failure in name resolution" that a
+resolver with no route gives, which clients such as musl's sit out for seconds.
+
 ```bash
 nullroute run --allow db.staging.example.com:5432 -- psql -h db.staging.example.com
 nullroute run --allow api.github.com -- ./my-static-binary   # ports 80 and 443
 ```
 
-With `--allow`, the sandbox also gets its own resolver:
+Every sandbox gets its own resolver, and with `--allow` host names it becomes a
+sinkhole that maps those names:
 
 1. **Resolver.** nullroute answers DNS on `127.0.0.1:53` (UDP and TCP) inside the
    sandbox, and bind-mounts a generated `/etc/resolv.conf` (`nameserver 127.0.0.1`)
@@ -126,6 +135,7 @@ With `--allow`, the sandbox also gets its own resolver:
    assigned on first lookup and recycled least-recently-resolved first (TTL 30s).
    **Any other name gets `NXDOMAIN`** and is recorded in the report as `dns`.
    `AAAA` queries for allowed names get an empty answer, so clients use IPv4.
+   (`localhost` and `*.localhost` resolve to loopback and aren't reported.)
 3. **Transparent relay.** nullroute listens on each synthetic address on the
    ports that name is allowed on: the `:port` from `--allow`, or **80 and 443**
    when none is given. A connection to `127.77.0.x:PORT` is mapped back to its
@@ -136,7 +146,7 @@ With `--allow`, the sandbox also gets its own resolver:
 | Flag | Effect |
 |---|---|
 | `--resolve HOST:IP` | Dial an allowed host at `IP` instead of resolving it on the host, like curl's `--resolve` (repeatable; applies to the proxy too). The host must be allowed; loopback IPs are still refused. |
-| `--no-dns` | Don't run the sinkhole: names don't resolve inside, only proxy-aware clients reach allowed hosts. |
+| `--no-dns` | Don't run the resolver or the sinkhole: names don't resolve inside (the host's `resolv.conf` has no route out, so lookups typically fail with "Temporary failure in name resolution"), only proxy-aware clients reach allowed hosts, and DNS lookups are not recorded, so `--strict` can't see them. |
 
 ```text
 $ nullroute run --allow api.github.com -- python3 -c "import socket; socket.create_connection(('example.com', 443))"
@@ -157,10 +167,13 @@ Limits (all fail closed):
 - An allowed name that has no port and isn't HTTP(S) needs `--allow host:port`.
 - A client with a hard-coded resolver (`dig @8.8.8.8`, DNS-over-HTTPS) bypasses
   `resolv.conf`; it gets "network unreachable" instead of an answer.
-- `--port 53` clashes with the resolver; add `--no-dns` to bridge it.
-- nullroute adds `127.77.0.1/24` to the sandbox's `lo`: routing doesn't need
-  it, but glibc's `AI_ADDRCONFIG` ignores lookups for IPv4 when the only IPv4
-  address is `127.0.0.1`.
+- With `--allow` host names, `--port 53` clashes with the resolver; add
+  `--no-dns` to bridge it. Without them, `--port 53` bridges as asked and the
+  resolver steps aside (lookups are then not recorded).
+- nullroute adds `127.77.0.1/24` to the sandbox's `lo` (in every sandbox that
+  has the resolver): routing doesn't need it, but glibc's `AI_ADDRCONFIG`
+  ignores lookups for IPv4 when the only IPv4 address is `127.0.0.1`, which
+  would hide those lookups from the report.
 
 ## What got blocked: the report and `--strict`
 
@@ -197,7 +210,7 @@ CLI reconnects).
 
 | Flag | Effect |
 |---|---|
-| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors. A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
+| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors, as long as the attempt reaches nullroute: DNS lookups (with or without `--allow`), proxy requests and hidden sockets do; a connection straight to an IP address does not (see below). A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
 | `-q`, `--quiet` | Skip the live lines; keep the summary. |
 | `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
 
@@ -230,9 +243,13 @@ the command isn't known to use them. (Like Docker: `125` for "the runner failed"
 contained command that couldn't be invoked or found. Usage errors are `2`, as
 for most CLIs.)
 
-Not listed: a direct connection to an IP address fails inside the kernel
-("network unreachable") without reaching nullroute. Proxy requests, DNS lookups
-and hidden sockets are listed.
+**What `--strict` can't see.** A direct connection to an IP address (`connect()` to
+`93.184.216.34:443`, no name lookup) fails inside the kernel with "network
+unreachable" (`ENETUNREACH`), because the sandbox has only a loopback. Nothing
+reaches nullroute, so there is nothing to record: `--strict` can't tell that
+such a command tried, and it passes if the command swallows the error. Proxy
+requests, DNS lookups and hidden sockets are listed. A program that talks to
+hard-coded IP addresses is only caught by its own failure.
 
 **Signals and process lifetime.** Ctrl-C reaches the command as usual; nullroute
 itself ignores SIGINT/SIGQUIT so it can still print the report, then exits with
@@ -280,15 +297,15 @@ nullroute: inspect: sandbox topology
 
 | Line | Meaning |
 |---|---|
-| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden, sealed or masked, or the DNS sinkhole is on. |
-| `loopback` | The sandbox's own `lo`, brought up before the command runs (plus the synthetic pool address with the DNS sinkhole). |
+| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden, sealed or masked, or the resolver has a `resolv.conf` to put in place (almost always). |
+| `loopback` | The sandbox's own `lo`, brought up before the command runs (plus the resolver's synthetic pool address, `127.77.0.1/24`, unless `--no-dns`). |
 | `bridged ports` | `--port` values (sorted, deduplicated), or `none`. |
 | `blocked (403 decoy)` | Sockets replaced by a decoy that answers `403` (defaults + `--hide-socket`, minus `--allow-socket`). |
 | `sealed (--seal-docker proxy)` | Docker sockets proxied with containers forced to `NetworkMode=none`. |
 | `docker pulls` | The `--seal-docker-pulls` mode (only shown when a socket is sealed). `--dry-run` prints it too. |
 | `masked (resolver bypass)` | Local resolver sockets (systemd-resolved varlink, nscd) replaced by an unconnectable file, always. |
 | `upstream proxy` | Where the `--allow` proxy listens inside the sandbox, and the allowed hosts, or `none`. |
-| `dns sinkhole` | The resolver address and each allowed name's synthetic address and relayed ports, or `none` (no `--allow` host names, or `--no-dns`). |
+| `dns sinkhole` / `dns resolver` | The resolver address and each allowed name's synthetic address and relayed ports (`dns sinkhole`); `dns resolver` when there are no allowed names and it only refuses and records every lookup; `none` with `--no-dns` (or `--port 53` and no allowed names). |
 
 The summary is built from the same plan the sandbox is built from, so it shows
 exactly what will be set up. Combine with `--dry-run` to print it and exit

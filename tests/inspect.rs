@@ -145,15 +145,27 @@ fn base_topology_has_user_and_net_namespaces_and_loopback() {
     let ns = field(&e, "namespaces");
     let ns: Vec<&str> = ns.split(", ").collect();
     assert_eq!(&ns[..2], ["user", "net"], "{e}");
-    assert_eq!(field(&e, "loopback"), "lo: UP (127.0.0.1, ::1)");
+    // The resolver's pool address is on lo in every sandbox.
+    assert_eq!(
+        field(&e, "loopback"),
+        "lo: UP (127.0.0.1, ::1, 127.77.0.1/24)"
+    );
     assert_eq!(field(&e, "bridged ports"), "none");
     assert_eq!(field(&e, "upstream proxy"), "none");
     // The mount namespace is there exactly when some socket is hidden, sealed
-    // or masked.
-    let any_sockets = !section(&e, "blocked").is_empty()
+    // or masked, or the resolver has a resolv.conf to mount.
+    let any_mounts = !section(&e, "blocked").is_empty()
         || !section(&e, "sealed").is_empty()
-        || !section(&e, "masked").is_empty();
-    assert_eq!(ns.contains(&"mount"), any_sockets, "{e}");
+        || !section(&e, "masked").is_empty()
+        || std::fs::canonicalize("/etc/resolv.conf").is_ok();
+    assert_eq!(ns.contains(&"mount"), any_mounts, "{e}");
+
+    // Without the resolver (--no-dns) the loopback is just lo's own addresses.
+    let e = err(&nr(
+        &["--inspect", "--dry-run", "--no-dns", "--", "true"],
+        &t.0,
+    ));
+    assert_eq!(field(&e, "loopback"), "lo: UP (127.0.0.1, ::1)");
 }
 
 #[test]

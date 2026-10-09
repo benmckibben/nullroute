@@ -38,6 +38,15 @@ will contain.
   `--strict` (fail if anything was blocked), `--quiet`, and `--report-json FILE`
   (including a separate `rewritten` list for requests `--seal-docker` changed
   and let through).
+- DNS lookups are recorded in every run, with or without `--allow`: the
+  sandbox's resolver answers `NXDOMAIN` for any name that isn't allowed, so
+  `--strict` catches a command that looks a name up and swallows the error. A
+  lookup fails with "Name or service not known" (final) instead of "Temporary
+  failure in name resolution" (retryable; musl's resolver sat out 5 s per
+  lookup). `localhost` still resolves. `--no-dns` turns the resolver off, and
+  `--port 53` without allowed names still bridges port 53. `--strict` and the
+  report can't see a connection straight to an IP address (it fails in the
+  kernel with `ENETUNREACH`); the README says so.
 - `--dry-run` and `--inspect`: show what would be hidden, bridged, allowed and
   sealed, and the sandbox topology.
 - Linux builds for x86_64 and aarch64, glibc and musl (static) targets. Other

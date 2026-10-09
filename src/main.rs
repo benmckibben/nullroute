@@ -113,14 +113,19 @@ enum Cmd {
         #[arg(long = "resolve", value_name = "HOST:IP")]
         resolve: Vec<String>,
 
-        /// Don't run the DNS sinkhole for --allow: names don't resolve inside
-        /// and only proxy-aware clients can reach allowed hosts.
+        /// Don't run the DNS resolver/sinkhole: names don't resolve inside, only
+        /// proxy-aware clients can reach allowed hosts, and DNS lookups are not
+        /// recorded (so --strict can't see them). Also frees port 53 for --port.
         #[arg(long = "no-dns")]
         no_dns: bool,
 
         /// Fail (exit 1) if anything was blocked, even if the command succeeded.
         /// A command that already failed keeps its own exit code. Requests
         /// --seal-docker rewrote and let through don't count.
+        ///
+        /// Sees DNS lookups (with or without --allow), proxy requests and hidden
+        /// sockets. It can't see a connection straight to an IP address: that
+        /// fails inside the kernel (ENETUNREACH) without reaching nullroute.
         #[arg(long)]
         strict: bool,
 
@@ -193,11 +198,16 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            // The resolver is always on (it records lookups for --strict and
+            // makes them fail for good); only --no-dns, or --port 53 without
+            // allowed names to map, leaves port 53 alone.
             let dns_plan = if no_dns {
                 None
             } else {
                 match dns::Plan::new(&allowlist) {
-                    Ok(p) => p,
+                    Ok(Some(p)) => Some(p),
+                    Ok(None) if ports.contains(&dns::PORT) => None,
+                    Ok(None) => Some(dns::Plan::resolver_only()),
                     Err(e) => {
                         eprintln!("nullroute: {e}");
                         return ExitCode::from(2);
@@ -294,11 +304,18 @@ fn main() -> ExitCode {
                 if !allowlist.is_empty() {
                     println!("proxy: http://127.0.0.1:{}", proxy::pick_port(&ports));
                 }
-                if let Some(d) = &dns_plan {
-                    println!("dns sinkhole: 127.0.0.1:{}", dns::PORT);
-                    for l in d.describe() {
-                        println!("synthetic address: {l}");
+                match &dns_plan {
+                    Some(d) if d.has_names() => {
+                        println!("dns sinkhole: 127.0.0.1:{}", dns::PORT);
+                        for l in d.describe() {
+                            println!("synthetic address: {l}");
+                        }
                     }
+                    Some(_) => println!(
+                        "dns resolver: 127.0.0.1:{} (every lookup is refused and recorded)",
+                        dns::PORT
+                    ),
+                    None => {}
                 }
                 return ExitCode::SUCCESS;
             }

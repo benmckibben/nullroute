@@ -29,7 +29,7 @@ done
 CI (the `examples` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)) builds nullroute and runs examples **01** and **03**, plus `shellcheck` over all example and demo scripts. It runs them with `NULLROUTE_EXAMPLES_OFFLINE=1`, so nothing depends on the public internet:
 
 - `NULLROUTE_EXAMPLES_OFFLINE=1` makes every step that needs live connectivity (calls to example.com / example.org, `curl` connectivity probes) print `skipping ...: ... (offline mode, NOT VERIFIED)` and carry on. Everything that does not need upstream (sealed runs, `--report-json`, `--strict`, `--port`, sinkhole/proxy denials) still runs and asserts. Unset (the default) the scripts behave as before and use the internet when it is reachable.
-- Each of 01, 03 (and 02, 04) ends with a summary line, e.g. `examples: 01-python-test-leak: 3 assertions run, 2 skipped (offline mode)`. CI greps for the exact line, so an assertion that gets skipped by accident fails the job instead of passing silently. Expected: 01 runs 3 assertions and skips 2 (steps 1 and 5); 03 runs 4 and skips 0. If you add or remove an assertion, update the counts in the workflow.
+- Each of 01, 03 (and 02, 04) ends with a summary line, e.g. `examples: 01-python-test-leak: 4 assertions run, 2 skipped (offline mode)`. CI greps for the exact line, so an assertion that gets skipped by accident fails the job instead of passing silently. Expected: 01 runs 4 assertions and skips 2 (steps 1 and 5); 03 runs 4 and skips 0. If you add or remove an assertion, update the counts in the workflow.
 - 02 (needs Node, and its only offline-safe check is a sealed run) and 04 (almost entirely about live allowed hosts) are not part of the CI job; run them locally.
 
 To reproduce the CI run locally (after `cargo build`):

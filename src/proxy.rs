@@ -197,7 +197,7 @@ impl Allowlist {
 /// Names that mean "this machine" (glibc/systemd resolve them to loopback
 /// without asking DNS): `localhost`, `*.localhost` (RFC 6761),
 /// `localhost.localdomain` and the Debian `ip6-` aliases.
-fn is_localhost_name(h: &str) -> bool {
+pub(crate) fn is_localhost_name(h: &str) -> bool {
     let h = h.trim_start_matches("*.");
     h == "localhost"
         || h.ends_with(".localhost")
