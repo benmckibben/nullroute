@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing has been released yet. This section lists everything the first release
-will contain.
+No release has been made yet. The first release will be 0.1.0 and will contain
+everything listed here. (The name `nullroute` on crates.io currently holds only
+an empty 0.0.0 placeholder, which is not this program.)
 
 ### Added
 
@@ -18,6 +19,12 @@ will contain.
   `127` if the command isn't found, `126` if it can't be executed). The command
   must follow `--`; an unknown option before it is a usage error (exit 2).
   `--dry-run | head` ends quietly by SIGPIPE instead of panicking.
+- The command doesn't outlive nullroute: it gets SIGKILL when nullroute dies
+  (`PR_SET_PDEATHSIG`), and whatever it leaves running when it exits (background
+  jobs, daemons, even `setsid` ones) is killed before nullroute exits.
+  SIGTERM, SIGHUP, SIGINT and SIGQUIT sent to nullroute are passed on to the
+  command, including ones that arrive while the command is starting (it starts
+  with the signal mask it would normally have).
 - `--port`: bridge chosen ports of the host's localhost into the sandbox
   (TCP, IPv4 and IPv6). At most 64; more is a usage error (exit 2).
 - `--allow`: let chosen hosts through (`host`, `*.domain`, IP literals, optional
@@ -43,7 +50,10 @@ will contain.
 - Report of everything that was blocked, printed live and as a summary;
   `--strict` (fail if anything was blocked), `--quiet`, and `--report-json FILE`
   (including a separate `rewritten` list for requests `--seal-docker` changed
-  and let through). The file starts with `"schema_version": 1` and its layout
+  and let through; those don't count as blocks, so `--strict --seal-docker`
+  passes when the command only starts sealed containers). The report file is
+  checked before the command runs (exit `2` if it can't be written); a write
+  failure at the end of an otherwise successful run exits `74`. The file starts with `"schema_version": 1` and its layout
   is documented in `docs/report-json.md` and pinned by golden-file tests.
 - DNS lookups are recorded in every run, with or without `--allow`: the
   sandbox's resolver answers `NXDOMAIN` for any name that isn't allowed, so
@@ -75,51 +85,30 @@ will contain.
 
 ### Security
 
-Findings from a security review of the first version, all fixed before release:
+Hardening that the first release ships with:
 
-- S1: the system D-Bus socket is hidden by default (it let a sandboxed command
+- The system D-Bus socket is hidden by default (it would let a sandboxed command
   resolve names on the host through systemd-resolved).
   `--allow-socket /run/dbus/system_bus_socket` opts back in.
-- S2: systemd-resolved's varlink socket and nscd are masked in every sandbox,
-  not only with `--allow`, so name resolution can't bypass the sandbox.
-- `--seal-docker`: the connection is no longer switched to an unparsed raw relay
-  just because a request path looked like attach/exec; a probe followed by a
-  `NetworkMode=host` container create on the same connection used to get a
-  host-networked container. Only a genuine `101 Switching Protocols` (or the
-  daemon's raw stream for attach/exec start) starts a relay. Container-create
-  bodies that aren't a single JSON object, chunked bodies and duplicate
-  `Content-Length` headers are refused, and JSON keys are matched the way
-  Docker's decoder matches them.
-- S4: `--seal-docker` now also seals classic `docker build` (`networkmode=none`)
-  and refuses what can't be sealed: BuildKit/buildx builds (`/build?version=2`,
+- systemd-resolved's varlink socket and nscd are masked in every sandbox, not
+  only with `--allow`, so name resolution can't bypass the sandbox.
+- `--seal-docker` only switches a connection to a raw relay on a genuine
+  `101 Switching Protocols` (or the daemon's raw stream for attach/exec start),
+  never because a request path looks like attach/exec, so a probe followed by a
+  `NetworkMode=host` container create on the same connection can't get a
+  host-networked container. Container-create bodies that aren't a single JSON
+  object, chunked bodies and duplicate `Content-Length` headers are refused, and
+  JSON keys are matched the way Docker's decoder matches them.
+- `--seal-docker` also seals classic `docker build` (`networkmode=none`) and
+  refuses what can't be sealed: BuildKit/buildx builds (`/build?version=2`,
   `/grpc`, `/session`; the "BuildKit gap"), `/networks/{id}/connect`, Swarm
-  services and `swarm init/join`, and plugin install/enable/upgrade. Request paths
-  are matched after percent-decoding and dot/slash cleaning, and ambiguous ones
-  are refused.
-- S5: the `--allow` proxy and the DNS sinkhole refuse link-local addresses
+  services and `swarm init/join`, and plugin install/enable/upgrade. Request
+  paths are matched after percent-decoding and dot/slash cleaning, and ambiguous
+  ones are refused.
+- The `--allow` proxy and the DNS sinkhole refuse link-local addresses
   (including the `169.254.169.254` cloud metadata service), other known metadata
   endpoints, `0.0.0.0/8` and IPv6 forms that wrap a forbidden IPv4 address.
   `--allow` entries that can never work (`localhost`, loopback and link-local
   IPs) are rejected at startup.
-
-### Fixed
-
-- The command no longer outlives nullroute: it gets SIGKILL when nullroute dies
-  (`PR_SET_PDEATHSIG`), and whatever it leaves running when it exits (background
-  jobs, daemons, even `setsid` ones) is killed before nullroute exits.
-- SIGTERM, SIGHUP, SIGINT and SIGQUIT that arrive while the command is starting
-  are no longer lost or fatal to nullroute; the command starts with the signal
-  mask it would normally have. A SIGINT/SIGQUIT that reaches nullroute before
-  the command exists (Ctrl-C right after launch, sent to the process group) is
-  passed on to it instead of being dropped, so it stops the command before it
-  runs; it used to be swallowed, and the command then ran with nullroute
-  waiting for it.
-- `--report-json` is checked before the command runs (exit `2` if it can't be
-  written); a write failure at the end of an otherwise successful run now exits
-  `74` instead of `0`.
-- `--seal-docker` rewrites (forced `NetworkMode=none`, sealed classic builds)
-  no longer count as blocks, so `--strict --seal-docker` passes when the command
-  only starts sealed containers.
-- musl targets build (the `ioctl` request type differs from glibc).
 
 [Unreleased]: https://github.com/benmckibben/nullroute/commits/master
