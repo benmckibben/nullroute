@@ -14,7 +14,10 @@ will contain.
 
 - `nullroute run [OPTIONS] -- COMMAND`: run a command in a new user and network
   namespace that has only its own loopback. No root needed; the command's exit
-  code is passed through (`128+N` for signals, `125` if nullroute itself fails).
+  code is passed through (`128+N` for signals, `125` if nullroute itself fails,
+  `127` if the command isn't found, `126` if it can't be executed). The command
+  must follow `--`; an unknown option before it is a usage error (exit 2).
+  `--dry-run | head` ends quietly by SIGPIPE instead of panicking.
 - `--port`: bridge chosen ports of the host's localhost into the sandbox
   (TCP, IPv4 and IPv6).
 - `--allow`: let chosen hosts through (`host`, `*.domain`, IP literals, optional

@@ -219,13 +219,16 @@ CLI reconnects).
 | Code | When |
 |---|---|
 | `1` | `--strict` and something was blocked, though the command succeeded |
-| `2` | bad arguments, and nothing is run: unknown or invalid options, an `--allow`, `--resolve` or `--port` value that can't work, `--seal-docker-pulls` without a sealed socket, an unwritable `--report-json` |
+| `2` | bad arguments, and nothing is run: unknown or invalid options (before or after `run`; the command must follow `--`), an `--allow`, `--resolve` or `--port` value that can't work, `--seal-docker-pulls` without a sealed socket, an unwritable `--report-json` |
 | `74` | the `--report-json` file couldn't be written after a run that would have exited 0 (a non-zero exit is kept) |
-| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused), the command couldn't be started (not found, not executable), socket hiding couldn't be prepared, or more than 64 `--port` values were given |
+| `125` | nullroute itself failed: the sandbox couldn't be set up (e.g. namespaces refused), socket hiding couldn't be prepared, or more than 64 `--port` values were given |
+| `126` | the command was found but couldn't be executed (not executable, a directory, ...) |
+| `127` | the command was not found |
 
 The command can exit with any of these itself, so they only mean something when
-the command isn't known to use them. (`125` is what Docker and Podman use for
-"the runner failed".)
+the command isn't known to use them. (Like Docker: `125` for "the runner failed", `126` and `127` for the
+contained command that couldn't be invoked or found. Usage errors are `2`, as
+for most CLIs.)
 
 Not listed: a direct connection to an IP address fails inside the kernel
 ("network unreachable") without reaching nullroute. Proxy requests, DNS lookups
@@ -498,7 +501,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Hermetic mode (no network but the sandbox's own loopback) | ✅ |
 | No root needed | ✅ (unprivileged user namespaces) |
 | Runs as you, not as root inside | ✅ |
-| Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails) |
+| Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails, `127`/`126` if the command isn't found/executable) |
 | Reach chosen services on the host's localhost (`--port`) | ✅ TCP, IPv4 + IPv6 |
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
 | Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes and the system D-Bus |

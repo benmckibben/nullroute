@@ -136,38 +136,48 @@ pub fn run_hermetic(
     // which is what pre_exec requires.
     unsafe {
         cmd.pre_exec(move || {
-            // First, so the child can't outlive nullroute even during setup.
-            lifecycle::die_with_parent(parent)?;
-            // Opened now, read at the end: the namespace changes below may
-            // change what the child can open (signals.rs).
-            let parent_status = child_mask.open_parent_status()?;
-            if libc::unshare(flags) != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // An unprivileged process must deny setgroups before writing gid_map.
-            write_file(&paths.0, b"deny")?;
-            write_file(&paths.1, uid_map.as_bytes())?;
-            write_file(&paths.2, gid_map.as_bytes())?;
-            if let Some(m) = mounts.as_ref() {
-                hide::apply_in_child(m)?;
-            }
-            loopback_up()?;
-            if pool_address {
-                dns::add_pool_address()?;
-            }
-            if let Some(c) = child_side.as_mut() {
-                c.listen_and_send()?;
-            }
-            // Re-arm after the user-namespace credential change (lifecycle.rs).
-            lifecycle::die_with_parent(parent)?;
-            // Last: unblock, so nothing is delivered before setup is done. A
-            // SIGINT/SIGQUIT that reached only nullroute is passed on here.
-            child_mask.restore(parent_status)?;
-            Ok(())
+            let mut setup = || -> io::Result<()> {
+                // First, so the child can't outlive nullroute even during setup.
+                lifecycle::die_with_parent(parent)?;
+                // Opened now, read at the end: the namespace changes below may
+                // change what the child can open (signals.rs).
+                let parent_status = child_mask.open_parent_status()?;
+                if libc::unshare(flags) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                // An unprivileged process must deny setgroups before writing gid_map.
+                write_file(&paths.0, b"deny")?;
+                write_file(&paths.1, uid_map.as_bytes())?;
+                write_file(&paths.2, gid_map.as_bytes())?;
+                if let Some(m) = mounts.as_ref() {
+                    hide::apply_in_child(m)?;
+                }
+                loopback_up()?;
+                if pool_address {
+                    dns::add_pool_address()?;
+                }
+                if let Some(c) = child_side.as_mut() {
+                    c.listen_and_send()?;
+                }
+                // Re-arm after the user-namespace credential change (lifecycle.rs).
+                lifecycle::die_with_parent(parent)?;
+                // Last: unblock, so nothing is delivered before setup is done. A
+                // SIGINT/SIGQUIT that reached only nullroute is passed on here.
+                child_mask.restore(parent_status)?;
+                Ok(())
+            };
+            // Tag setup failures so they can be told apart from exec failures
+            // (ENOENT/EACCES from the command itself). from_raw_os_error does
+            // not allocate, so this stays async-signal-safe.
+            setup().map_err(|e| {
+                io::Error::from_raw_os_error(
+                    e.raw_os_error().unwrap_or(libc::EIO) | SETUP_ERROR_TAG,
+                )
+            })
         });
     }
 
-    let spawned = cmd.spawn().map_err(explain_spawn_error);
+    let spawned = cmd.spawn().map_err(classify_spawn_error);
     // Dropping cmd drops the pre_exec closure and with it the parent's copy of
     // the child's socket end.
     drop(cmd);
@@ -300,6 +310,50 @@ fn loopback_up() -> io::Result<()> {
         libc::close(sock);
         result
     }
+}
+
+/// Set on the errno of a failure inside the forked child's setup (pre_exec),
+/// so it can be told apart from the exec of the command itself failing.
+const SETUP_ERROR_TAG: i32 = 1 << 24;
+
+/// The command itself could not be started: not found (127) or not
+/// executable (126), the codes shells and `docker run` use. Carried inside the
+/// `io::Error` returned by `run_hermetic`; see [`command_exit_code`].
+#[derive(Debug)]
+struct CommandNotStarted {
+    code: u8,
+    source: io::Error,
+}
+
+impl std::fmt::Display for CommandNotStarted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.source)
+    }
+}
+
+impl std::error::Error for CommandNotStarted {}
+
+/// 127 or 126 if `e` says the command could not be found or executed, else None.
+pub fn command_exit_code(e: &io::Error) -> Option<u8> {
+    e.get_ref()?
+        .downcast_ref::<CommandNotStarted>()
+        .map(|c| c.code)
+}
+
+fn classify_spawn_error(e: io::Error) -> io::Error {
+    let Some(errno) = e.raw_os_error() else {
+        return e;
+    };
+    if errno & SETUP_ERROR_TAG != 0 {
+        return explain_spawn_error(io::Error::from_raw_os_error(errno & !SETUP_ERROR_TAG));
+    }
+    let code = match errno {
+        libc::ENOENT | libc::ENOTDIR => 127,
+        libc::EACCES | libc::ENOEXEC | libc::EISDIR | libc::ETXTBSY | libc::ELOOP => 126,
+        // fork/pipe failures and the like: nullroute's problem, not the command's.
+        _ => return e,
+    };
+    io::Error::new(e.kind(), CommandNotStarted { code, source: e })
 }
 
 /// Turn the common "namespaces are disabled" failure into an actionable message.

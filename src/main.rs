@@ -142,7 +142,7 @@ enum Cmd {
         inspect: bool,
 
         /// The command and its arguments (put them after --).
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        #[arg(required = true, last = true)]
         argv: Vec<String>,
     },
 }
@@ -258,6 +258,13 @@ fn main() -> ExitCode {
                 );
             }
             if dry_run {
+                // Rust ignores SIGPIPE, so a reader that exits early (| head)
+                // would turn println! into a panic (101). Die by the signal
+                // instead, like ls does.
+                // SAFETY: restoring the default disposition has no preconditions.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                }
                 match &plan {
                     None => println!("hidden sockets: none"),
                     Some(p) => {
@@ -340,9 +347,10 @@ fn run(
         Ok(s) => s,
         Err(e) => {
             eprintln!("nullroute: failed to run {:?}: {e}", argv[0]);
-            // 125 is what docker/podman use for "the runner failed", as
-            // opposed to the command; keeps the two distinguishable.
-            return ExitCode::from(125);
+            // Like docker run and shells: 127 = command not found, 126 = found
+            // but not executable. Otherwise 125, "the runner failed", as opposed
+            // to the command; keeps the two distinguishable.
+            return ExitCode::from(sandbox::command_exit_code(&e).unwrap_or(125));
         }
     };
     // Mirror the child's exit status so nullroute is transparent in CI.
