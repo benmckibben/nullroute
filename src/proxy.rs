@@ -36,8 +36,8 @@ use std::net::{
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 
+use crate::limits;
 use crate::report::{Kind, Report};
-use std::thread;
 use std::time::Duration;
 
 /// Default port for the proxy inside the sandbox (the conventional proxy port).
@@ -315,11 +315,17 @@ impl Proxy {
         // SAFETY: fd is a listening TCP socket received from the child; we own it.
         let listener = unsafe { TcpListener::from_raw_fd(fd) };
         let me = self.clone();
-        thread::spawn(move || {
-            for conn in listener.incoming().flatten() {
-                let me = me.clone();
-                thread::spawn(move || me.handle(conn));
-            }
+        let limit = limits::Limiter::new(limits::max_connections(limits::MAX_CONNECTIONS));
+        limits::spawn_service(move || {
+            limits::accept_loop(
+                || listener.accept().map(|(c, _)| c),
+                |conn| {
+                    let me = me.clone();
+                    if let Some(permit) = limit.try_acquire() {
+                        limits::spawn_conn(permit, move || me.handle(conn));
+                    }
+                },
+            );
         });
     }
 
@@ -560,10 +566,7 @@ impl Forbidden {
 pub(crate) fn dial(host: &str, port: u16, overrides: &Overrides) -> Result<TcpStream, DialError> {
     let addrs: Vec<SocketAddr> = match overrides.get(&Allowlist::norm(host)) {
         Some(&ip) => vec![SocketAddr::new(ip, port)],
-        None => (host, port)
-            .to_socket_addrs()
-            .map_err(DialError::Io)?
-            .collect(),
+        None => resolve_bounded(host, port).map_err(DialError::Io)?,
     };
     if addrs.is_empty() {
         return Err(DialError::Io(io::Error::new(
@@ -581,7 +584,28 @@ pub(crate) fn dial(host: &str, port: u16, overrides: &Overrides) -> Result<TcpSt
             Err(e) => last = Some(e),
         }
     }
-    Err(DialError::Io(last.unwrap()))
+    Err(DialError::Io(last.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no addresses")
+    })))
+}
+
+/// How long a name lookup for the command may take. getaddrinfo has no
+/// timeout of its own beyond the resolver's (retries across every nameserver
+/// in resolv.conf can add up to minutes), and a command that hangs on a dead
+/// resolver would otherwise hang with it.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Lookups that may be in flight (or stuck) at once.
+const MAX_LOOKUPS: usize = 32;
+
+/// getaddrinfo, bounded by RESOLVE_TIMEOUT and MAX_LOOKUPS.
+fn resolve_bounded(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    static LOOKUPS: std::sync::OnceLock<limits::Limiter> = std::sync::OnceLock::new();
+    let host = host.to_string();
+    limits::run_bounded(
+        LOOKUPS.get_or_init(|| limits::Limiter::new(MAX_LOOKUPS)),
+        RESOLVE_TIMEOUT,
+        move || Ok((host.as_str(), port).to_socket_addrs()?.collect()),
+    )
 }
 
 /// Is `ip` a destination nullroute must never dial for the command, and why?

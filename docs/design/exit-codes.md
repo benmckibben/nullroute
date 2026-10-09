@@ -64,7 +64,7 @@ Every row was produced by running the command.
 | 125 | command not found | `run -- /nonexistent/cmd` → `failed to run "/nonexistent/cmd": No such file or directory` | yes |
 | 125 | command not executable | `run -- /etc/passwd` → `failed to run "/etc/passwd": Permission denied (os error 13): could not create an unprivileged user namespace. On Ubuntu 23.10+ …` | yes, but the message is wrong |
 | 125 | unknown option **after** `run` (taken as the command) | `run --bogus -- true`, `run --strcit -- true`, `run -x -- true` → `failed to run "--bogus"…` | **README says 2** |
-| 125 | too many listeners (1024) | one `--allow` host with 1100 ports → `failed to run "true": too many listeners (1104 > 1024)`; `--dry-run` with the same flags → **0** | not documented; message says "failed to run" |
+| 125 | too many listeners (1024) | one `--allow` host with 1100 ports → `could not set up the sandbox: too many listeners (1104 > 1024)`; `--dry-run` with the same flags → now 125 too (it used to say 0) | not documented |
 | 125 | user namespaces refused (`EPERM`/`EACCES`/`ENOSPC` from spawn) | **[unverified]** here (this host allows them); same path as the `EACCES` row | yes |
 | 125 | `Sinkhole`/`hide` start or handover failed after the command started | **[reasoned]** (`h.start`, `parent.receive` in `run_hermetic`: the command is killed and the error reported as "failed to run") | yes (generic) |
 | 74 | `--report-json` could not be written at the end, command exit 0 | `run --report-json /dev/full -- true` | yes |

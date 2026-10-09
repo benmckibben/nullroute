@@ -30,23 +30,41 @@
 //! Only TCP is relayed; UDP to a synthetic address (QUIC, for example) gets
 //! nothing back.
 
+use crate::diag::diagln;
+use crate::limits::{self, Limiter};
+use crate::tmpdir::PrivateDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::forward::Spec;
 use crate::proxy::{self, Allowlist, DialError, Overrides, Pattern};
 use crate::report::{Kind, Report};
 
 /// Where the resolver listens inside the sandbox.
+/// A DNS-over-TCP connection may stay idle this long between messages...
+const TCP_IDLE: Duration = Duration::from_secs(10);
+/// ...must be over after this long in total...
+const TCP_TOTAL: Duration = Duration::from_secs(30);
+/// ...and carries at most this many queries.
+const TCP_MAX_MESSAGES: usize = 64;
+
+/// How long the next read on a DNS-over-TCP connection that has been open for
+/// `open_for` may wait; None once its total time is up.
+fn tcp_read_timeout(open_for: Duration) -> Option<Duration> {
+    TCP_TOTAL
+        .checked_sub(open_for)
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(TCP_IDLE))
+}
+
 pub const PORT: u16 = 53;
 /// First three octets of the synthetic address pool (127.77.0.1-254).
 const POOL_PREFIX: [u8; 3] = [127, 77, 0];
@@ -401,26 +419,38 @@ impl Sinkhole {
             Listener::Udp => {
                 // SAFETY: fd is a bound UDP socket from the sandbox; we own it.
                 let sock = unsafe { UdpSocket::from_raw_fd(fd) };
-                thread::spawn(move || me.serve_udp(sock));
+                limits::spawn_service(move || me.serve_udp(sock));
             }
             Listener::Tcp => {
                 // SAFETY: fd is a listening TCP socket from the sandbox; we own it.
                 let l = unsafe { TcpListener::from_raw_fd(fd) };
-                thread::spawn(move || {
-                    for c in l.incoming().flatten() {
-                        let me = me.clone();
-                        thread::spawn(move || me.serve_tcp(c));
-                    }
+                let limit = Limiter::new(limits::max_connections(limits::MAX_DNS_TCP_CONNECTIONS));
+                limits::spawn_service(move || {
+                    limits::accept_loop(
+                        || l.accept().map(|(c, _)| c),
+                        |c| {
+                            let me = me.clone();
+                            if let Some(permit) = limit.try_acquire() {
+                                limits::spawn_conn(permit, move || me.serve_tcp(c));
+                            }
+                        },
+                    );
                 });
             }
             Listener::Bridge(slot, port) => {
                 // SAFETY: as above.
                 let l = unsafe { TcpListener::from_raw_fd(fd) };
-                thread::spawn(move || {
-                    for c in l.incoming().flatten() {
-                        let me = me.clone();
-                        thread::spawn(move || me.bridge(c, slot, port));
-                    }
+                let limit = Limiter::new(limits::max_connections(limits::MAX_CONNECTIONS));
+                limits::spawn_service(move || {
+                    limits::accept_loop(
+                        || l.accept().map(|(c, _)| c),
+                        |c| {
+                            let me = me.clone();
+                            if let Some(permit) = limit.try_acquire() {
+                                limits::spawn_conn(permit, move || me.bridge(c, slot, port));
+                            }
+                        },
+                    );
                 });
             }
         }
@@ -440,8 +470,15 @@ impl Sinkhole {
 
     /// DNS over TCP: 2-byte length prefix per message, several per connection.
     fn serve_tcp(&self, mut c: TcpStream) {
-        let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        loop {
+        let started = Instant::now();
+        for _ in 0..TCP_MAX_MESSAGES {
+            // Each read gets a deadline, and so does the connection as a
+            // whole: a client that trickles a byte at a time or sends queries
+            // forever doesn't keep a thread for good.
+            let Some(timeout) = tcp_read_timeout(started.elapsed()) else {
+                return;
+            };
+            let _ = c.set_read_timeout(Some(timeout));
             let mut len = [0u8; 2];
             if c.read_exact(&mut len).is_err() {
                 return;
@@ -487,7 +524,7 @@ impl Sinkhole {
                     .map(|mut w| w.insert(target.clone()))
                     .unwrap_or(false);
                 if first {
-                    eprintln!("nullroute: could not reach {target}: {e}");
+                    diagln!("nullroute: could not reach {target}: {e}");
                 }
                 let _ = inner.shutdown(Shutdown::Both);
             }
@@ -555,7 +592,9 @@ pub fn add_pool_address() -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             if n < 20 || u16::from_ne_bytes([ack[4], ack[5]]) != NLMSG_ERROR {
-                return Err(io::Error::other("unexpected rtnetlink reply"));
+                // from_raw_os_error, not io::Error::other: this runs in the forked
+                // child, where nothing may allocate.
+                return Err(io::Error::from_raw_os_error(libc::EPROTO));
             }
             match i32::from_ne_bytes([ack[16], ack[17], ack[18], ack[19]]) {
                 0 => Ok(()),
@@ -715,9 +754,10 @@ fn existing(paths: &[&str]) -> Vec<PathBuf> {
 }
 
 /// The generated resolv.conf and the mask file, in a private temp dir, plus
-/// the bind mounts that put them in place. Removes the dir on drop.
+/// the bind mounts that put them in place. The dir goes away on drop, or
+/// earlier with [`Files::cleanup`].
 pub struct Files {
-    dir: PathBuf,
+    dir: PrivateDir,
     pub mounts: Vec<(CString, CString)>,
 }
 
@@ -730,27 +770,18 @@ impl Files {
     }
 
     fn create_for(resolv: Option<&Path>, bypass: &[&str]) -> io::Result<Files> {
-        let dir = std::env::temp_dir().join(format!(
-            "nullroute-dns-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let mut files = Files {
-            dir,
+            dir: PrivateDir::create("nullroute-dns")?,
             mounts: Vec::new(),
         };
-        let conf = files.dir.join("resolv.conf");
+        let conf = files.dir.path().join("resolv.conf");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o644)
             .open(&conf)?
             .write_all(RESOLV_CONF.as_bytes())?;
-        let mask = files.dir.join("masked");
+        let mask = files.dir.path().join("masked");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -769,12 +800,6 @@ impl Files {
     }
 }
 
-impl Drop for Files {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
 fn cstring(p: &Path) -> io::Result<CString> {
     CString::new(p.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
@@ -783,6 +808,18 @@ fn cstring(p: &Path) -> io::Result<CString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_reads_wait_at_most_the_idle_time_and_stop_at_the_total() {
+        assert_eq!(tcp_read_timeout(Duration::ZERO), Some(TCP_IDLE));
+        assert_eq!(tcp_read_timeout(Duration::from_secs(15)), Some(TCP_IDLE));
+        assert_eq!(
+            tcp_read_timeout(TCP_TOTAL - Duration::from_secs(3)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(tcp_read_timeout(TCP_TOTAL), None);
+        assert_eq!(tcp_read_timeout(TCP_TOTAL + Duration::from_secs(1)), None);
+    }
 
     fn allow(v: &[&str]) -> Allowlist {
         Allowlist::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
@@ -1018,9 +1055,14 @@ mod tests {
             "symlink followed"
         );
         assert!(f.mounts[1].1.to_str().unwrap().ends_with("resolve.sock"));
-        let dir = f.dir.clone();
+        let dir = f.dir.path().to_path_buf();
+        assert!(dir.exists());
+        f.dir.remove();
+        assert!(
+            !dir.exists(),
+            "removing the dir works while the Files lives on"
+        );
         drop(f);
-        assert!(!dir.exists());
 
         // Without the sinkhole (no --allow), resolv.conf is left alone but the
         // bypass sockets are still masked.

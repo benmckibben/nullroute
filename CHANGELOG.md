@@ -146,6 +146,59 @@ Findings from a security review of the first version, all fixed before release:
   passed on to it instead of being dropped, so it stops the command before it
   runs; it used to be swallowed, and the command then ran with nullroute
   waiting for it.
+- A closed or full stderr (a CI log pipe whose reader went away, `/dev/full`) no
+  longer changes the result of a run: nullroute's warnings, live "blocked" lines
+  and summary ignore write errors instead of panicking, so a command that exited
+  7 still exits 7 (it used to become 101, and a panic in a worker thread could
+  silently stop the DNS sinkhole or the proxy). `--dry-run` to a stdout that
+  can't be written (a full disk) fails with exit `74` and a message, not a panic.
+- SIGTERM and SIGHUP sent to a process group (`kill -TERM -PGID`, `timeout`) no
+  longer reach the command twice: the command is in the group and got the
+  signal itself, and nullroute used to forward a second copy as well. A signal
+  sent to nullroute's pid alone is still forwarded, exactly once. Signals are
+  now taken by a dedicated thread, and a helper process in nullroute's process
+  group tells group-directed signals from pid-directed ones. nullroute also no
+  longer signals the command's pid after the command has been reaped (a signal
+  arriving while it cleans up leftovers could have hit an unrelated process
+  that reused the pid).
+- nullroute's scratch directories (`nullroute-*` and `nullroute-dns-*` in the temp
+  dir, holding the decoy sockets and generated resolv.conf) used to pile up
+  when nullroute was killed (SIGKILL, the OOM killer) or crashed. Each one is
+  now locked while its nullroute runs, and the next run sweeps the ones that
+  are left (only directories of the current user, over a minute old, that no
+  running nullroute holds a lock on). `--dry-run` no longer creates them at
+  all.
+- nullroute no longer lets a command make it grow without bound: at most 256
+  connections are relayed at once per `--port` / proxy / DNS-bridge listener (64
+  for DNS over TCP, which also gets a 30 s lifetime and 64 queries per
+  connection, and 32 for socket decoys); one more is closed immediately instead
+  of getting a new thread (300 idle DNS-over-TCP connections used to mean 310
+  threads), a thread that can't be started drops the connection instead of
+  panicking the acceptor, and an accept error (e.g. out of descriptors)
+  backs off instead of spinning. Name lookups for the proxy and the DNS bridge
+  give up after 10 s instead of waiting for a dead resolver.
+- The breach report is bounded: at most 1000 distinct targets are listed, at
+  most 20 live "blocked ..." lines are printed per second, and the summary says
+  how many more attempts were counted but not listed ("... and N more
+  attempts at other targets"); `--report-json` gets a `not_listed` object with
+  the counts when that happens. Suppressed attempts still count as blocks, so
+  `--strict` still fails (a flood of 20000 generated names used to print 40000
+  lines, 2.5 MB).
+- nullroute raises its own soft file-descriptor limit to the hard limit while
+  it runs (the command still gets the soft limit it was started with), and
+  running out of descriptors is reported as that instead of "nothing
+  reachable on the host" for a `--port`.
+- `--dry-run` no longer says everything is fine for a configuration the real run
+  rejects: it applies the same listener and file-descriptor budget (32 pool
+  addresses x 40 ports used to pass a dry run and then fail with "too many
+  listeners", exit 125). New `--dry-run --check-sandbox` also checks that
+  namespaces can be created on this machine. A failure while setting up the
+  sandbox is now reported as "could not set up the sandbox: ..."; "failed to
+  run" is kept for the command itself not being found or executable.
+- Command arguments that aren't valid UTF-8 (file names are bytes on Linux) are
+  passed to the command intact instead of being rejected with exit 2 ("invalid
+  UTF-8 was detected in one or more arguments"). In the `--report-json` command
+  list such bytes appear as U+FFFD.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.

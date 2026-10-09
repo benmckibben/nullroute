@@ -245,7 +245,15 @@ and hidden sockets are listed.
 **Signals and process lifetime.** Ctrl-C reaches the command as usual; nullroute
 itself ignores SIGINT/SIGQUIT so it can still print the report, then exits with
 the command's status (130). SIGTERM and SIGHUP sent to nullroute are forwarded
-to the command, also when they arrive while the command is still starting. A
+to the command, also when they arrive while the command is still starting, and
+the command gets each exactly once: a signal sent to nullroute's pid
+(`kill -TERM PID`) is forwarded, while one sent to the whole process group
+(`kill -TERM -PGID`, `timeout`), which already reaches the command because it
+is in the group, is not forwarded again. (nullroute tells the two apart with a
+small helper process of its own in the group; if that can't be started, signals
+are forwarded unconditionally. A command that moved to another group always gets
+the forwarded copy.) The signal is also never sent to the command's pid once it
+has exited and been reaped. A
 SIGINT/SIGQUIT that reaches nullroute before the command exists (Ctrl-C right
 after you hit enter) is passed on to it as well: it stops the command before it
 runs, instead of vanishing while the command runs on. The command never outlives
@@ -259,6 +267,26 @@ signal only covers direct children), and a command that is itself a set-user-ID
 or file-capability binary (`ping` on many distros) survives too, because exec
 clears the setting. Send nullroute SIGTERM first (as `timeout` and CI runners
 do) so it can clean up.
+
+**Scratch files.** The decoy sockets and the generated resolver files are
+bind-mounted into the sandbox from a private directory in the temp dir
+(`nullroute-*`, `nullroute-dns-*`). It is removed when nullroute exits. If
+nullroute is killed (SIGKILL, the OOM killer) or crashes it can't clean up, and
+the directory is swept by the next run (only directories of the current user,
+over a minute old, that no running nullroute has locked). The files have to stay
+while the command runs: a nullroute started inside the sandbox mounts its own
+decoys over them. `--dry-run` (with or without `--inspect`) creates nothing.
+
+**Limits.** nullroute relays at most 256 connections at a time per
+`--port` / proxy / DNS-bridge listener (64 for DNS over TCP, 32 for socket
+decoys); one more is closed immediately. DNS-over-TCP connections last at most
+30 s, and name lookups for the proxy give up after 10 s. The report lists at
+most 1000 distinct targets and the terminal gets at most 20 live lines per
+second; the summary says how many more attempts were counted ("... and N more
+attempts at other targets"), they still make `--strict` fail, and
+`--report-json` gets a `not_listed` object with the counts. nullroute raises its
+own soft file-descriptor limit to the hard limit while it runs; the command
+gets the soft limit it was started with.
 
 ## Seeing the sandbox: `--inspect`
 
@@ -339,7 +367,8 @@ sandbox. So, also by default:
 |---|---|
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). Any path to the socket works (symlinks are followed); `--dry-run` shows what is hidden. |
 | `--hide-socket PATH` | Hide another socket too, e.g. an X11 or Wayland display socket or a local proxy (repeatable). |
-| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. |
+| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. It validates the options and the listener / file-descriptor budget exactly as a real run does (a configuration that would fail with "too many listeners" fails here too, exit 125), but it does **not** start anything: it can't tell you that user namespaces are disabled, that a port is free, or that the command exists. |
+| `--check-sandbox` | With `--dry-run`: also check that this machine lets nullroute create the user, network and mount namespaces (a throw-away process does the real setup and exits; nothing is left behind). Exit 125 with the same message a real run would give if it can't. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
 
 ### The user's session: D-Bus, systemd, snapd, agents

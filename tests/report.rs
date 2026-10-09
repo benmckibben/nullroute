@@ -5,8 +5,6 @@ use std::os::unix::net::UnixListener;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::thread;
-use std::time::Duration;
 
 struct Tmp(PathBuf);
 impl Tmp {
@@ -363,8 +361,8 @@ fn sigterm_is_forwarded_to_the_command() {
         .unwrap();
     let mut out = child.stdout.take().unwrap();
     let mut buf = [0u8; 6];
+    // The trap is installed before "ready" is printed: no need to wait longer.
     std::io::Read::read_exact(&mut out, &mut buf).unwrap();
-    thread::sleep(Duration::from_millis(100));
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let status = child.wait().unwrap();
     let mut rest = String::new();

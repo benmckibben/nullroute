@@ -42,14 +42,17 @@ use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::diag::diagln;
+use crate::limits::{self, Limiter};
 use crate::report::{Kind, Report, json_string};
+use crate::tmpdir::PrivateDir;
 
 /// What the default list of hidden sockets is derived from: the places a user's session
 /// services listen, which depend on the environment. Separate from the process
@@ -344,7 +347,8 @@ enum Mode {
 struct Decoy {
     /// Canonical path being hidden (what the user will see in warnings).
     target: PathBuf,
-    listener: UnixListener,
+    /// Bound by [`Plan::prepare`]; None until then (--dry-run never gets there).
+    listener: Option<UnixListener>,
     mode: Mode,
     /// Why it's hidden, for the messages.
     reason: &'static str,
@@ -362,9 +366,10 @@ const GPG_REASON: &str =
     "gpg-agent holds your keys and dirmngr looks keys up on the host's network";
 const EXPLICIT_REASON: &str = "hidden with --hide-socket";
 
-/// What to hide, with decoys already listening. Removes its temp dir on drop.
+/// What to hide. [`Plan::prepare`] makes the decoys listen, in a private temp
+/// dir that is removed again as soon as the sandbox is up (tmpdir.rs).
 pub struct Plan {
-    dir: PathBuf,
+    scratch: Option<PrivateDir>,
     decoys: Vec<Decoy>,
     /// --seal-docker-pulls and what it checks against, for sealed sockets.
     docker: Arc<crate::docker::Policy>,
@@ -412,7 +417,7 @@ fn plan_for(
     for (path, default_reason, explicit) in candidates {
         let Ok(canon) = std::fs::canonicalize(&path) else {
             if explicit {
-                eprintln!(
+                diagln!(
                     "nullroute: --hide-socket {}: no such file, ignoring",
                     path.display()
                 );
@@ -423,7 +428,7 @@ fn plan_for(
             Ok(m) if m.file_type().is_socket() => {}
             _ => {
                 if explicit {
-                    eprintln!(
+                    diagln!(
                         "nullroute: --hide-socket {}: not a Unix socket, ignoring",
                         path.display()
                     );
@@ -447,7 +452,7 @@ fn plan_for(
     for (path, explicit) in requested.chain(standard) {
         let Ok(canon) = std::fs::canonicalize(path) else {
             if explicit {
-                eprintln!(
+                diagln!(
                     "nullroute: --seal-docker-socket {}: not found, ignoring",
                     path.display()
                 );
@@ -458,14 +463,14 @@ fn plan_for(
             targets.insert(canon, (Mode::SealDocker, crate::docker::SEAL_REASON));
             sealed_any = true;
         } else if explicit {
-            eprintln!(
+            diagln!(
                 "nullroute: --seal-docker-socket {}: not a Unix socket, ignoring",
                 path.display()
             );
         }
     }
     if !seal_defaults.is_empty() && !sealed_any {
-        eprintln!(
+        diagln!(
             "nullroute: --seal-docker: no Docker socket found at the standard paths; \
              use --seal-docker-socket PATH for a non-standard one"
         );
@@ -474,33 +479,50 @@ fn plan_for(
         return Ok(None);
     }
 
-    let dir = std::env::temp_dir().join(format!("nullroute-{}-{}", std::process::id(), nonce()));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    let mut plan = Plan {
-        dir,
-        decoys: Vec::new(),
+    Ok(Some(Plan {
+        scratch: None,
+        decoys: targets
+            .into_iter()
+            .map(|(target, (mode, reason))| Decoy {
+                target,
+                listener: None,
+                mode,
+                reason,
+            })
+            .collect(),
         docker: Arc::default(),
-    };
-    for (i, (target, (mode, reason))) in targets.into_iter().enumerate() {
-        let listener = UnixListener::bind(plan.dir.join(format!("decoy-{i}.sock")))?;
-        plan.decoys.push(Decoy {
-            target,
-            listener,
-            mode,
-            reason,
-        });
-    }
-    Ok(Some(plan))
+    }))
 }
 
 impl Plan {
+    /// Create the private temp dir and bind a listening decoy socket for each
+    /// target in it. Call right before spawning the command (nothing is
+    /// created by merely planning, so --dry-run and --inspect leave no
+    /// files).
+    pub fn prepare(&mut self) -> io::Result<()> {
+        if self.scratch.is_some() {
+            return Ok(());
+        }
+        let scratch = PrivateDir::create("nullroute")?;
+        for (i, d) in self.decoys.iter_mut().enumerate() {
+            d.listener = Some(UnixListener::bind(
+                scratch.path().join(format!("decoy-{i}.sock")),
+            )?);
+        }
+        self.scratch = Some(scratch);
+        Ok(())
+    }
+
     pub fn mount_list(&self) -> io::Result<MountList> {
+        let Some(scratch) = &self.scratch else {
+            return Err(io::Error::other("socket decoys were not prepared"));
+        };
         self.decoys
             .iter()
             .enumerate()
             .map(|(i, d)| {
                 Ok((
-                    cstring(&self.dir.join(format!("decoy-{i}.sock")))?,
+                    cstring(&scratch.path().join(format!("decoy-{i}.sock")))?,
                     cstring(&d.target)?,
                 ))
             })
@@ -529,42 +551,46 @@ impl Plan {
     /// Start answering connections on the decoys. Call after spawn.
     pub fn start(&self, report: &Arc<Report>) -> io::Result<()> {
         for d in &self.decoys {
-            let listener = d.listener.try_clone()?;
+            let Some(listener) = &d.listener else {
+                continue;
+            };
+            let listener = listener.try_clone()?;
             let target = d.target.clone();
             let reason = d.reason;
             let mode = d.mode;
             let report = report.clone();
             let docker = self.docker.clone();
-            thread::spawn(move || {
-                for conn in listener.incoming() {
-                    let Ok(conn) = conn else { continue };
-                    let target = target.clone();
-                    let report = report.clone();
-                    let docker = docker.clone();
-                    match mode {
-                        Mode::Block => {
-                            let t = target.display().to_string();
-                            report.record(Kind::Socket, &t, reason, || {
-                                format!("nullroute: blocked a connection to {t} ({reason}). Rerun with --allow-socket {t} to permit it.")
-                            });
-                            thread::spawn(move || answer(conn, &target, reason));
+            let limit = Limiter::new(limits::max_connections(limits::MAX_DECOY_CONNECTIONS));
+            thread::Builder::new().name("decoy".into()).spawn(move || {
+                limits::accept_loop(
+                    || listener.accept().map(|(c, _)| c),
+                    |conn| {
+                        let target = target.clone();
+                        let report = report.clone();
+                        let docker = docker.clone();
+                        match mode {
+                            Mode::Block => {
+                                let t = target.display().to_string();
+                                report.record(Kind::Socket, &t, reason, || {
+                                    format!("nullroute: blocked a connection to {t} ({reason}). Rerun with --allow-socket {t} to permit it.")
+                                });
+                                if let Some(permit) = limit.try_acquire() {
+                                    limits::spawn_conn(permit, move || answer(conn, &target, reason));
+                                }
+                            }
+                            Mode::SealDocker => {
+                                if let Some(permit) = limit.try_acquire() {
+                                    limits::spawn_conn(permit, move || {
+                                        crate::docker::handle(conn, &target, &report, &docker)
+                                    });
+                                }
+                            }
                         }
-                        Mode::SealDocker => {
-                            thread::spawn(move || {
-                                crate::docker::handle(conn, &target, &report, &docker)
-                            });
-                        }
-                    }
-                }
-            });
+                    },
+                );
+            })?;
         }
         Ok(())
-    }
-}
-
-impl Drop for Plan {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -597,13 +623,6 @@ fn canonical_or_same(p: &Path) -> PathBuf {
 fn cstring(p: &Path) -> io::Result<CString> {
     CString::new(p.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
-}
-
-fn nonce() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// In the forked child, after unshare(CLONE_NEWNS): stop mount events leaking

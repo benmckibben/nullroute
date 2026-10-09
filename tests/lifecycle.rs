@@ -341,12 +341,14 @@ fn sigint_to_the_group_while_running_reaches_the_command_once() {
         (count() >= 1).then_some(())
     });
     unsafe { libc::kill(pid, libc::SIGINT) }; // nullroute alone: ignored
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(count(), 1, "the command saw a different number of SIGINTs");
-    assert!(nr.try_wait().unwrap().is_none(), "nullroute exited");
-
+    // Instead of sleeping and hoping the ignored signal had time to do harm,
+    // order the checks: signals sent to nullroute are handled in order, so by
+    // the time the SIGTERM that follows has been forwarded and the command
+    // has exited with its TERM status (nullroute itself survived the SIGINT),
+    // the SIGINT has been dealt with, and the command saw no second one.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     assert_eq!(wait_with_timeout(nr).code(), Some(42));
+    assert_eq!(count(), 1, "the command saw a different number of SIGINTs");
 }
 
 #[test]
