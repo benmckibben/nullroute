@@ -16,6 +16,7 @@
 //!
 //! `--port` itself: inside, `localhost:PORT` reaches the host's `localhost:PORT`.
 
+use crate::diag::diagln;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -401,7 +402,7 @@ fn spawn_acceptor(fd: RawFd, port: u16, warned: Arc<AtomicBool>) {
                 Err(e) => {
                     // Once per port: a test retrying in a loop shouldn't flood stderr.
                     if !warned.swap(true, Ordering::Relaxed) {
-                        eprintln!(
+                        diagln!(
                             "nullroute: --port {port}: nothing reachable on the host at localhost:{port} ({e})"
                         );
                     }

@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use crate::diag::diagln;
 use crate::report::{Kind, Report, json_string};
 
 /// Sockets hidden unless `--allow-socket`ed, each with why: container
@@ -159,7 +160,7 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
     for (path, default_reason, explicit) in candidates {
         let Ok(canon) = std::fs::canonicalize(&path) else {
             if explicit {
-                eprintln!(
+                diagln!(
                     "nullroute: --hide-socket {}: no such file, ignoring",
                     path.display()
                 );
@@ -170,7 +171,7 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
             Ok(m) if m.file_type().is_socket() => {}
             _ => {
                 if explicit {
-                    eprintln!(
+                    diagln!(
                         "nullroute: --hide-socket {}: not a Unix socket, ignoring",
                         path.display()
                     );
@@ -190,7 +191,7 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
     }
     for path in seal {
         let Ok(canon) = std::fs::canonicalize(path) else {
-            eprintln!(
+            diagln!(
                 "nullroute: --seal-docker: {} not found, ignoring",
                 path.display()
             );

@@ -30,6 +30,7 @@
 //! Only TCP is relayed; UDP to a synthetic address (QUIC, for example) gets
 //! nothing back.
 
+use crate::diag::diagln;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::{self, Read, Write};
@@ -487,7 +488,7 @@ impl Sinkhole {
                     .map(|mut w| w.insert(target.clone()))
                     .unwrap_or(false);
                 if first {
-                    eprintln!("nullroute: could not reach {target}: {e}");
+                    diagln!("nullroute: could not reach {target}: {e}");
                 }
                 let _ = inner.shutdown(Shutdown::Both);
             }

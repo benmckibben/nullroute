@@ -97,6 +97,12 @@ Findings from a security review of the first version, all fixed before release:
   passed on to it instead of being dropped, so it stops the command before it
   runs; it used to be swallowed, and the command then ran with nullroute
   waiting for it.
+- A closed or full stderr (a CI log pipe whose reader went away, `/dev/full`) no
+  longer changes the result of a run: nullroute's warnings, live "blocked" lines
+  and summary ignore write errors instead of panicking, so a command that exited
+  7 still exits 7 (it used to become 101, and a panic in a worker thread could
+  silently stop the DNS sinkhole or the proxy). `--dry-run` to a stdout that
+  can't be written (a full disk) fails with exit `74` and a message, not a panic.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.

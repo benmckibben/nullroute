@@ -12,6 +12,7 @@
 //! nullroute, so it doesn't appear here. Proxy requests, DNS lookups and hidden
 //! sockets do.
 
+use crate::diag::diagln;
 use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::path::Path;
@@ -98,7 +99,7 @@ impl Report {
             e.count == 1
         };
         if first && !self.quiet {
-            eprintln!("{}", first_line());
+            diagln!("{}", first_line());
         }
         first
     }

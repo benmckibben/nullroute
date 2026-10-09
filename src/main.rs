@@ -4,6 +4,8 @@
 // are cfg'd out, so the build stops with this one error instead of dozens of
 // missing-libc-symbol errors; allow(unused) keeps the leftovers quiet.
 #![cfg_attr(not(target_os = "linux"), allow(unused))]
+// Diagnostics go through diag!/diagln! (src/diag.rs), which can't panic.
+#![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "nullroute only supports Linux (it relies on Linux network namespaces); build it for a Linux target"
@@ -11,6 +13,8 @@ compile_error!(
 #[cfg(not(target_os = "linux"))]
 fn main() {}
 
+#[cfg(target_os = "linux")]
+mod diag;
 #[cfg(target_os = "linux")]
 mod dns;
 #[cfg(target_os = "linux")]
@@ -32,6 +36,7 @@ mod sandbox;
 #[cfg(target_os = "linux")]
 mod signals;
 
+use crate::diag::{diag, diagln};
 use clap::{Parser, Subcommand};
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitCode;
@@ -173,7 +178,7 @@ fn main() -> ExitCode {
             argv,
         } => {
             if seal_docker_pulls.is_some() && !seal_docker && seal_docker_sockets.is_empty() {
-                eprintln!(
+                diagln!(
                     "nullroute: --seal-docker-pulls only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
                 );
                 return ExitCode::from(2);
@@ -182,14 +187,14 @@ fn main() -> ExitCode {
             let allowlist = match proxy::Allowlist::parse(&allow) {
                 Ok(a) => a,
                 Err(e) => {
-                    eprintln!("nullroute: {e}");
+                    diagln!("nullroute: {e}");
                     return ExitCode::from(2);
                 }
             };
             let overrides = match proxy::parse_overrides(&resolve, &allowlist) {
                 Ok(o) => o,
                 Err(e) => {
-                    eprintln!("nullroute: {e}");
+                    diagln!("nullroute: {e}");
                     return ExitCode::from(2);
                 }
             };
@@ -199,7 +204,7 @@ fn main() -> ExitCode {
                 match dns::Plan::new(&allowlist) {
                     Ok(p) => p,
                     Err(e) => {
-                        eprintln!("nullroute: {e}");
+                        diagln!("nullroute: {e}");
                         return ExitCode::from(2);
                     }
                 }
@@ -207,7 +212,7 @@ fn main() -> ExitCode {
             if let Some(path) = &report_json
                 && let Err(e) = report::check_writable(path)
             {
-                eprintln!(
+                diagln!(
                     "nullroute: --report-json {}: can't write the report there: {e}; not running the command",
                     path.display()
                 );
@@ -216,14 +221,14 @@ fn main() -> ExitCode {
             ports.sort_unstable();
             ports.dedup();
             if dns_plan.is_some() && ports.contains(&dns::PORT) {
-                eprintln!(
+                diagln!(
                     "nullroute: --port {} clashes with the DNS sinkhole for --allow; add --no-dns to bridge it",
                     dns::PORT
                 );
                 return ExitCode::from(2);
             }
             if ports.len() > forward::MAX_PORTS {
-                eprintln!(
+                diagln!(
                     "nullroute: at most {} --port values (got {})",
                     forward::MAX_PORTS,
                     ports.len()
@@ -237,7 +242,7 @@ fn main() -> ExitCode {
             let mut plan = match hide::plan(&hide_sockets, &allow_sockets, &seal) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("nullroute: preparing socket hiding: {e}");
+                    diagln!("nullroute: preparing socket hiding: {e}");
                     return ExitCode::from(125);
                 }
             };
@@ -252,7 +257,7 @@ fn main() -> ExitCode {
             if inspect {
                 let proxy = (!allowlist.is_empty())
                     .then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
-                eprint!(
+                diag!(
                     "{}",
                     inspect::Topology::new(
                         &ports,
@@ -267,40 +272,31 @@ fn main() -> ExitCode {
             }
             if dry_run {
                 // Rust ignores SIGPIPE, so a reader that exits early (| head)
-                // would turn println! into a panic (101). Die by the signal
-                // instead, like ls does.
+                // would turn a write error into a panic (101). The listing is
+                // the result of the command, not a diagnostic: die by the
+                // signal instead, like ls does.
                 // SAFETY: restoring the default disposition has no preconditions.
                 unsafe {
                     libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 }
-                match &plan {
-                    None => println!("hidden sockets: none"),
-                    Some(p) => {
-                        p.blocked_targets()
-                            .for_each(|t| println!("hidden socket: {}", t.display()));
-                        p.sealed_targets()
-                            .for_each(|t| println!("sealed docker socket: {}", t.display()));
-                        if p.sealed_targets().next().is_some() {
-                            println!("docker pulls: {}", pulls.describe());
-                        }
+                let mut out = std::io::stdout().lock();
+                return match write_dry_run(
+                    &mut out,
+                    plan.as_ref(),
+                    pulls,
+                    &ports,
+                    &allowed_hosts,
+                    !allowlist.is_empty(),
+                    dns_plan.as_ref(),
+                ) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) => {
+                        // Anything but a closed pipe (which killed us above),
+                        // e.g. a full disk: say so, don't panic.
+                        diagln!("nullroute: writing the --dry-run listing: {e}");
+                        ExitCode::from(EXIT_OUTPUT_FAILED as u8)
                     }
-                }
-                for p in &ports {
-                    println!("forwarded port: {p}");
-                }
-                for h in &allowed_hosts {
-                    println!("allowed host: {h}");
-                }
-                if !allowlist.is_empty() {
-                    println!("proxy: http://127.0.0.1:{}", proxy::pick_port(&ports));
-                }
-                if let Some(d) = &dns_plan {
-                    println!("dns sinkhole: 127.0.0.1:{}", dns::PORT);
-                    for l in d.describe() {
-                        println!("synthetic address: {l}");
-                    }
-                }
-                return ExitCode::SUCCESS;
+                };
             }
             let report = report::Report::new(quiet);
             let proxy = (!allowlist.is_empty()).then(|| {
@@ -327,6 +323,48 @@ fn main() -> ExitCode {
     }
 }
 
+/// The --dry-run listing: what would be hidden, forwarded and allowed.
+fn write_dry_run(
+    out: &mut impl std::io::Write,
+    plan: Option<&hide::Plan>,
+    pulls: docker::PullPolicy,
+    ports: &[u16],
+    allowed_hosts: &[String],
+    proxy: bool,
+    dns_plan: Option<&dns::Plan>,
+) -> std::io::Result<()> {
+    match plan {
+        None => writeln!(out, "hidden sockets: none")?,
+        Some(p) => {
+            for t in p.blocked_targets() {
+                writeln!(out, "hidden socket: {}", t.display())?;
+            }
+            for t in p.sealed_targets() {
+                writeln!(out, "sealed docker socket: {}", t.display())?;
+            }
+            if p.sealed_targets().next().is_some() {
+                writeln!(out, "docker pulls: {}", pulls.describe())?;
+            }
+        }
+    }
+    for p in ports {
+        writeln!(out, "forwarded port: {p}")?;
+    }
+    for h in allowed_hosts {
+        writeln!(out, "allowed host: {h}")?;
+    }
+    if proxy {
+        writeln!(out, "proxy: http://127.0.0.1:{}", proxy::pick_port(ports))?;
+    }
+    if let Some(d) = dns_plan {
+        writeln!(out, "dns sinkhole: 127.0.0.1:{}", dns::PORT)?;
+        for l in d.describe() {
+            writeln!(out, "synthetic address: {l}")?;
+        }
+    }
+    out.flush()
+}
+
 /// How an --allow value is displayed: trimmed, no trailing dot, lowercase.
 fn normalize_host(h: &str) -> String {
     h.trim().trim_end_matches('.').to_ascii_lowercase()
@@ -335,6 +373,10 @@ fn normalize_host(h: &str) -> String {
 /// Exit code when the command (and --strict) would have exited 0 but the
 /// --report-json file couldn't be written at the end (EX_IOERR, sysexits.h).
 const EXIT_REPORT_WRITE_FAILED: i32 = 74;
+
+/// Exit code when the --dry-run listing itself can't be written to stdout
+/// (a full disk, say); same sysexits.h code.
+const EXIT_OUTPUT_FAILED: i32 = 74;
 
 struct RunOpts {
     strict: bool,
@@ -354,7 +396,7 @@ fn run(
     let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("nullroute: failed to run {:?}: {e}", argv[0]);
+            diagln!("nullroute: failed to run {:?}: {e}", argv[0]);
             // Like docker run and shells: 127 = command not found, 126 = found
             // but not executable. Otherwise 125, "the runner failed", as opposed
             // to the command; keeps the two distinguishable.
@@ -368,19 +410,17 @@ fn run(
         _ => 1,
     };
     if let Some(s) = report.summary() {
-        eprint!("{s}");
+        diag!("{s}");
     }
     let strict_failed = opts.strict && code == 0 && report.has_blocks();
     if strict_failed {
-        eprintln!(
-            "nullroute: --strict: failing because the command tried to reach blocked targets"
-        );
+        diagln!("nullroute: --strict: failing because the command tried to reach blocked targets");
         code = 1;
     }
     if let Some(path) = &opts.report_json
         && let Err(e) = report.write_json(path, argv, code, strict_failed)
     {
-        eprintln!(
+        diagln!(
             "nullroute: --report-json {}: writing the report failed: {e}",
             path.display()
         );

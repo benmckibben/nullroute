@@ -85,6 +85,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
+use crate::diag::diagln;
 use crate::proxy::Allowlist;
 use crate::report::{Kind, Report};
 
@@ -102,7 +103,7 @@ pub fn handle(client: UnixStream, upstream: &Path, report: &Arc<Report>, policy:
     if let Err(e) = proxy(client, upstream, report, policy) {
         // Best-effort; the client usually just sees a closed connection.
         if e.kind() != io::ErrorKind::BrokenPipe && e.kind() != io::ErrorKind::UnexpectedEof {
-            eprintln!("nullroute: --seal-docker: {e}");
+            diagln!("nullroute: --seal-docker: {e}");
         }
     }
 }
