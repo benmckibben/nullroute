@@ -801,6 +801,11 @@ impl Files {
 }
 
 impl Files {
+    /// What the forked child deletes after its bind mounts (tmpdir.rs).
+    pub fn child_cleanup(&self) -> io::Result<crate::tmpdir::ChildCleanup> {
+        self.dir.child_cleanup()
+    }
+
     /// Remove the temp dir now. Call once the command has been spawned: the
     /// bind mounts keep the files alive.
     pub fn cleanup(&self) {

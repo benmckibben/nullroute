@@ -111,6 +111,15 @@ pub fn run_hermetic(
         h.prepare()?;
     }
     let dns_files = Some(dns::Files::create(dns.is_some())?).filter(|f| !f.mounts.is_empty());
+    // The child deletes the scratch files itself once its bind mounts are in
+    // place (before it execs), so a running command implies they are gone.
+    let mut scratch_cleanup = Vec::new();
+    if let Some(h) = hide.as_deref() {
+        scratch_cleanup.extend(h.child_cleanup()?);
+    }
+    if let Some(f) = &dns_files {
+        scratch_cleanup.push(f.child_cleanup()?);
+    }
     let need_mount_ns = hide.is_some() || dns_files.is_some();
     let mounts = if need_mount_ns {
         let mut m = hide
@@ -182,6 +191,9 @@ pub fn run_hermetic(
                 if let Some(c) = child_side.as_mut() {
                     c.listen_and_send()?;
                 }
+                for c in &scratch_cleanup {
+                    c.run();
+                }
                 if let Some(original) = &nofile_original
                     && libc::setrlimit(libc::RLIMIT_NOFILE, original) != 0
                 {
@@ -209,9 +221,8 @@ pub fn run_hermetic(
     // Dropping cmd drops the pre_exec closure and with it the parent's copy of
     // the child's socket end.
     drop(cmd);
-    // Spawn returns once the command has exec'd, i.e. after the child made its
-    // bind mounts: the files they came from can go now, so nothing is left in
-    // the temp dir whatever happens to nullroute from here on.
+    // The child already deleted the files (scratch_cleanup); this removes
+    // whatever is left, e.g. when the child failed before that point.
     if let Some(f) = &dns_files {
         f.cleanup();
     }

@@ -246,6 +246,14 @@ impl Plan {
         Ok(())
     }
 
+    /// What the forked child deletes after its bind mounts (tmpdir.rs).
+    pub fn child_cleanup(&self) -> io::Result<Option<crate::tmpdir::ChildCleanup>> {
+        self.scratch
+            .as_ref()
+            .map(PrivateDir::child_cleanup)
+            .transpose()
+    }
+
     /// Remove the temp dir. Call once the command has been spawned: the
     /// bind mounts keep the sockets alive and the listeners are open fds.
     pub fn cleanup(&self) {

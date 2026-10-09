@@ -55,8 +55,11 @@ bind-mounted, so they live in a directory in the temp dir. Options considered:
   for nullroute itself would change what it sees.
 - *memfd / O_TMPFILE*: a bind mount needs a path in a mount of this namespace;
   a memfd's internal mount isn't one (`EINVAL`).
-- *unlink after use*: done. A bind mount keeps the file alive, so the directory
-  is removed right after spawn returns, i.e. after the child made its mounts.
+- *unlink after use*: done. A bind mount keeps the file alive, so the forked
+  child unlinks the files and the directory right after its mounts, before it
+  execs (unlink/rmdir only: async-signal-safe), and the parent removes whatever
+  is left after spawn. A running command therefore implies the directory is
+  gone.
 - *janitor*: done for what remains (a kill between creating the directory and
   the end of spawn). The "in use" marker is an exclusive `flock` that the kernel
   drops when the process dies, not a pid (no pid reuse, works across PID
