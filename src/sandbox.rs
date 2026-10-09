@@ -7,7 +7,8 @@
 //!    - map our real uid/gid into the user namespace, so the command still runs
 //!      as "you", not as a fake root.
 //!    - bring `lo` up (it starts DOWN), so 127.0.0.1 works inside.
-//!    - set no_new_privs and install a small seccomp filter (seccomp.rs).
+//!    - set no_new_privs and install a small seccomp filter (seccomp.rs), each
+//!      unless turned off (--allow-new-privs, --no-seccomp).
 //! 2. exec the command. It keeps no capabilities after exec (it isn't root in
 //!    the namespace), so it can't add interfaces or routes to get back out.
 //!
@@ -46,7 +47,7 @@ pub fn run_hermetic(
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
     dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
-    use_seccomp: bool,
+    hardening: seccomp::Hardening,
 ) -> io::Result<ExitStatus> {
     let (program, args) = argv
         .split_first()
@@ -132,14 +133,19 @@ pub fn run_hermetic(
     };
     let flags = namespace_flags(need_mount_ns);
     // Built here because building allocates; the child only installs it.
-    let seccomp_filter = if !use_seccomp {
+    let seccomp_filter = if !hardening.seccomp {
         None
     } else if let Some(f) = seccomp::Filter::new().filter(|_| seccomp::available()) {
         Some(f)
     } else {
         diagln!(
             "nullroute: warning: this kernel or architecture can't load the seccomp filter; \
-             running without it (no_new_privs is still set)"
+             running without it{}",
+            if hardening.no_new_privs {
+                " (no_new_privs is still set)"
+            } else {
+                ""
+            }
         );
         None
     };
@@ -209,8 +215,9 @@ pub fn run_hermetic(
                 // After the last socket and ioctl the setup itself needs (the
                 // filter denies some of them), before the command exists.
                 match seccomp_filter.as_ref() {
-                    Some(f) => f.install()?,
-                    None => seccomp::set_no_new_privs()?,
+                    Some(f) => f.install(hardening.no_new_privs)?,
+                    None if hardening.no_new_privs => seccomp::set_no_new_privs()?,
+                    None => {}
                 }
                 // Last: unblock, so nothing is delivered before setup is done. A
                 // SIGINT/SIGQUIT that reached only nullroute is passed on here.
