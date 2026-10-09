@@ -103,6 +103,11 @@ impl Report {
         first
     }
 
+    /// Was --quiet given (no live lines)?
+    pub fn quiet(&self) -> bool {
+        self.quiet
+    }
+
     pub fn entries(&self) -> Vec<Entry> {
         self.entries
             .lock()

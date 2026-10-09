@@ -611,3 +611,44 @@ fn localhost_is_not_a_lookup_even_when_asked_over_dns() {
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert!(out(&o).contains("127.0.0.1"), "{o:?}");
 }
+
+#[test]
+fn relayed_tls_connection_must_name_the_host_it_dialled() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    let port = echo_server(ip);
+    // The test server echoes back "echo:" + what it read. A ClientHello for
+    // the dialled name goes through; one naming another host is cut off.
+    let script = |sni: &str| {
+        format!(
+            "import socket, struct\n\
+             n = {sni}.encode()\n\
+             entry = b'\\x00' + struct.pack('>H', len(n)) + n\n\
+             lst = struct.pack('>H', len(entry)) + entry\n\
+             ext = struct.pack('>HH', 0, len(lst)) + lst\n\
+             body = b'\\x03\\x03' + bytes(32) + b'\\x00' + b'\\x00\\x02\\x13\\x01' + b'\\x01\\x00' + struct.pack('>H', len(ext)) + ext\n\
+             hs = b'\\x01' + struct.pack('>I', len(body))[1:] + body\n\
+             data = b'\\x16\\x03\\x01' + struct.pack('>H', len(hs)) + hs\n\
+             s = socket.create_connection(('db.nr.test', {port}), timeout=10)\n\
+             try:\n    s.sendall(data)\n    r = s.recv(8)\n    print(r.decode() or 'CLOSED')\n\
+             except OSError:\n    print('CLOSED')"
+        )
+    };
+    let flags = [
+        "--allow",
+        &format!("db.nr.test:{port}"),
+        "--resolve",
+        &format!("db.nr.test:{ip}"),
+    ];
+    let o = py(&flags, &script("'db.nr.test'"));
+    assert_eq!(out(&o), "echo:\u{16}\u{3}\u{1}", "{o:?}");
+    let o = py(&flags, &script("'evil.nr.test'"));
+    assert_eq!(out(&o), "CLOSED", "{o:?}");
+    assert!(
+        err(&o)
+            .contains("nullroute: blocked TLS server name evil.nr.test in a tunnel to db.nr.test:"),
+        "{}",
+        err(&o)
+    );
+}

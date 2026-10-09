@@ -31,6 +31,8 @@ mod report;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod signals;
+#[cfg(target_os = "linux")]
+mod sni;
 
 use clap::{Parser, Subcommand};
 use std::os::unix::process::ExitStatusExt;
@@ -103,7 +105,10 @@ enum Cmd {
         /// other clients resolve allowed names via nullroute's DNS sinkhole and
         /// are relayed on the allowed ports (80/443 without :PORT). localhost and
         /// loopback, link-local and cloud-metadata IPs are refused (use --port
-        /// for local services).
+        /// for local services). The Host header of a proxied HTTP request and the
+        /// TLS server name (SNI) of a tunnel must name the allowed host too.
+        /// Private/LAN addresses (RFC 1918, 100.64.0.0/10, fc00::/7) work, with a
+        /// warning.
         #[arg(short, long = "allow", value_name = "HOST", value_delimiter = ',')]
         allow: Vec<String>,
 
@@ -198,6 +203,11 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            if !quiet {
+                for w in proxy::private_address_warnings(&allowlist, &overrides) {
+                    eprintln!("{w}");
+                }
+            }
             // The resolver is always on (it records lookups for --strict and
             // makes them fail for good); only --no-dns, or --port 53 without
             // allowed names to map, leaves port 53 alone.

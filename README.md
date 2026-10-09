@@ -98,6 +98,41 @@ Other details:
   `--port`), and link-local/metadata IPs.
 - Plain-HTTP requests are sent with `Connection: close`: one request per
   proxied connection.
+- **The name has to be the same all the way down.** The allowlist is checked
+  against the host in the request (the proxy's `CONNECT` target or request URL,
+  or the name the client resolved through the sinkhole). A client could ask for
+  an allowed host and then name another one for the server to serve (domain
+  fronting), so nullroute also checks what it can see without decrypting
+  anything:
+  - a plain-HTTP request through the proxy must have a `Host` header that names
+    the host it is sent to (or another allowed host), exactly one `Host` header,
+    or none; anything else gets `403` (or `400` for several) and is reported as
+    `proxy` block;
+  - the first TLS record of a tunnel (the proxy's `CONNECT` and the sinkhole's
+    relayed connections) is read before anything reaches the host: a ClientHello
+    whose server name (SNI) isn't the tunnel's host or another allowed host is
+    cut off and reported. No SNI (a client dialling an IP address) is let
+    through; a first record that looks like TLS but can't be parsed is refused.
+    Other protocols, and servers that speak first (SSH, SMTP, MySQL), are
+    forwarded untouched. To use a different SNI deliberately (for example a
+    client-facing name for Encrypted Client Hello), allow that name too.
+- **What that doesn't stop.** The server name and the `Host` header inside TLS
+  are the same name for any honest client, but a program that wants to front
+  can send the allowed name in the SNI and a different `Host` in the encrypted
+  request, to a server that serves both (typically several sites behind one CDN
+  address). Plain HTTP through the sinkhole's relay isn't `Host`-checked either:
+  one connection carries many requests. Allowlisting by name can't close this;
+  nullroute stops accidental access, not a client that is trying to get around it
+  (see [What nullroute is not](#what-nullroute-is-not)).
+- **Private and LAN addresses work, on purpose.** `--allow 10.0.0.5`, or a name
+  that resolves into RFC 1918, carrier-grade NAT (100.64.0.0/10) or unique-local
+  (fc00::/7) space, reaches that machine on your network (only loopback,
+  link-local and cloud-metadata addresses are always refused). nullroute prints
+  a warning for an `--allow` or `--resolve` IP in that space, and once per host
+  when an allowed name resolves into it, because that is usually a corporate or
+  split-horizon name you didn't mean to open up. `-q` silences the warnings.
+  An allowed IP allows everything that answers there, but a `Host` header or
+  SNI naming another host is still refused unless that host is allowed too.
 - The proxy listens on `127.0.0.1:3128` inside the sandbox (or the next port
   that isn't a `--port`). An existing `HTTP(S)_PROXY` is overridden; chaining to
   a corporate upstream proxy isn't supported yet.
@@ -194,7 +229,7 @@ nullroute: blocked 7 attempts to reach 2 targets:
 | Kind | What | Counts as blocked (`--strict`) |
 |---|---|---|
 | `socket` | a connection to a hidden socket | yes |
-| `proxy` | a proxy request to a host that isn't allowed | yes |
+| `proxy` | a proxy request to a host that isn't allowed, or one whose `Host` header or TLS server name names a host that isn't | yes |
 | `dns` | a lookup of a name that isn't allowed, or a relay the sinkhole refused | yes |
 | `docker` | a Docker API request `--seal-docker` (or `--seal-docker-pulls`) refused | yes |
 | `rewritten` | a request `--seal-docker` changed and let through (a container create forced onto `NetworkMode=none`, or a classic `docker build` forced onto `networkmode=none`) | no |

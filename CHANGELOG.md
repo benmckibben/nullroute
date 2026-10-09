@@ -24,7 +24,13 @@ will contain.
   `:port`) via an HTTP(S) proxy (`HTTP_PROXY` and friends) and, for clients that
   ignore proxy variables, a DNS sinkhole with a transparent TCP relay on
   synthetic loopback addresses. `--resolve HOST:IP` pins an allowed host;
-  `--no-dns` turns the sinkhole off.
+  `--no-dns` turns the sinkhole off. A proxied plain-HTTP request's `Host`
+  header and the TLS server name (SNI) of a tunnel, read from the first record
+  without decrypting, must name the allowed host (or another allowed host), so a
+  client can't ask for an allowed host and be served another (domain fronting
+  through a shared CDN address still gets through). `--allow` of, or a name
+  resolving to, private/LAN space (RFC 1918, 100.64.0.0/10, fc00::/7) works and
+  prints a warning.
 - Container-runtime sockets (Docker, Podman, containerd, BuildKit) are hidden
   by default behind a decoy that answers `403`; `--hide-socket` and
   `--allow-socket` adjust the list.

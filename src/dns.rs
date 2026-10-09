@@ -516,7 +516,18 @@ impl Sinkhole {
             return block("port not in --allow");
         }
         match proxy::dial(&host, port, &self.overrides) {
-            Ok(outer) => crate::forward::relay(inner, outer),
+            Ok(mut outer) => {
+                proxy::note_private_peer(&host, &outer, self.report.quiet());
+                // The client dialled this name, but it can still name another
+                // one in the TLS ClientHello; see sni.rs.
+                match proxy::gate_tunnel(&self.allow, &inner, &mut outer, &host, port, Vec::new()) {
+                    Ok(()) => crate::forward::relay(inner, outer),
+                    Err(refusal) => {
+                        proxy::record_refused_tunnel(&self.report, &host, port, &refusal);
+                        let _ = inner.shutdown(Shutdown::Both);
+                    }
+                }
+            }
             Err(DialError::Forbidden(why)) => block(why.reason()),
             Err(DialError::Io(e)) => {
                 let first = self
