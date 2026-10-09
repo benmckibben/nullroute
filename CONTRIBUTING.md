@@ -57,6 +57,13 @@ trailing comment; Dependabot proposes updates.
 - Anything that changes the sandbox's guarantees (what is blocked or let through)
   should say so explicitly in the description.
 
+## Design notes
+
+[`docs/design/`](docs/design/README.md) holds write-ups of open design questions (running as
+root and inherited file descriptors, a PID namespace for the command, the exit-code policy), with the
+evidence behind each recommendation. Read the relevant note before changing that area, and update it
+when a proposal is implemented or rejected. They are not part of the published crate.
+
 ## Releasing (maintainer)
 
 The release workflow (`.github/workflows/release.yml`) only **builds**: it runs
