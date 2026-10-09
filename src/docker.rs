@@ -3782,9 +3782,25 @@ mod tests {
         }
     }
 
+    /// Write all of `raw`. The proxy answers an oversized request (431) and
+    /// closes as soon as it has seen enough, possibly before a very large one
+    /// has been written: that broken pipe is not an error, the answer is what
+    /// the test checks.
+    fn send(c: &mut UnixStream, raw: &[u8]) {
+        match c.write_all(raw) {
+            Ok(()) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            Err(e) => panic!("writing the request failed: {e}"),
+        }
+    }
+
     /// Send `raw` and return what came back for one response.
     fn exchange(c: &mut UnixStream, raw: &str) -> String {
-        c.write_all(raw.as_bytes()).unwrap();
+        send(c, raw.as_bytes());
         read_responses(c, 1)
     }
 
@@ -3990,7 +4006,7 @@ mod tests {
             "GET /_ping HTTP/1.1\r\nX-Fill: {}",
             "a".repeat(MAX_HEAD + 10)
         );
-        c.write_all(line.as_bytes()).unwrap();
+        send(&mut c, line.as_bytes());
         let r = read_responses(&mut c, 1);
         assert!(r.starts_with("HTTP/1.1 431"), "{}", &r[..r.len().min(200)]);
         // A request line that is too long.
