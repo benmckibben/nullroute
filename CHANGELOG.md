@@ -103,6 +103,22 @@ Findings from a security review of the first version, all fixed before release:
   7 still exits 7 (it used to become 101, and a panic in a worker thread could
   silently stop the DNS sinkhole or the proxy). `--dry-run` to a stdout that
   can't be written (a full disk) fails with exit `74` and a message, not a panic.
+- SIGTERM and SIGHUP sent to a process group (`kill -TERM -PGID`, `timeout`) no
+  longer reach the command twice: the command is in the group and got the
+  signal itself, and nullroute used to forward a second copy as well. A signal
+  sent to nullroute's pid alone is still forwarded, exactly once. Signals are
+  now taken by a dedicated thread, and a helper process in nullroute's process
+  group tells group-directed signals from pid-directed ones. nullroute also no
+  longer signals the command's pid after the command has been reaped (a signal
+  arriving while it cleans up leftovers could have hit an unrelated process
+  that reused the pid).
+- nullroute's scratch directories (`nullroute-*` and `nullroute-dns-*` in the temp
+  dir, holding the decoy sockets and generated resolv.conf) are no longer left
+  behind when nullroute is killed (SIGKILL, the OOM killer) or crashes: they
+  are removed as soon as the command has started, and what a kill during the
+  few milliseconds of setup leaves is swept by the next run (only directories of
+  the current user, over a minute old, that no running nullroute holds a lock
+  on). `--dry-run` and `--inspect` no longer create them at all.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.

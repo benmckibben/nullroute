@@ -35,6 +35,8 @@ mod report;
 mod sandbox;
 #[cfg(target_os = "linux")]
 mod signals;
+#[cfg(target_os = "linux")]
+mod tmpdir;
 
 use crate::diag::{diag, diagln};
 use clap::{Parser, Subcommand};
@@ -313,7 +315,7 @@ fn main() -> ExitCode {
             run(
                 &argv,
                 &ports,
-                plan.as_ref(),
+                plan.as_mut(),
                 proxy,
                 dns.as_ref(),
                 &report,
@@ -387,7 +389,7 @@ struct RunOpts {
 fn run(
     argv: &[String],
     ports: &[u16],
-    hide: Option<&hide::Plan>,
+    hide: Option<&mut hide::Plan>,
     proxy: Option<(u16, std::sync::Arc<proxy::Proxy>)>,
     dns: Option<&std::sync::Arc<dns::Sinkhole>>,
     report: &std::sync::Arc<report::Report>,

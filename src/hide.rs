@@ -30,7 +30,7 @@ use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, FileTypeExt};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,6 +39,7 @@ use std::time::Duration;
 
 use crate::diag::diagln;
 use crate::report::{Kind, Report, json_string};
+use crate::tmpdir::PrivateDir;
 
 /// Sockets hidden unless `--allow-socket`ed, each with why: container
 /// runtimes, whose daemons can start network-connected containers on the
@@ -122,7 +123,8 @@ enum Mode {
 struct Decoy {
     /// Canonical path being hidden (what the user will see in warnings).
     target: PathBuf,
-    listener: UnixListener,
+    /// Bound by [`Plan::prepare`]; None until then (--dry-run never gets there).
+    listener: Option<UnixListener>,
     mode: Mode,
     /// Why it's hidden, for the messages.
     reason: &'static str,
@@ -132,9 +134,10 @@ const RUNTIME_REASON: &str = "container runtimes can start containers with full 
 const DBUS_REASON: &str = "the system D-Bus reaches host services such as systemd-resolved, which resolve names outside the sandbox";
 const EXPLICIT_REASON: &str = "hidden with --hide-socket";
 
-/// What to hide, with decoys already listening. Removes its temp dir on drop.
+/// What to hide. [`Plan::prepare`] makes the decoys listen, in a private temp
+/// dir that is removed again as soon as the sandbox is up (tmpdir.rs).
 pub struct Plan {
-    dir: PathBuf,
+    scratch: Option<PrivateDir>,
     decoys: Vec<Decoy>,
     /// --seal-docker-pulls and what it checks against, for sealed sockets.
     docker: Arc<crate::docker::Policy>,
@@ -208,33 +211,58 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
         return Ok(None);
     }
 
-    let dir = std::env::temp_dir().join(format!("nullroute-{}-{}", std::process::id(), nonce()));
-    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    let mut plan = Plan {
-        dir,
-        decoys: Vec::new(),
+    Ok(Some(Plan {
+        scratch: None,
+        decoys: targets
+            .into_iter()
+            .map(|(target, (mode, reason))| Decoy {
+                target,
+                listener: None,
+                mode,
+                reason,
+            })
+            .collect(),
         docker: Arc::default(),
-    };
-    for (i, (target, (mode, reason))) in targets.into_iter().enumerate() {
-        let listener = UnixListener::bind(plan.dir.join(format!("decoy-{i}.sock")))?;
-        plan.decoys.push(Decoy {
-            target,
-            listener,
-            mode,
-            reason,
-        });
-    }
-    Ok(Some(plan))
+    }))
 }
 
 impl Plan {
+    /// Create the private temp dir and bind a listening decoy socket for each
+    /// target in it. Call right before spawning the command (nothing is
+    /// created by merely planning, so --dry-run and --inspect leave no
+    /// files).
+    pub fn prepare(&mut self) -> io::Result<()> {
+        if self.scratch.is_some() {
+            return Ok(());
+        }
+        let scratch = PrivateDir::create("nullroute")?;
+        for (i, d) in self.decoys.iter_mut().enumerate() {
+            d.listener = Some(UnixListener::bind(
+                scratch.path().join(format!("decoy-{i}.sock")),
+            )?);
+        }
+        self.scratch = Some(scratch);
+        Ok(())
+    }
+
+    /// Remove the temp dir. Call once the command has been spawned: the
+    /// bind mounts keep the sockets alive and the listeners are open fds.
+    pub fn cleanup(&self) {
+        if let Some(s) = &self.scratch {
+            s.remove();
+        }
+    }
+
     pub fn mount_list(&self) -> io::Result<MountList> {
+        let Some(scratch) = &self.scratch else {
+            return Err(io::Error::other("socket decoys were not prepared"));
+        };
         self.decoys
             .iter()
             .enumerate()
             .map(|(i, d)| {
                 Ok((
-                    cstring(&self.dir.join(format!("decoy-{i}.sock")))?,
+                    cstring(&scratch.path().join(format!("decoy-{i}.sock")))?,
                     cstring(&d.target)?,
                 ))
             })
@@ -263,7 +291,10 @@ impl Plan {
     /// Start answering connections on the decoys. Call after spawn.
     pub fn start(&self, report: &Arc<Report>) -> io::Result<()> {
         for d in &self.decoys {
-            let listener = d.listener.try_clone()?;
+            let Some(listener) = &d.listener else {
+                continue;
+            };
+            let listener = listener.try_clone()?;
             let target = d.target.clone();
             let reason = d.reason;
             let mode = d.mode;
@@ -296,12 +327,6 @@ impl Plan {
     }
 }
 
-impl Drop for Plan {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
 /// Reply to whatever was sent with an HTTP 403 the Docker/Podman CLIs display.
 fn answer(mut conn: UnixStream, target: &Path, reason: &str) {
     let _ = conn.set_read_timeout(Some(Duration::from_millis(300)));
@@ -331,13 +356,6 @@ fn canonical_or_same(p: &Path) -> PathBuf {
 fn cstring(p: &Path) -> io::Result<CString> {
     CString::new(p.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
-}
-
-fn nonce() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos() as u64)
-        .unwrap_or(0)
 }
 
 /// In the forked child, after unshare(CLONE_NEWNS): stop mount events leaking

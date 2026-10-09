@@ -42,7 +42,7 @@ enum Role {
 pub fn run_hermetic(
     argv: &[String],
     ports: &[u16],
-    hide: Option<&hide::Plan>,
+    mut hide: Option<&mut hide::Plan>,
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
     dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
@@ -50,6 +50,15 @@ pub fn run_hermetic(
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no command given"))?;
+
+    // From here until the signal thread is running, SIGINT/SIGQUIT/SIGTERM/SIGHUP
+    // stay pending instead of hitting nullroute's default action (see
+    // signals.rs). Blocking comes first, before anything is created on disk,
+    // so a signal during setup can't kill nullroute and leave files behind.
+    // Whatever the command orphans is reparented to nullroute, which kills it
+    // once the command is done (lifecycle.rs).
+    lifecycle::become_subreaper();
+    let blocked = signals::block()?;
 
     // Prepare everything that allocates *before* fork. The pre_exec closure runs
     // in the forked child, where allocating is not guaranteed safe.
@@ -92,12 +101,16 @@ pub fn run_hermetic(
     // Bind mounts for the private mount namespace: socket decoys, then the
     // sinkhole's resolv.conf (with --allow) and the resolver-socket masks
     // (always: systemd-resolved's varlink socket and nscd would otherwise
-    // resolve names on the host's network). dns_files must outlive the child
-    // (it deletes the sources on drop).
+    // resolve names on the host's network). Their source files live in private
+    // temp dirs that are removed right after spawn (tmpdir.rs).
+    if let Some(h) = hide.as_deref_mut() {
+        h.prepare()?;
+    }
     let dns_files = Some(dns::Files::create(dns.is_some())?).filter(|f| !f.mounts.is_empty());
     let need_mount_ns = hide.is_some() || dns_files.is_some();
     let mounts = if need_mount_ns {
         let mut m = hide
+            .as_deref()
             .map(|h| h.mount_list())
             .transpose()?
             .unwrap_or_default();
@@ -111,13 +124,7 @@ pub fn run_hermetic(
     let flags = namespace_flags(need_mount_ns);
     let pool_address = dns.is_some();
 
-    // From here until the handlers are installed, SIGINT/SIGQUIT/SIGTERM/SIGHUP
-    // stay pending instead of hitting nullroute's default action (see signals.rs).
-    // Whatever the command orphans is reparented to nullroute, which kills it
-    // once the command is done (lifecycle.rs).
-    lifecycle::become_subreaper();
-    let blocked = signals::block()?;
-    let child_mask = blocked.child_mask();
+    let child_mask = blocked.child_mask()?;
     hold_for_test();
     // The parent-death signal is tied to the forking thread (lifecycle.rs).
     debug_assert!(
@@ -126,6 +133,9 @@ pub fn run_hermetic(
     );
     // SAFETY: getpid has no preconditions.
     let parent = unsafe { libc::getpid() };
+    // A bystander in our process group, to tell group-directed signals from
+    // pid-directed ones (signals.rs). Forked while we are still single-threaded.
+    let sentinel = blocked.spawn_sentinel(parent);
 
     let mut cmd = Command::new(program);
     cmd.args(args);
@@ -181,13 +191,33 @@ pub fn run_hermetic(
     // Dropping cmd drops the pre_exec closure and with it the parent's copy of
     // the child's socket end.
     drop(cmd);
+    // Spawn returns once the command has exec'd, i.e. after the child made its
+    // bind mounts: the files they came from can go now, so nothing is left in
+    // the temp dir whatever happens to nullroute from here on.
+    if let Some(f) = &dns_files {
+        f.cleanup();
+    }
+    if let Some(h) = hide.as_deref() {
+        h.cleanup();
+    }
     let mut child = spawned?;
-    blocked.install(child.id());
-    if let Some(h) = hide
+    let fwd = match blocked.start(child.id(), sentinel) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            lifecycle::kill_leftovers();
+            return Err(io::Error::new(
+                e.kind(),
+                format!("starting the signal forwarder: {e}"),
+            ));
+        }
+    };
+    if let Some(h) = hide.as_deref()
         && let Err(e) = h.start(report)
     {
         let _ = child.kill();
-        let _ = child.wait();
+        let _ = signals::wait_for_exit(&mut child, &fwd);
         lifecycle::kill_leftovers();
         return Err(e);
     }
@@ -196,7 +226,7 @@ pub fn run_hermetic(
             Ok(g) => g,
             Err(e) => {
                 let _ = child.kill();
-                let _ = child.wait();
+                let _ = signals::wait_for_exit(&mut child, &fwd);
                 lifecycle::kill_leftovers();
                 return Err(e);
             }
@@ -229,11 +259,10 @@ pub fn run_hermetic(
             }
         }
     }
-    let status = child.wait();
+    let status = signals::wait_for_exit(&mut child, &fwd);
     // The command is done; don't leave anything it started running in a
     // sandbox whose relays are about to go away.
     lifecycle::kill_leftovers();
-    drop(dns_files);
     status
 }
 

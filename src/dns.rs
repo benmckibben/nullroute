@@ -31,13 +31,14 @@
 //! nothing back.
 
 use crate::diag::diagln;
+use crate::tmpdir::PrivateDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -716,9 +717,10 @@ fn existing(paths: &[&str]) -> Vec<PathBuf> {
 }
 
 /// The generated resolv.conf and the mask file, in a private temp dir, plus
-/// the bind mounts that put them in place. Removes the dir on drop.
+/// the bind mounts that put them in place. The dir goes away on drop, or
+/// earlier with [`Files::cleanup`].
 pub struct Files {
-    dir: PathBuf,
+    dir: PrivateDir,
     pub mounts: Vec<(CString, CString)>,
 }
 
@@ -731,27 +733,18 @@ impl Files {
     }
 
     fn create_for(resolv: Option<&Path>, bypass: &[&str]) -> io::Result<Files> {
-        let dir = std::env::temp_dir().join(format!(
-            "nullroute-dns-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
         let mut files = Files {
-            dir,
+            dir: PrivateDir::create("nullroute-dns")?,
             mounts: Vec::new(),
         };
-        let conf = files.dir.join("resolv.conf");
+        let conf = files.dir.path().join("resolv.conf");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o644)
             .open(&conf)?
             .write_all(RESOLV_CONF.as_bytes())?;
-        let mask = files.dir.join("masked");
+        let mask = files.dir.path().join("masked");
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -770,9 +763,11 @@ impl Files {
     }
 }
 
-impl Drop for Files {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+impl Files {
+    /// Remove the temp dir now. Call once the command has been spawned: the
+    /// bind mounts keep the files alive.
+    pub fn cleanup(&self) {
+        self.dir.remove();
     }
 }
 
@@ -1019,9 +1014,14 @@ mod tests {
             "symlink followed"
         );
         assert!(f.mounts[1].1.to_str().unwrap().ends_with("resolve.sock"));
-        let dir = f.dir.clone();
+        let dir = f.dir.path().to_path_buf();
+        assert!(dir.exists());
+        f.cleanup();
+        assert!(
+            !dir.exists(),
+            "cleanup removes the dir while the Files lives on"
+        );
         drop(f);
-        assert!(!dir.exists());
 
         // Without the sinkhole (no --allow), resolv.conf is left alone but the
         // bypass sockets are still masked.
