@@ -84,9 +84,58 @@ Findings from a security review of the first version, all fixed before release:
   endpoints, `0.0.0.0/8` and IPv6 forms that wrap a forbidden IPv4 address.
   `--allow` entries that can never work (`localhost`, loopback and link-local
   IPs) are rejected at startup.
+- The user's session services are hidden by default too, because their
+  sockets reach processes outside the network namespace: the session D-Bus
+  (`$DBUS_SESSION_BUS_ADDRESS`, `$XDG_RUNTIME_DIR/bus`; `busctl --user list`
+  worked from inside and `systemd-run --user` ran a command in the host's
+  network namespace), the systemd user manager, snapd, SSH and keyring agents
+  (`$SSH_AUTH_SOCK`), gpg-agent and dirmngr (a `gpg --recv-keys` inside reached
+  the network through the host's dirmngr), and more container runtimes
+  (rootless containerd and BuildKit, Docker Desktop, Colima, Rancher Desktop,
+  Lima, OrbStack, k3s, CRI-O, LXD, libvirt). Only sockets that exist are hidden,
+  without a message for the rest. `--allow-socket PATH` brings one back, and
+  `--dry-run`/`--inspect` list them. Display servers (X11, Wayland) and abstract
+  sockets are not hidden; see the README for why.
+
+- The command runs with `no_new_privs` and a small seccomp filter (x86-64 and
+  AArch64): `socket()` with `AF_VSOCK` (a side channel to the hypervisor or host
+  on microVMs, WSL2, Hyper-V, Firecracker and Docker Desktop), `AF_BLUETOOTH`,
+  `AF_NFC` or `AF_QIPCRTR` fails with `EAFNOSUPPORT`; `ioctl(TIOCSTI)` and
+  `ioctl(TIOCLINUX)`, which inject input into the terminal the command was
+  started from, fail with `EPERM` (on kernels with `dev.tty.legacy_tiocsti=1`
+  that was typing into the parent shell); `io_uring_setup()` fails with `EPERM`,
+  because io_uring can create sockets without `socket()`. Nothing else is
+  filtered. `--no-seccomp` turns the filter off; `no_new_privs` stays. See the
+  README for the effect on setuid and file-capability binaries.
+
+- `--seal-docker` only rewrote container creation, so containers that already
+  existed were unsealed: `docker exec db sh -c 'echo x | nc 172.17.0.1 9999'`
+  from inside the sandbox delivered data to a listener on the host, and
+  `start`, `restart`, `unpause`, `attach`, `update` and copying files in were the
+  same. Under `--seal-docker` those operations (and starting an exec instance)
+  are now refused with a `403` that names the flag unless the container has no
+  network (`NetworkMode: none`): the ones created through the sandbox, in this
+  or an earlier run, still work. Reads (`inspect`, `logs`, `ps`, `cp` out) are
+  unaffected. `--seal-docker-allow-existing` opts out and unseals them.
 
 ### Fixed
 
+- The README no longer says the command has "a loopback interface and nothing
+  else": it now says what is isolated (the network namespace plus the hardening
+  listed) and what is not (the filesystem, `/proc` and signalling of your other
+  processes, IPC and `/dev/shm`, inherited credentials, display servers and other
+  unlisted Unix sockets), and SECURITY.md lists the default-hidden sockets and
+  the seccomp filter as in scope.
+- The `--seal-docker` proxy now handles `Expect: 100-continue` (it used to
+  forward only the interim `100 Continue` and hold the real response until the
+  next request, so a client such as `curl` hung), answers an oversized request
+  head with `431` (and an oversized body with `413`, a malformed request line
+  or an unsupported `Expect` with `400`/`417`) instead of silently closing the
+  connection, and no longer buffers a header line without bound.
+- `--seal-docker` no longer prints a "not found, ignoring" warning for each
+  standard Docker socket that doesn't exist on the machine (it warned twice on
+  an ordinary host). Only a `--seal-docker-socket` path that can't be used is
+  reported, plus one line if no Docker socket was found at all.
 - The command no longer outlives nullroute: it gets SIGKILL when nullroute dies
   (`PR_SET_PDEATHSIG`), and whatever it leaves running when it exits (background
   jobs, daemons, even `setsid` ones) is killed before nullroute exits.
@@ -113,12 +162,12 @@ Findings from a security review of the first version, all fixed before release:
   arriving while it cleans up leftovers could have hit an unrelated process
   that reused the pid).
 - nullroute's scratch directories (`nullroute-*` and `nullroute-dns-*` in the temp
-  dir, holding the decoy sockets and generated resolv.conf) are no longer left
-  behind when nullroute is killed (SIGKILL, the OOM killer) or crashes: they
-  are removed as soon as the command has started, and what a kill during the
-  few milliseconds of setup leaves is swept by the next run (only directories of
-  the current user, over a minute old, that no running nullroute holds a lock
-  on). `--dry-run` no longer creates them at all.
+  dir, holding the decoy sockets and generated resolv.conf) used to pile up
+  when nullroute was killed (SIGKILL, the OOM killer) or crashed. Each one is
+  now locked while its nullroute runs, and the next run sweeps the ones that
+  are left (only directories of the current user, over a minute old, that no
+  running nullroute holds a lock on). `--dry-run` no longer creates them at
+  all.
 - nullroute no longer lets a command make it grow without bound: at most 256
   connections are relayed at once per `--port` / proxy / DNS-bridge listener (64
   for DNS over TCP, which also gets a 30 s lifetime and 64 queries per

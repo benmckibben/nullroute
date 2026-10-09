@@ -7,6 +7,7 @@
 //!    - map our real uid/gid into the user namespace, so the command still runs
 //!      as "you", not as a fake root.
 //!    - bring `lo` up (it starts DOWN), so 127.0.0.1 works inside.
+//!    - set no_new_privs and install a small seccomp filter (seccomp.rs).
 //! 2. exec the command. It keeps no capabilities after exec (it isn't root in
 //!    the namespace), so it can't add interfaces or routes to get back out.
 //!
@@ -26,7 +27,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 
 use crate::report::Report;
-use crate::{dns, forward, hide, lifecycle, limits, proxy, signals};
+use crate::{diagln, dns, forward, hide, lifecycle, limits, proxy, seccomp, signals};
 use std::sync::Arc;
 
 /// What a listener created inside the sandbox is for.
@@ -45,6 +46,7 @@ pub fn run_hermetic(
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
     dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
+    use_seccomp: bool,
 ) -> io::Result<ExitStatus> {
     let (program, args) = argv
         .split_first()
@@ -106,20 +108,14 @@ pub fn run_hermetic(
     // sinkhole's resolv.conf (with --allow) and the resolver-socket masks
     // (always: systemd-resolved's varlink socket and nscd would otherwise
     // resolve names on the host's network). Their source files live in private
-    // temp dirs that are removed right after spawn (tmpdir.rs).
+    // temp dirs that are removed when nullroute exits (tmpdir.rs). They stay
+    // until then on purpose: a nullroute started inside the sandbox bind-mounts
+    // its own decoys over these mounts, which the kernel refuses (ENOENT) once
+    // the mounted files have been unlinked.
     if let Some(h) = hide.as_deref_mut() {
         h.prepare()?;
     }
     let dns_files = Some(dns::Files::create(dns.is_some())?).filter(|f| !f.mounts.is_empty());
-    // The child deletes the scratch files itself once its bind mounts are in
-    // place (before it execs), so a running command implies they are gone.
-    let mut scratch_cleanup = Vec::new();
-    if let Some(h) = hide.as_deref() {
-        scratch_cleanup.extend(h.child_cleanup()?);
-    }
-    if let Some(f) = &dns_files {
-        scratch_cleanup.push(f.child_cleanup()?);
-    }
     let need_mount_ns = hide.is_some() || dns_files.is_some();
     let mounts = if need_mount_ns {
         let mut m = hide
@@ -135,6 +131,18 @@ pub fn run_hermetic(
         None
     };
     let flags = namespace_flags(need_mount_ns);
+    // Built here because building allocates; the child only installs it.
+    let seccomp_filter = if !use_seccomp {
+        None
+    } else if let Some(f) = seccomp::Filter::new().filter(|_| seccomp::available()) {
+        Some(f)
+    } else {
+        diagln!(
+            "nullroute: warning: this kernel or architecture can't load the seccomp filter; \
+             running without it (no_new_privs is still set)"
+        );
+        None
+    };
     let pool_address = dns.is_some();
 
     let child_mask = blocked.child_mask()?;
@@ -191,9 +199,6 @@ pub fn run_hermetic(
                 if let Some(c) = child_side.as_mut() {
                     c.listen_and_send()?;
                 }
-                for c in &scratch_cleanup {
-                    c.run();
-                }
                 if let Some(original) = &nofile_original
                     && libc::setrlimit(libc::RLIMIT_NOFILE, original) != 0
                 {
@@ -201,6 +206,12 @@ pub fn run_hermetic(
                 }
                 // Re-arm after the user-namespace credential change (lifecycle.rs).
                 lifecycle::die_with_parent(parent)?;
+                // After the last socket and ioctl the setup itself needs (the
+                // filter denies some of them), before the command exists.
+                match seccomp_filter.as_ref() {
+                    Some(f) => f.install()?,
+                    None => seccomp::set_no_new_privs()?,
+                }
                 // Last: unblock, so nothing is delivered before setup is done. A
                 // SIGINT/SIGQUIT that reached only nullroute is passed on here.
                 child_mask.restore(parent_status)?;
@@ -221,14 +232,6 @@ pub fn run_hermetic(
     // Dropping cmd drops the pre_exec closure and with it the parent's copy of
     // the child's socket end.
     drop(cmd);
-    // The child already deleted the files (scratch_cleanup); this removes
-    // whatever is left, e.g. when the child failed before that point.
-    if let Some(f) = &dns_files {
-        f.cleanup();
-    }
-    if let Some(h) = hide.as_deref() {
-        h.cleanup();
-    }
     let mut child = spawned?;
     let fwd = match blocked.start(child.id(), sentinel) {
         Ok(f) => f,

@@ -17,14 +17,26 @@
 //! unmounting needs CAP_SYS_ADMIN. Mounts are only changed inside the new mount
 //! namespace; the host's filesystem is untouched.
 //!
-//! By default the well-known container-runtime sockets and the system D-Bus
-//! socket are hidden. `--hide-socket` adds more and `--allow-socket` keeps one
-//! visible.
+//! By default these are hidden (the ones that exist; see [`SocketEnv::default_sockets`]):
+//! container runtimes, the system D-Bus, the user's session D-Bus and systemd
+//! user manager, snapd, SSH/keyring agents (`$SSH_AUTH_SOCK`) and gpg-agent /
+//! dirmngr. `--hide-socket` adds more and `--allow-socket` keeps one visible.
 //!
-//! D-Bus is hidden because the system bus reaches host services that live
-//! outside the network namespace. The obvious one is systemd-resolved
-//! (`org.freedesktop.resolve1`), which would happily resolve any name on the
-//! command's behalf: a DNS side channel straight past the sandbox.
+//! Each of these is a service that lives outside the network namespace and
+//! will do things on the command's behalf. The system bus reaches
+//! systemd-resolved (`org.freedesktop.resolve1`), which resolves any name for
+//! whoever asks: a DNS side channel straight past the sandbox. The session bus
+//! and the systemd user manager start processes on the host (`systemd-run
+//! --user` runs a command in the host's network namespace). dirmngr fetches
+//! keys over the host's network, snapd installs snaps, container runtimes
+//! start containers with a network.
+//!
+//! Abstract sockets (`@name`, a D-Bus session bus address of the form
+//! `unix:abstract=...`, the X11 `@/tmp/.X11-unix/X0` name) live in the network
+//! namespace, so the sandbox's own empty one hides the host's: nothing to do.
+//! Display servers (X11, Wayland) are not hidden by default: they can inject
+//! input and read the screen, but that is not a way to the network, and hiding
+//! them would break GUI tests. Hide one with `--hide-socket` if that matters.
 
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -42,35 +54,210 @@ use crate::limits::{self, Limiter};
 use crate::report::{Kind, Report, json_string};
 use crate::tmpdir::PrivateDir;
 
-/// Sockets hidden unless `--allow-socket`ed, each with why: container
-/// runtimes, whose daemons can start network-connected containers on the
-/// command's behalf, and the system D-Bus, whose services (systemd-resolved)
-/// can resolve names outside the sandbox.
-pub fn default_sockets() -> Vec<(PathBuf, &'static str)> {
-    let mut v: Vec<(PathBuf, &'static str)> = runtime_sockets()
-        .into_iter()
-        .map(|p| (p, RUNTIME_REASON))
-        .collect();
-    v.extend(dbus_system_sockets().into_iter().map(|p| (p, DBUS_REASON)));
-    v
+/// What the default list of hidden sockets is derived from: the places a user's session
+/// services listen, which depend on the environment. Separate from the process
+/// environment so tests can build one without touching it.
+#[derive(Debug, Default, Clone)]
+pub struct SocketEnv {
+    pub uid: u32,
+    /// `$XDG_RUNTIME_DIR`.
+    pub xdg_runtime_dir: Option<PathBuf>,
+    /// `$HOME`.
+    pub home: Option<PathBuf>,
+    /// `$GNUPGHOME`.
+    pub gnupg_home: Option<PathBuf>,
+    /// `$DBUS_SESSION_BUS_ADDRESS`.
+    pub dbus_session: Option<String>,
+    /// `$DBUS_SYSTEM_BUS_ADDRESS`.
+    pub dbus_system: Option<String>,
+    /// `$SSH_AUTH_SOCK`.
+    pub ssh_auth_sock: Option<PathBuf>,
+    /// `$DOCKER_HOST`.
+    pub docker_host: Option<String>,
 }
 
-/// The system bus socket, at its standard paths and wherever
-/// DBUS_SYSTEM_BUS_ADDRESS points (`unix:path=...`).
-pub fn dbus_system_sockets() -> Vec<PathBuf> {
-    let mut v = vec![
-        PathBuf::from(DBUS_SYSTEM_SOCKET),
-        PathBuf::from("/var/run/dbus/system_bus_socket"),
-    ];
-    if let Ok(addr) = std::env::var("DBUS_SYSTEM_BUS_ADDRESS") {
-        v.extend(dbus_address_paths(&addr));
+impl SocketEnv {
+    pub fn from_env() -> Self {
+        let var = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty());
+        SocketEnv {
+            // SAFETY: getuid has no preconditions and cannot fail.
+            uid: unsafe { libc::getuid() },
+            xdg_runtime_dir: var("XDG_RUNTIME_DIR").map(PathBuf::from),
+            home: var("HOME").map(PathBuf::from),
+            gnupg_home: var("GNUPGHOME").map(PathBuf::from),
+            dbus_session: var("DBUS_SESSION_BUS_ADDRESS").and_then(|v| v.into_string().ok()),
+            dbus_system: var("DBUS_SYSTEM_BUS_ADDRESS").and_then(|v| v.into_string().ok()),
+            ssh_auth_sock: var("SSH_AUTH_SOCK").map(PathBuf::from),
+            docker_host: var("DOCKER_HOST").and_then(|v| v.into_string().ok()),
+        }
     }
-    v
+
+    /// The directories a session's runtime sockets live in: `$XDG_RUNTIME_DIR`
+    /// and the conventional `/run/user/UID` (which is where a user's session
+    /// bus is even when the variable isn't set, as in cron and some CI shells).
+    fn runtime_dirs(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = self.xdg_runtime_dir.iter().cloned().collect();
+        let conventional = PathBuf::from(format!("/run/user/{}", self.uid));
+        if !v.contains(&conventional) {
+            v.push(conventional);
+        }
+        v
+    }
+
+    /// Container-runtime sockets, at their standard paths and wherever
+    /// `DOCKER_HOST` points.
+    fn runtime_sockets(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = [
+            "/var/run/docker.sock",
+            "/run/docker.sock",
+            "/run/podman/podman.sock",
+            "/run/containerd/containerd.sock",
+            "/run/buildkit/buildkitd.sock",
+            "/run/k3s/containerd/containerd.sock",
+            "/run/crio/crio.sock",
+            "/run/libvirt/libvirt-sock",
+            "/var/lib/lxd/unix.socket",
+            "/var/snap/lxd/common/lxd/unix.socket",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        for dir in self.runtime_dirs() {
+            for rel in [
+                "docker.sock", // rootless Docker
+                "docker/containerd/containerd.sock",
+                "podman/podman.sock", // rootless Podman
+                "buildkit/buildkitd.sock",
+                "libvirt/libvirt-sock",
+            ] {
+                v.push(dir.join(rel));
+            }
+        }
+        v.extend(self.docker_api_home_sockets());
+        // An explicit DOCKER_HOST=unix:///path is where the CLI will actually go.
+        if let Some(p) = self
+            .docker_host
+            .as_deref()
+            .and_then(|h| h.strip_prefix("unix://"))
+        {
+            v.push(PathBuf::from(p));
+        }
+        v
+    }
+
+    /// Sockets that speak the Docker HTTP API, the ones `--seal-docker` can
+    /// seal: the system and rootless Docker sockets, `DOCKER_HOST` and the
+    /// home-directory ones. (containerd and BuildKit speak gRPC and are only
+    /// hidden.)
+    pub fn docker_api_sockets(&self) -> Vec<PathBuf> {
+        let mut v = vec![
+            PathBuf::from("/var/run/docker.sock"),
+            PathBuf::from("/run/docker.sock"),
+        ];
+        v.extend(
+            self.runtime_dirs()
+                .into_iter()
+                .map(|d| d.join("docker.sock")),
+        );
+        v.extend(self.docker_api_home_sockets());
+        if let Some(p) = self
+            .docker_host
+            .as_deref()
+            .and_then(|h| h.strip_prefix("unix://"))
+        {
+            v.push(PathBuf::from(p));
+        }
+        v
+    }
+
+    /// Docker API sockets that Docker Desktop and the VM-based runtimes
+    /// (Colima, Rancher Desktop, Lima, OrbStack) keep in the home directory.
+    /// Wildcards are expanded against what exists.
+    pub fn docker_api_home_sockets(&self) -> Vec<PathBuf> {
+        let Some(home) = &self.home else {
+            return Vec::new();
+        };
+        [
+            ".docker/run/docker.sock", // Docker Desktop
+            ".docker/desktop/*.sock",
+            ".colima/*/docker.sock",
+            ".rd/docker.sock", // Rancher Desktop
+            ".lima/*/sock/docker.sock",
+            ".orbstack/run/docker.sock",
+        ]
+        .iter()
+        .flat_map(|rel| expand(&home.join(rel)))
+        .collect()
+    }
+
+    /// Everything hidden unless `--allow-socket`ed, each with why. Only sockets
+    /// that exist are hidden by [`plan`]; a path that isn't there is skipped
+    /// silently.
+    pub fn default_sockets(&self) -> Vec<(PathBuf, &'static str)> {
+        let mut v: Vec<(PathBuf, &'static str)> = Vec::new();
+        let mut add = |paths: Vec<PathBuf>, why: &'static str| {
+            v.extend(paths.into_iter().map(|p| (p, why)));
+        };
+        add(self.runtime_sockets(), RUNTIME_REASON);
+        add(self.system_bus_sockets(), DBUS_REASON);
+
+        let mut session: Vec<PathBuf> = self
+            .dbus_session
+            .as_deref()
+            .map(dbus_address_paths)
+            .unwrap_or_default();
+        let mut manager = Vec::new();
+        let mut snapd = vec![
+            PathBuf::from("/run/snapd.socket"),
+            PathBuf::from("/run/snapd-snap.socket"),
+        ];
+        let mut agents: Vec<PathBuf> = self.ssh_auth_sock.iter().cloned().collect();
+        let mut gpg = Vec::new();
+        for dir in self.runtime_dirs() {
+            session.push(dir.join("bus"));
+            manager.push(dir.join("systemd/private"));
+            snapd.push(dir.join("snapd-session-agent.socket"));
+            agents.extend(
+                ["ssh-agent.socket", "openssh_agent", "gcr/ssh", "keyring/*"]
+                    .iter()
+                    .flat_map(|rel| expand(&dir.join(rel))),
+            );
+            gpg.extend(
+                ["gnupg/S.*", "gnupg/d.*/S.*"]
+                    .iter()
+                    .flat_map(|rel| expand(&dir.join(rel))),
+            );
+        }
+        let gnupg_homes = self.home.iter().map(|h| h.join(".gnupg"));
+        for dir in gnupg_homes.chain(self.gnupg_home.clone()) {
+            gpg.extend(expand(&dir.join("S.*")));
+        }
+        add(session, SESSION_BUS_REASON);
+        add(manager, USER_MANAGER_REASON);
+        add(snapd, SNAPD_REASON);
+        add(agents, AGENT_REASON);
+        add(gpg, GPG_REASON);
+        v
+    }
+
+    /// The system bus socket, at its standard paths and wherever
+    /// DBUS_SYSTEM_BUS_ADDRESS points (`unix:path=...`).
+    fn system_bus_sockets(&self) -> Vec<PathBuf> {
+        let mut v = vec![
+            PathBuf::from(DBUS_SYSTEM_SOCKET),
+            PathBuf::from("/var/run/dbus/system_bus_socket"),
+        ];
+        if let Some(addr) = &self.dbus_system {
+            v.extend(dbus_address_paths(addr));
+        }
+        v
+    }
 }
 
 /// Socket paths in a D-Bus address: a ;-separated list of
 /// `transport:key=value,...`, of which `unix:path=...` names a file.
-/// (Abstract sockets are scoped to the network namespace, so they don't matter.)
+/// Abstract sockets (`unix:abstract=...`) are skipped on purpose: they are
+/// scoped to the network namespace, so the sandbox can't reach the host's.
 fn dbus_address_paths(addr: &str) -> Vec<PathBuf> {
     addr.split(';')
         .filter_map(|t| t.strip_prefix("unix:"))
@@ -84,32 +271,68 @@ fn dbus_address_paths(addr: &str) -> Vec<PathBuf> {
 /// Where the system D-Bus listens on practically every distribution.
 pub const DBUS_SYSTEM_SOCKET: &str = "/run/dbus/system_bus_socket";
 
-fn runtime_sockets() -> Vec<PathBuf> {
-    let mut v: Vec<PathBuf> = [
-        "/var/run/docker.sock",
-        "/run/docker.sock",
-        "/run/podman/podman.sock",
-        "/run/containerd/containerd.sock",
-        "/run/buildkit/buildkitd.sock",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .collect();
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let xdg = PathBuf::from(xdg);
-        v.push(xdg.join("docker.sock")); // rootless Docker
-        v.push(xdg.join("podman/podman.sock")); // rootless Podman
+/// Expand `*` wildcards in a path, one path component at a time (a component
+/// like `S.*` or `*.sock` matches directory entries; `*` doesn't match a
+/// leading dot or cross a `/`). Wildcard-free paths come back unchanged
+/// whether or not they exist; wildcard ones only yield what exists.
+pub fn expand(pattern: &Path) -> Vec<PathBuf> {
+    use std::path::Component;
+    let mut paths = vec![PathBuf::new()];
+    for comp in pattern.components() {
+        let name = match comp {
+            Component::Normal(n) => n,
+            other => {
+                paths.iter_mut().for_each(|p| p.push(other.as_os_str()));
+                continue;
+            }
+        };
+        let Some(pat) = name.to_str().filter(|n| n.contains('*')) else {
+            paths.iter_mut().for_each(|p| p.push(name));
+            continue;
+        };
+        let mut next = Vec::new();
+        for dir in &paths {
+            let Ok(rd) = std::fs::read_dir(dir) else {
+                continue;
+            };
+            let mut names: Vec<_> = rd
+                .flatten()
+                .map(|e| e.file_name())
+                .filter(|n| {
+                    n.to_str().is_some_and(|n| {
+                        (!n.starts_with('.') || pat.starts_with('.')) && wildcard_match(pat, n)
+                    })
+                })
+                .collect();
+            names.sort();
+            next.extend(names.into_iter().map(|n| dir.join(n)));
+        }
+        paths = next;
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        v.push(PathBuf::from(home).join(".docker/run/docker.sock")); // Docker Desktop for Linux
+    paths
+}
+
+/// Match `s` against a pattern where `*` stands for any run of characters.
+fn wildcard_match(pat: &str, s: &str) -> bool {
+    let (p, s) = (pat.as_bytes(), s.as_bytes());
+    let (mut pi, mut si) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while si < s.len() {
+        if pi < p.len() && p[pi] == b'*' {
+            star = Some((pi, si));
+            pi += 1;
+        } else if pi < p.len() && p[pi] == s[si] {
+            pi += 1;
+            si += 1;
+        } else if let Some((sp, ss)) = star {
+            pi = sp + 1;
+            si = ss + 1;
+            star = Some((sp, ss + 1));
+        } else {
+            return false;
+        }
     }
-    // An explicit DOCKER_HOST=unix:///path is where the CLI will actually go.
-    if let Ok(h) = std::env::var("DOCKER_HOST")
-        && let Some(p) = h.strip_prefix("unix://")
-    {
-        v.push(PathBuf::from(p));
-    }
-    v
+    p[pi..].iter().all(|&c| c == b'*')
 }
 
 /// What a decoy does with connections.
@@ -133,6 +356,14 @@ struct Decoy {
 
 const RUNTIME_REASON: &str = "container runtimes can start containers with full network access";
 const DBUS_REASON: &str = "the system D-Bus reaches host services such as systemd-resolved, which resolve names outside the sandbox";
+const SESSION_BUS_REASON: &str = "the session D-Bus can start processes on the host with full network access, for example through systemd-run --user";
+const USER_MANAGER_REASON: &str =
+    "the systemd user manager can start processes on the host with full network access";
+const SNAPD_REASON: &str = "snapd installs and runs snaps outside the sandbox, with network access";
+const AGENT_REASON: &str =
+    "an SSH or keyring agent signs with your keys for anything the command can reach";
+const GPG_REASON: &str =
+    "gpg-agent holds your keys and dirmngr looks keys up on the host's network";
 const EXPLICIT_REASON: &str = "hidden with --hide-socket";
 
 /// What to hide. [`Plan::prepare`] makes the decoys listen, in a private temp
@@ -147,17 +378,39 @@ pub struct Plan {
 /// (decoy path, target path) pairs for the child, allocated before fork.
 pub type MountList = Vec<(CString, CString)>;
 
-/// Work out which sockets to hide. Defaults and `--hide-socket` paths that don't
-/// exist (or aren't sockets) are skipped; explicit ones with a warning.
+/// Work out which sockets to hide. Defaults that don't exist (or aren't
+/// sockets) are skipped silently; so are the standard Docker sockets under
+/// `--seal-docker` (`seal_defaults`). Paths the user named (`--hide-socket`,
+/// `--seal-docker-socket`) get a warning if they can't be used.
 /// Returns None when there is nothing to hide, so no mount namespace is needed.
-pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Result<Option<Plan>> {
+pub fn plan(
+    extra: &[PathBuf],
+    allow: &[PathBuf],
+    seal: &[PathBuf],
+    seal_defaults: &[PathBuf],
+) -> io::Result<Option<Plan>> {
+    plan_for(&SocketEnv::from_env(), extra, allow, seal, seal_defaults)
+}
+
+fn plan_for(
+    env: &SocketEnv,
+    extra: &[PathBuf],
+    allow: &[PathBuf],
+    seal: &[PathBuf],
+    seal_defaults: &[PathBuf],
+) -> io::Result<Option<Plan>> {
     let allowed: BTreeSet<PathBuf> = allow.iter().map(|p| canonical_or_same(p)).collect();
     // Docker sockets to seal (proxy + force no-network) rather than block.
-    let sealed: BTreeSet<PathBuf> = seal.iter().map(|p| canonical_or_same(p)).collect();
+    let sealed: BTreeSet<PathBuf> = seal
+        .iter()
+        .chain(seal_defaults)
+        .map(|p| canonical_or_same(p))
+        .collect();
     // BTreeMap keeps output stable; (Mode, reason) per target. Sealing wins.
     let mut targets: std::collections::BTreeMap<PathBuf, (Mode, &'static str)> =
         std::collections::BTreeMap::new();
-    let candidates = default_sockets()
+    let candidates = env
+        .default_sockets()
         .into_iter()
         .map(|(p, why)| (p, why, false))
         .chain(extra.iter().cloned().map(|p| (p, EXPLICIT_REASON, true)));
@@ -193,20 +446,34 @@ pub fn plan(extra: &[PathBuf], allow: &[PathBuf], seal: &[PathBuf]) -> io::Resul
             *r = (Mode::Block, EXPLICIT_REASON);
         }
     }
-    for path in seal {
+    let requested = seal.iter().map(|p| (p, true));
+    let standard = seal_defaults.iter().map(|p| (p, false));
+    let mut sealed_any = false;
+    for (path, explicit) in requested.chain(standard) {
         let Ok(canon) = std::fs::canonicalize(path) else {
-            diagln!(
-                "nullroute: --seal-docker: {} not found, ignoring",
-                path.display()
-            );
+            if explicit {
+                diagln!(
+                    "nullroute: --seal-docker-socket {}: not found, ignoring",
+                    path.display()
+                );
+            }
             continue;
         };
-        if std::fs::metadata(&canon)
-            .map(|m| m.file_type().is_socket())
-            .unwrap_or(false)
-        {
+        if std::fs::metadata(&canon).is_ok_and(|m| m.file_type().is_socket()) {
             targets.insert(canon, (Mode::SealDocker, crate::docker::SEAL_REASON));
+            sealed_any = true;
+        } else if explicit {
+            diagln!(
+                "nullroute: --seal-docker-socket {}: not a Unix socket, ignoring",
+                path.display()
+            );
         }
+    }
+    if !seal_defaults.is_empty() && !sealed_any {
+        diagln!(
+            "nullroute: --seal-docker: no Docker socket found at the standard paths; \
+             use --seal-docker-socket PATH for a non-standard one"
+        );
     }
     if targets.is_empty() {
         return Ok(None);
@@ -244,22 +511,6 @@ impl Plan {
         }
         self.scratch = Some(scratch);
         Ok(())
-    }
-
-    /// What the forked child deletes after its bind mounts (tmpdir.rs).
-    pub fn child_cleanup(&self) -> io::Result<Option<crate::tmpdir::ChildCleanup>> {
-        self.scratch
-            .as_ref()
-            .map(PrivateDir::child_cleanup)
-            .transpose()
-    }
-
-    /// Remove the temp dir. Call once the command has been spawned: the
-    /// bind mounts keep the sockets alive and the listeners are open fds.
-    pub fn cleanup(&self) {
-        if let Some(s) = &self.scratch {
-            s.remove();
-        }
     }
 
     pub fn mount_list(&self) -> io::Result<MountList> {
@@ -411,7 +662,7 @@ mod tests {
 
     #[test]
     fn system_dbus_is_hidden_by_default_with_its_own_reason() {
-        let d = default_sockets();
+        let d = SocketEnv::from_env().default_sockets();
         assert!(
             d.iter()
                 .any(|(p, why)| p == Path::new(DBUS_SYSTEM_SOCKET) && *why == DBUS_REASON),
@@ -437,18 +688,188 @@ mod tests {
         assert!(dbus_address_paths("unix:path=").is_empty());
     }
 
+    /// A temp directory laid out like a user's runtime dir, with real sockets.
+    struct Session {
+        root: PathBuf,
+        env: SocketEnv,
+        _listeners: Vec<std::os::unix::net::UnixListener>,
+    }
+
+    impl Session {
+        fn new(tag: &str) -> Session {
+            let root = std::env::temp_dir().join(format!("nr-hide-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let xdg = root.join("run");
+            std::fs::create_dir_all(&xdg).unwrap();
+            let env = SocketEnv {
+                uid: u32::MAX - 1, // so /run/user/UID is never a real directory
+                xdg_runtime_dir: Some(xdg),
+                home: Some(root.join("home")),
+                ..SocketEnv::default()
+            };
+            Session {
+                root,
+                env,
+                _listeners: Vec::new(),
+            }
+        }
+
+        fn sock(&mut self, path: &Path) -> PathBuf {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            self._listeners
+                .push(std::os::unix::net::UnixListener::bind(path).unwrap());
+            std::fs::canonicalize(path).unwrap()
+        }
+
+        fn xdg(&self) -> PathBuf {
+            self.env.xdg_runtime_dir.clone().unwrap()
+        }
+    }
+
+    impl Drop for Session {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn blocked(env: &SocketEnv) -> Vec<PathBuf> {
+        plan_for(env, &[], &[], &[], &[])
+            .unwrap()
+            .map(|p| p.blocked_targets().map(Path::to_path_buf).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn session_sockets_are_hidden_by_default_when_they_exist() {
+        let mut s = Session::new("session");
+        let xdg = s.xdg();
+        let want = [
+            s.sock(&xdg.join("bus")),
+            s.sock(&xdg.join("systemd/private")),
+            s.sock(&xdg.join("snapd-session-agent.socket")),
+            s.sock(&xdg.join("gnupg/S.gpg-agent")),
+            s.sock(&xdg.join("gnupg/S.dirmngr")),
+            s.sock(&xdg.join("gnupg/d.abc123/S.gpg-agent")),
+            s.sock(&xdg.join("keyring/ssh")),
+            s.sock(&xdg.join("docker.sock")),
+            s.sock(&xdg.join("podman/podman.sock")),
+            s.sock(&s.root.join("home/.gnupg/S.gpg-agent.ssh")),
+            s.sock(&s.root.join("home/.docker/desktop/docker.sock")),
+            s.sock(&s.root.join("home/.colima/default/docker.sock")),
+            s.sock(&s.root.join("home/.rd/docker.sock")),
+        ];
+        let got = blocked(&s.env);
+        for w in &want {
+            assert!(got.contains(w), "{w:?} not hidden; hidden: {got:?}");
+        }
+        // Sockets that are not on the list stay visible.
+        let other = s.sock(&xdg.join("pulse/native"));
+        let other2 = s.sock(&xdg.join("systemd/notify"));
+        let got = blocked(&s.env);
+        assert!(!got.contains(&other) && !got.contains(&other2), "{got:?}");
+    }
+
+    #[test]
+    fn env_variables_name_more_sockets() {
+        let mut s = Session::new("envvars");
+        let agent = s.sock(&s.root.join("elsewhere/agent.1234"));
+        let bus = s.sock(&s.root.join("elsewhere/mybus"));
+        let docker = s.sock(&s.root.join("elsewhere/dock.sock"));
+        let gnupg = s.sock(&s.root.join("gnupghome/S.gpg-agent"));
+        s.env.ssh_auth_sock = Some(agent.clone());
+        s.env.dbus_session = Some(format!(
+            "unix:abstract=/tmp/dbus-nope,guid=1;unix:path={},guid=2",
+            bus.display()
+        ));
+        s.env.docker_host = Some(format!("unix://{}", docker.display()));
+        s.env.gnupg_home = Some(s.root.join("gnupghome"));
+        let got = blocked(&s.env);
+        for w in [&agent, &bus, &docker, &gnupg] {
+            assert!(got.contains(w), "{w:?} not hidden; hidden: {got:?}");
+        }
+    }
+
+    #[test]
+    fn missing_default_sockets_are_skipped_silently() {
+        // Nothing exists below the session's directories: plan() finds nothing
+        // there (and prints nothing; it only warns about paths the user named).
+        let s = Session::new("missing");
+        let listed: Vec<_> = s
+            .env
+            .default_sockets()
+            .into_iter()
+            .filter(|(p, _)| p.starts_with(&s.root))
+            .collect();
+        assert!(listed.iter().any(|(p, _)| p.ends_with("bus")), "{listed:?}");
+        assert!(blocked(&s.env).iter().all(|p| !p.starts_with(&s.root)));
+    }
+
+    #[test]
+    fn allow_socket_keeps_a_default_hidden_socket_visible() {
+        let mut s = Session::new("allow");
+        let bus = s.sock(&s.xdg().join("bus"));
+        let agent = s.sock(&s.root.join("agent"));
+        s.env.ssh_auth_sock = Some(agent.clone());
+        let p = plan_for(&s.env, &[], std::slice::from_ref(&bus), &[], &[])
+            .unwrap()
+            .unwrap();
+        let hidden: Vec<_> = p.blocked_targets().collect();
+        assert!(!hidden.contains(&bus.as_path()), "{hidden:?}");
+        assert!(hidden.contains(&agent.as_path()), "{hidden:?}");
+    }
+
+    #[test]
+    fn abstract_bus_addresses_name_no_file() {
+        assert!(dbus_address_paths("unix:abstract=/tmp/dbus-abc,guid=1").is_empty());
+    }
+
+    #[test]
+    fn wildcards_expand_one_component_at_a_time() {
+        let mut s = Session::new("glob");
+        let a = s.sock(&s.root.join("d/one.sock"));
+        let b = s.sock(&s.root.join("d/two.sock"));
+        s.sock(&s.root.join("d/three.txt"));
+        s.sock(&s.root.join("d/.hidden.sock"));
+        s.sock(&s.root.join("x/deep/one.sock"));
+        assert_eq!(expand(&s.root.join("d/*.sock")), vec![a.clone(), b.clone()]);
+        assert_eq!(expand(&s.root.join("d/t*")).len(), 2);
+        assert_eq!(expand(&s.root.join("x/*/one.sock")).len(), 1);
+        assert!(expand(&s.root.join("nope/*.sock")).is_empty());
+        // No wildcard: returned as given, existing or not.
+        assert_eq!(
+            expand(&s.root.join("nope/plain")),
+            vec![s.root.join("nope/plain")]
+        );
+        assert!(wildcard_match("S.*", "S.gpg-agent"));
+        assert!(wildcard_match("*.sock", "a.sock"));
+        assert!(!wildcard_match("*.sock", "a.sockx"));
+        assert!(wildcard_match("a*b*c", "aXXbYYc"));
+        assert!(!wildcard_match("a*b*c", "aXXbYY"));
+    }
+
+    #[test]
+    fn explicit_seal_paths_warn_but_standard_ones_do_not_matter() {
+        let mut s = Session::new("seal");
+        let sock = s.sock(&s.xdg().join("docker.sock"));
+        let p = plan_for(&s.env, &[], &[], &[], std::slice::from_ref(&sock))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.sealed_targets().collect::<Vec<_>>(), vec![sock.as_path()]);
+        assert!(p.blocked_targets().all(|t| t != sock));
+    }
+
     #[test]
     fn allow_socket_keeps_the_system_bus_visible() {
         let Ok(canon) = std::fs::canonicalize(DBUS_SYSTEM_SOCKET) else {
             return eprintln!("skipping: no system D-Bus socket");
         };
-        let hidden = plan(&[], &[], &[]).unwrap();
+        let hidden = plan(&[], &[], &[], &[]).unwrap();
         assert!(
             hidden
                 .as_ref()
                 .is_some_and(|p| p.blocked_targets().any(|t| t == canon))
         );
-        let allowed = plan(&[], &[PathBuf::from(DBUS_SYSTEM_SOCKET)], &[]).unwrap();
+        let allowed = plan(&[], &[PathBuf::from(DBUS_SYSTEM_SOCKET)], &[], &[]).unwrap();
         assert!(
             allowed
                 .as_ref()

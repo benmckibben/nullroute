@@ -26,7 +26,6 @@ const CHILD_PATH: &[(&str, &str)] = &[
     ("signals.rs", "feed"),
     ("signals.rs", "finish"),
     ("signals.rs", "sentinel_main"),
-    ("tmpdir.rs", "run"),
     ("sandbox.rs", "write_file"),
     ("sandbox.rs", "loopback_up"),
 ];

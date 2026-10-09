@@ -36,7 +36,9 @@ Reporters are credited in the changelog unless they'd rather not be.
 nullroute stops **accidental** network access by commands you run: tests that
 call real services, build scripts that download things, libraries that phone
 home. It does this with the kernel (a new user and network namespace with only a
-loopback device), not with environment variables or library hooks. See the
+loopback device) plus a few specific hardening steps (hidden Unix sockets,
+`no_new_privs`, a small seccomp filter), not with environment variables or library
+hooks. See the
 [README](README.md#what-nullroute-is-not) for the full list of what is and isn't
 protected.
 
@@ -56,10 +58,19 @@ buggy. For example:
 - getting past the `--allow` allowlist: a host that isn't allowed, the
   loopback, link-local and cloud-metadata destinations the proxy and DNS
   sinkhole refuse, or DNS lookups that leave the sandbox;
-- getting past the default-hidden or masked Unix sockets (container runtimes,
-  system D-Bus, systemd-resolved, nscd);
+- getting past the default-hidden or masked Unix sockets: container runtimes
+  (Docker, Podman, containerd, BuildKit, CRI-O, k3s, LXD, libvirt, Docker
+  Desktop, Colima, Rancher Desktop, Lima, OrbStack), the system D-Bus, the
+  session D-Bus, the systemd user manager, snapd, SSH and keyring agents
+  (`$SSH_AUTH_SOCK`), gpg-agent and dirmngr, and systemd-resolved and nscd (the
+  README lists the paths); a service that can be asked to act on the host's
+  network from one of those is in scope, an unlisted one is a feature request;
+- getting past the seccomp filter or `no_new_privs`: creating an `AF_VSOCK`,
+  Bluetooth, NFC or QIPCRTR socket, `TIOCSTI`/`TIOCLINUX` on the controlling
+  terminal, or io_uring, without `--no-seccomp`;
 - under `--seal-docker`, getting a container, build, service or plugin a
-  network, or making the Docker daemon contact something that
+  network, or running code in, starting or attaching to an existing container that
+  has one without `--seal-docker-allow-existing`, or making the Docker daemon contact something that
   `--seal-docker-pulls` should have refused (the gaps documented in the README
   aren't bugs);
 - the command outliving nullroute, or signals being lost at startup;
@@ -71,7 +82,10 @@ buggy. For example:
 - Anything that needs a hostile command to attack the host by other means than
   the network (filesystem access, other processes, kernel exploits).
 - Limits documented in the README's "What nullroute is not" and in the Docker
-  sections (for example inherited file descriptors, running as root, other
-  local Unix sockets, registry mirrors, remote logging drivers).
+  sections (for example inherited file descriptors, running as root,
+  credentials the command inherits, display servers and other Unix sockets that
+  aren't on the default list, signalling or inspecting your other processes
+  (there is no PID namespace), shared IPC and `/dev/shm`, registry mirrors,
+  remote logging drivers).
 - Vulnerabilities in dependencies that don't affect nullroute (the build runs
   `cargo deny` against the RustSec advisory database, weekly).

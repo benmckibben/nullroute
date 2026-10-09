@@ -1,32 +1,29 @@
-//! Private scratch directories that can't be leaked.
+//! Private scratch directories that don't pile up.
 //!
 //! The decoy sockets (hide.rs) and the generated resolv.conf and mask file
 //! (dns.rs) have to exist as files to be bind-mounted into the sandbox, so
 //! they need a directory in the temp dir. Three things keep it from piling up
 //! there:
 //!
-//! 1. The directory only lives while the sandbox is being set up: a bind mount
-//!    keeps the file it was made from alive, so the forked child deletes the
-//!    files and the directory right after making its mounts, before it execs
-//!    the command ([`ChildCleanup`]; the parent removes whatever is left with
-//!    [`PrivateDir::remove`]). A running command therefore implies the
-//!    directory is gone, and a SIGKILL, the OOM killer or a crash while the
-//!    command runs leaves nothing behind.
+//! 1. The directory lives as long as nullroute does and is removed when it
+//!    exits ([`PrivateDir`]'s drop). The files can't go earlier: a nullroute
+//!    started inside the sandbox bind-mounts its own decoys over these mounts,
+//!    and the kernel refuses (`ENOENT`) to mount over a file that has been
+//!    unlinked. (Deleting them from the child right after its mounts would
+//!    leave nothing behind when nullroute is killed, but breaks nesting.)
 //! 2. Every directory is created holding an exclusive `flock` that the kernel
 //!    drops when the process dies, however it dies. The lock is the "in use"
 //!    marker: no process-id or start-time guessing, and it works across PID
 //!    namespaces.
-//! 3. The one window left, a kill between creating the directory and the
-//!    child's cleanup, is cleaned up by the next run ([`sweep`]): at startup it
-//!    removes directories named like ours that belong to the current user, are
-//!    over a minute old and that nobody holds the lock of. Directories of
-//!    other users, other names, symlinks and anything younger are left alone.
+//! 3. What a kill (SIGKILL, the OOM killer, a crash) leaves behind is cleaned
+//!    up by the next run ([`sweep`]): at startup it removes directories named
+//!    like ours that belong to the current user, are over a minute old and
+//!    that nobody holds the lock of. Directories of other users, other names,
+//!    symlinks and anything younger are left alone.
 
-use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Once;
@@ -83,51 +80,6 @@ impl PrivateDir {
     /// already bind-mounted from it stay usable.
     pub fn remove(&self) {
         let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
-
-impl PrivateDir {
-    /// What the forked child should delete, listed now so the child needn't
-    /// allocate: the directory's current entries and the directory. See
-    /// [`ChildCleanup`].
-    pub fn child_cleanup(&self) -> io::Result<ChildCleanup> {
-        let c = |p: &Path| {
-            CString::new(p.as_os_str().as_bytes())
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
-        };
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(&self.path)? {
-            files.push(c(&entry?.path())?);
-        }
-        Ok(ChildCleanup {
-            files,
-            dir: c(&self.path)?,
-        })
-    }
-}
-
-/// Files and a directory for the child to delete once its bind mounts are in
-/// place, just before it execs the command. That makes "the command is running"
-/// imply "the scratch directory is gone", with no window in which a kill of
-/// nullroute (after the exec, before the parent gets to clean up) could leave it
-/// behind. The parent still removes whatever is left ([`PrivateDir::remove`]).
-pub struct ChildCleanup {
-    files: Vec<CString>,
-    dir: CString,
-}
-
-impl ChildCleanup {
-    /// Delete the files, then the directory; errors are ignored (the parent
-    /// cleans up what remains). Allocation-free and async-signal-safe: only
-    /// unlink(2) and rmdir(2), so it can run between fork and exec.
-    pub fn run(&self) {
-        // SAFETY: valid NUL-terminated paths, built before the fork.
-        unsafe {
-            for f in &self.files {
-                libc::unlink(f.as_ptr());
-            }
-            libc::rmdir(self.dir.as_ptr());
-        }
     }
 }
 
@@ -309,18 +261,6 @@ mod tests {
         drop(held);
         assert_eq!(sweep(&b.0, Duration::from_secs(60)), 1);
         assert!(!live.exists());
-    }
-
-    #[test]
-    fn the_childs_cleanup_removes_the_files_and_the_directory() {
-        let d = PrivateDir::create("nullroute").unwrap();
-        std::fs::write(d.path().join("a"), b"x").unwrap();
-        std::fs::write(d.path().join("b"), b"y").unwrap();
-        let cleanup = d.child_cleanup().unwrap();
-        cleanup.run();
-        assert!(!d.path().exists());
-        // Idempotent with the parent's own removal.
-        d.remove();
     }
 
     #[test]

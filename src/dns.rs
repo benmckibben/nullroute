@@ -800,19 +800,6 @@ impl Files {
     }
 }
 
-impl Files {
-    /// What the forked child deletes after its bind mounts (tmpdir.rs).
-    pub fn child_cleanup(&self) -> io::Result<crate::tmpdir::ChildCleanup> {
-        self.dir.child_cleanup()
-    }
-
-    /// Remove the temp dir now. Call once the command has been spawned: the
-    /// bind mounts keep the files alive.
-    pub fn cleanup(&self) {
-        self.dir.remove();
-    }
-}
-
 fn cstring(p: &Path) -> io::Result<CString> {
     CString::new(p.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
@@ -1070,10 +1057,10 @@ mod tests {
         assert!(f.mounts[1].1.to_str().unwrap().ends_with("resolve.sock"));
         let dir = f.dir.path().to_path_buf();
         assert!(dir.exists());
-        f.cleanup();
+        f.dir.remove();
         assert!(
             !dir.exists(),
-            "cleanup removes the dir while the Files lives on"
+            "removing the dir works while the Files lives on"
         );
         drop(f);
 

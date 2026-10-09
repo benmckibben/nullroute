@@ -135,10 +135,12 @@ fn alive(pid: libc::pid_t) -> bool {
     })
 }
 
-/// Start nullroute running §sleep 300§, wait until the command is up, hit it
-/// with §sig§, wait for the command to be gone and return what was left in
-/// TMPDIR.
-fn leftovers_after_kill(tag: &str, sig: libc::c_int) -> Vec<String> {
+/// Start nullroute running `sleep 300`, wait until the command is up, hit
+/// nullroute with `sig` and wait for the command to be gone. The scratch
+/// directories have to stay while the command runs (a nullroute started inside
+/// the sandbox mounts over them), so a kill leaves them behind: the next run
+/// must sweep them once they are old enough.
+fn kill_then_the_next_run_sweeps(tag: &str, sig: libc::c_int) {
     let mut env = Env::new(tag);
     let child = env
         .nullroute(&[], &["sleep", "300"])
@@ -157,29 +159,30 @@ fn leftovers_after_kill(tag: &str, sig: libc::c_int) -> Vec<String> {
     poll("the command to die with nullroute", || {
         (!alive(sleeper)).then_some(())
     });
-    env.leftovers()
-}
-
-#[test]
-fn sigkill_while_the_command_runs_leaves_no_temp_dirs() {
+    // Nobody holds the locks any more; make the leftovers old enough.
+    let left = env.leftovers();
+    for d in &left {
+        backdate(&env.tmp().join(d));
+    }
+    assert!(env.nullroute(&[], &["true"]).status().unwrap().success());
     assert_eq!(
-        leftovers_after_kill("kill", libc::SIGKILL),
-        Vec::<String>::new()
+        env.leftovers(),
+        Vec::<String>::new(),
+        "left after the next run (there were {left:?})"
     );
 }
 
 #[test]
-fn a_crash_while_the_command_runs_leaves_no_temp_dirs() {
+fn sigkill_while_the_command_runs_is_swept_by_the_next_run() {
+    kill_then_the_next_run_sweeps("kill", libc::SIGKILL);
+}
+
+#[test]
+fn a_crash_while_the_command_runs_is_swept_by_the_next_run() {
     // SIGUSR1 and SIGABRT terminate with no chance to clean up, like a crash
     // (SIGSEGV can't stand in: Rust handles it for stack overflow detection).
-    assert_eq!(
-        leftovers_after_kill("usr1", libc::SIGUSR1),
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        leftovers_after_kill("abrt", libc::SIGABRT),
-        Vec::<String>::new()
-    );
+    kill_then_the_next_run_sweeps("usr1", libc::SIGUSR1);
+    kill_then_the_next_run_sweeps("abrt", libc::SIGABRT);
 }
 
 #[test]
@@ -227,7 +230,6 @@ fn held_during_setup(env: &mut Env, command: &[&str]) -> (libc::pid_t, PathBuf) 
     (pid, hold)
 }
 
-#[cfg(debug_assertions)]
 fn backdate(path: &Path) {
     let t = libc::timespec {
         tv_sec: 1_000_000_000,

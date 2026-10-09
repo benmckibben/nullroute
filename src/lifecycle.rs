@@ -137,13 +137,31 @@ mod tests {
 
     #[test]
     fn thread_count_sees_other_threads() {
+        // Other tests start and stop threads at the same time, so a
+        // before/after comparison is unreliable; hold a known number of
+        // threads and check the count is at least that many (plus this one).
+        const HELD: usize = 8;
         let (stop, hold) = std::sync::mpsc::channel::<()>();
-        let before = thread_count().unwrap();
-        let t = std::thread::spawn(move || {
-            let _ = hold.recv();
-        });
-        assert!(thread_count().unwrap() > before);
+        let hold = std::sync::Arc::new(std::sync::Mutex::new(hold));
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let threads: Vec<_> = (0..HELD)
+            .map(|_| {
+                let hold = hold.clone();
+                let started = started_tx.clone();
+                std::thread::spawn(move || {
+                    started.send(()).unwrap();
+                    // Blocks until the sender is dropped.
+                    let _ = hold.lock().unwrap().recv();
+                })
+            })
+            .collect();
+        for _ in 0..HELD {
+            started_rx.recv().unwrap();
+        }
+        assert!(thread_count().unwrap() > HELD);
         drop(stop);
-        t.join().unwrap();
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }

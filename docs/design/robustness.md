@@ -55,13 +55,15 @@ bind-mounted, so they live in a directory in the temp dir. Options considered:
   for nullroute itself would change what it sees.
 - *memfd / O_TMPFILE*: a bind mount needs a path in a mount of this namespace;
   a memfd's internal mount isn't one (`EINVAL`).
-- *unlink after use*: done. A bind mount keeps the file alive, so the forked
-  child unlinks the files and the directory right after its mounts, before it
-  execs (unlink/rmdir only: async-signal-safe), and the parent removes whatever
-  is left after spawn. A running command therefore implies the directory is
-  gone.
-- *janitor*: done for what remains (a kill between creating the directory and
-  the end of spawn). The "in use" marker is an exclusive `flock` that the kernel
+- *unlink after use*: tried and dropped. A bind mount keeps the file alive, so
+  the forked child could unlink the files and the directory right after its
+  mounts (unlink/rmdir only: async-signal-safe), and a kill while the command
+  runs would leave nothing behind. But a nullroute started inside the sandbox
+  then fails to set up (`ENOENT`): the kernel refuses to mount over a mount
+  whose file has been unlinked, and the inner sandbox mounts its decoys over the
+  outer one's. Nesting works, so the files stay until nullroute exits.
+- *janitor*: done, and the only cleanup after a kill (SIGKILL, the OOM killer, a
+  crash). The "in use" marker is an exclusive `flock` that the kernel
   drops when the process dies, not a pid (no pid reuse, works across PID
   namespaces); stale means named like ours, owned by the user, mode 0700, over a
   minute old (guards a nullroute from before the lock existed) and lockable.
