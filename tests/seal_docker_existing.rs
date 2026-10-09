@@ -333,7 +333,13 @@ fn oversized_request_heads_get_431() {
 import socket
 c = socket.socket(socket.AF_UNIX); c.settimeout(10); c.connect(SOCK)
 c.sendall(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n" + (b"X-Fill: " + b"a" * 1000 + b"\r\n") * 40 + b"\r\n")
-print(c.recv(4096).split(b"\r\n", 1)[0].decode())
+buf = b""
+while b"\r\n" not in buf:
+    chunk = c.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+print(buf.split(b"\r\n", 1)[0].decode())
 "#,
     );
     assert_eq!(
