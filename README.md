@@ -16,9 +16,17 @@ nullroute run --port 5432,6379 -- pytest   # local Postgres + Redis still reacha
   <img src="demo/demo.gif" alt="nullroute 15-second terminal demo" width="760" />
 </p>
 
-Inside, the command has a loopback interface and nothing else. Connecting to any
-other host fails immediately with "network unreachable", and DNS lookups fail
-(with `--allow`, only allowed names resolve; see below).
+Inside, the command runs in its own network namespace: a loopback interface and
+no other network device. Connecting to any other host fails immediately with
+"network unreachable", and DNS lookups fail (with `--allow`, only allowed names
+resolve; see below). Because a network namespace doesn't cover everything that
+can reach a network, nullroute also hides the Unix sockets of services that act
+outside it (container runtimes, D-Bus, systemd, snapd, SSH and GPG agents),
+sets `no_new_privs` and denies a few kernel interfaces that lead out of the
+namespace (AF_VSOCK sockets, io_uring, terminal input injection). That is the
+whole of it: nullroute isolates the **network**, not the filesystem, the
+processes or the credentials of the command (see [What nullroute is
+not](#what-nullroute-is-not)).
 The exit code is passed through, so it drops into CI unchanged.
 
 ## Installing
@@ -329,10 +337,84 @@ sandbox. So, also by default:
 
 | Flag | Effect |
 |---|---|
-| `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
-| `--hide-socket PATH` | Hide another socket too, e.g. an SSH agent or a local proxy (repeatable). |
+| `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). Any path to the socket works (symlinks are followed); `--dry-run` shows what is hidden. |
+| `--hide-socket PATH` | Hide another socket too, e.g. an X11 or Wayland display socket or a local proxy (repeatable). |
 | `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
+
+### The user's session: D-Bus, systemd, snapd, agents
+
+The same goes for the services of your login session. Their sockets are plain
+files, so a command in the sandbox could ask them to do things *outside* the
+sandbox, with the host's network. For example, `systemd-run --user` over the
+session bus starts a process in the host's network namespace
+(`busctl --user list` works from inside a bare sandbox unless these are
+hidden). So, also by default, nullroute hides the ones that exist on your
+machine:
+
+| Hidden | Where | Why |
+|---|---|---|
+| session D-Bus | `$DBUS_SESSION_BUS_ADDRESS` (`unix:path=`), `$XDG_RUNTIME_DIR/bus`, `/run/user/UID/bus` | starts processes on the host (`systemd-run --user`, D-Bus activation) |
+| systemd user manager | `…/systemd/private` in the same directories | starts processes on the host |
+| snapd | `/run/snapd.socket`, `/run/snapd-snap.socket`, `…/snapd-session-agent.socket` | installs and runs snaps, with network |
+| SSH and keyring agents | `$SSH_AUTH_SOCK`, `…/ssh-agent.socket`, `…/openssh_agent`, `…/gcr/ssh`, `…/keyring/*` | sign with your keys for anything the command can reach |
+| gpg-agent and dirmngr | `…/gnupg/S.*`, `~/.gnupg/S.*`, `$GNUPGHOME/S.*` | dirmngr fetches keys over the host's network (a `gpg --recv-keys` inside would go out) |
+| more container runtimes | rootless Docker/Podman/containerd/BuildKit, Docker Desktop, Colima, Rancher Desktop, Lima, OrbStack, k3s, CRI-O, LXD, libvirt | start containers and VMs with a network |
+
+Nothing is printed for the ones you don't have. A connection to a hidden
+socket gets the same decoy as above, is reported, and counts as a block for
+`--strict`; `--allow-socket PATH` brings one back (for instance
+`--allow-socket "$SSH_AUTH_SOCK"` if the command has to use your SSH agent, which
+it can only do over a route you've opened with `--allow` or `--port`).
+`nullroute run --dry-run -- true` lists what is hidden on this machine.
+
+Not hidden, on purpose:
+
+- **Abstract sockets** (a D-Bus address like `unix:abstract=/tmp/dbus-…`, X11's
+  `@/tmp/.X11-unix/X0`): they belong to a network namespace, so the sandbox's own
+  empty one already keeps the host's out. (Checked: connecting to a host's
+  abstract socket from inside fails with `ECONNREFUSED`.)
+- **Display servers** (`/tmp/.X11-unix/X0`, `$XDG_RUNTIME_DIR/wayland-0`) and the
+  accessibility bus (`$XDG_RUNTIME_DIR/at-spi/bus_*`). They can read the screen
+  and inject keystrokes into other windows, which could be turned into running
+  something on the host, but that is not a path to the network, and hiding them
+  would break GUI test runs. If that matters to you, `--hide-socket` them, or
+  don't run untrusted code on a desktop session.
+- `$XDG_RUNTIME_DIR/systemd/notify` (readiness notifications only), PulseAudio
+  and PipeWire, dconf.
+
+### Other ways out: seccomp and `no_new_privs`
+
+A few kernel interfaces reach outside the network namespace (or into the
+terminal you started the command from), and a command that is meant to have no
+network has no use for them. nullroute sets `no_new_privs` and installs a small
+seccomp filter before running the command. It denies, with an error and
+without killing the command:
+
+| Call | Result | Why |
+|---|---|---|
+| `socket(AF_VSOCK)` | `EAFNOSUPPORT` | a channel to the host or hypervisor on microVMs, WSL2, Hyper-V, Firecracker and Docker Desktop (it isn't scoped to the network namespace) |
+| `socket(AF_BLUETOOTH)`, `AF_NFC`, `AF_QIPCRTR` | `EAFNOSUPPORT` | hardware, also outside the namespace |
+| `ioctl(TIOCSTI)`, `ioctl(TIOCLINUX)` | `EPERM` | push input into the terminal the command was started from: on kernels with `dev.tty.legacy_tiocsti=1` that is typing into your shell |
+| `io_uring_setup()` | `EPERM` | io_uring can create sockets without `socket()`, so it would walk around the list above; programs already handle this error where `kernel.io_uring_disabled` is set |
+
+Everything else is allowed, including `AF_UNIX`, `AF_INET`, `AF_INET6`,
+`AF_NETLINK` and `AF_PACKET`. It is tested with bash, Python, Node, curl, git, the
+Docker CLI (`--seal-docker`), cargo and a nested nullroute; `ptrace` isn't filtered
+(strace and gdb should work, but weren't tried). It is not a syscall sandbox. On x86-64 the x32
+ABI fails with `ENOSYS` and 32-bit x86 programs can't use `socketcall()` (their
+direct `socket` calls are filtered like native ones); on AArch64 the 32-bit ARM
+mode is filtered the same way as the native one.
+
+`no_new_privs` means a setuid, setgid or file-capability binary can't raise
+privileges after exec. `sudo` and `su` never worked in the sandbox anyway (only
+your own id is mapped in the user namespace, so a root-owned setuid file has no
+effect); what changes is that a file capability (`cap_net_raw` on `ping` on some
+distributions) is no longer granted. A nested sandbox or helper inherits both
+settings. `nullroute run --dry-run -- true` and `--inspect` show them.
+
+`--no-seccomp` leaves the filter out, for the odd tool that needs one of these
+calls (`no_new_privs` stays set).
 
 ### Letting Docker tests run, with sealed containers
 
@@ -340,8 +422,9 @@ sandbox. So, also by default:
 can't use Docker) and `--allow-socket` (it can, and its containers get full
 network). The command uses Docker normally, but nullroute rewrites each
 container-create request to `NetworkMode: none`, forces classic-builder builds
-onto `--network none`, and refuses the API calls that would hand out a network
-it can't take back:
+onto `--network none`, refuses the API calls that would hand out a network
+it can't take back, and refuses to run code in, start or attach to a container
+that already has one:
 
 ```bash
 nullroute run --seal-docker -- pytest        # tests may start containers; none get network
@@ -353,6 +436,7 @@ nullroute run --seal-docker --seal-docker-pulls none -- pytest  # and the daemon
 |---|---|
 | `--seal-docker` | Seal the standard Docker socket paths (`/var/run/docker.sock`, rootless, Docker Desktop, `DOCKER_HOST=unix://`). |
 | `--seal-docker-socket PATH` | Seal this Docker API socket (repeatable). |
+| `--seal-docker-allow-existing` | Also let the command run code in, start, restart, attach to or copy files into containers that have a network (see [Containers that already exist](#containers-that-already-exist)). This unseals them. Needs `--seal-docker` or `--seal-docker-socket` (exit 2 otherwise). |
 | `--seal-docker-pulls MODE` | What the Docker daemon may contact for the command: `any` (default), `allowlisted` or `none`. See [Registry access](#registry-access---seal-docker-pulls). Needs `--seal-docker` or `--seal-docker-socket` (exit 2 otherwise). |
 
 The sealed container still runs and can mount volumes, but it has no network at
@@ -364,6 +448,7 @@ services. A requested `--network` (including `host`) is overridden to `none`.
 | `POST /containers/create` | rewritten: `NetworkMode: none`, networking settings dropped |
 | `POST /build` (classic builder) | rewritten: `networkmode=none`, so `RUN` steps have no network; the context is streamed through |
 | `POST /build?version=2`, `/grpc`, `/session` (BuildKit / buildx) | refused: a BuildKit build picks each step's network inside a gRPC stream nullroute can't rewrite |
+| `POST /containers/{id}/exec`, `/start`, `/restart`, `/unpause`, `/update`, `/attach`, `GET .../attach/ws`, `PUT .../archive`, `POST /exec/{id}/start` | refused unless the container has no network (see below) |
 | `POST /networks/{id}/connect` | refused |
 | `POST /services/create`, `/services/{id}/update` | refused: Swarm tasks get networks |
 | `POST /swarm/init`, `/swarm/join` | refused: a swarm manager could schedule such tasks here |
@@ -372,6 +457,41 @@ services. A requested `--network` (including `host`) is overridden to `none`.
 
 Refusals are Docker-style errors (`Error response from daemon: nullroute
 blocked ...`) and show up in the report as `docker` entries.
+
+#### Containers that already exist
+
+Rewriting what the command *creates* isn't enough: a container that already
+exists, say a database on the default bridge network that you started
+earlier, has a network, and `docker exec` into it would run the command's code
+with that network (a `docker exec db sh -c 'echo x | nc 172.17.0.1 9999'` from
+inside the sandbox reached a listener on the host). So under `--seal-docker`
+the Docker API operations that run code in, start, resume, attach to or write
+into a container (`exec`, `start`, `restart`, `unpause`, `update`, `attach`
+and its WebSocket form, `PUT archive`, and starting an exec instance) are only
+forwarded for a container that has **no network**: `NetworkMode: none` and
+attached to no other network. That includes everything the command created
+(also in an earlier run); the daemon is asked, so names, id prefixes and link
+names can't be used to slip past, and the request is sent to the container's
+full id. Any other container gets a `403` that names the flag:
+
+```
+Error response from daemon: nullroute blocked trying to run a command in container db: it has a network (NetworkMode=bridge), and --seal-docker only lets the command run code in, start or attach to containers that have none (the ones it creates here). Create the container through the sandbox, or pass --seal-docker-allow-existing to allow this; that unseals the container's network.
+```
+
+Reads are unaffected (`inspect`, `logs`, `ps`, `top`, `diff`, `export`, `stats`,
+`cp` out of a container), and so are stop, kill, pause, rename and remove.
+The list of operations that are *not* guarded is explicit, and an endpoint a
+later Docker version adds under `/containers/{id}/` is guarded until someone
+looks at it. `--seal-docker-allow-existing` turns the check off for people who
+really want the command to drive existing containers; it unseals them. (`docker
+cp` *into* a container isn't supported under `--seal-docker` at all: the CLI
+uploads the archive chunked, which the proxy doesn't accept.)
+
+Malformed or oversized requests get an answer rather than a silent close:
+`431` for a request head over 64 KiB, `413` for a body over 4 MiB, `417` for an
+`Expect` other than `100-continue`. `Expect: 100-continue` is answered by
+nullroute (the client gets its `100 Continue` before it sends the body) and not
+forwarded to the daemon.
 
 **Building images.** `docker build` uses BuildKit (buildx) by default, and
 BuildKit builds can't be sealed, so under `--seal-docker` they fail with a
@@ -498,18 +618,19 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 
 | | |
 |---|---|
-| Hermetic mode (no network but the sandbox's own loopback) | ✅ |
+| Network namespace isolation (no network but the sandbox's own loopback) | ✅ |
 | No root needed | ✅ (unprivileged user namespaces) |
 | Runs as you, not as root inside | ✅ |
 | Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails, `127`/`126` if the command isn't found/executable) |
 | Reach chosen services on the host's localhost (`--port`) | ✅ TCP, IPv4 + IPv6 |
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
-| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes and the system D-Bus |
+| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents |
 | Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
-| Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); not a boundary for hostile images |
+| Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); running code in, starting or attaching to existing containers that have a network is refused; not a boundary for hostile images |
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
 | Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |
+| Deny AF_VSOCK/Bluetooth/NFC sockets, TIOCSTI and io_uring (seccomp, `no_new_privs`) | ✅ on by default; `--no-seccomp` turns the filter off |
 | Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy, DNS and socket blocks; not direct IP connects |
 | Show the sandbox topology (`--inspect`) | ✅ namespaces, loopback, ports, sockets, proxy, DNS sinkhole |
 | macOS | ❌ no network namespaces; needs a different mechanism |
@@ -522,13 +643,29 @@ or bubblewrap with a locked-down filesystem. Specifically, these are **not**
 protected:
 
 - **The filesystem and everything else that isn't the network.** The command
-  sees your whole filesystem and runs as you. There is no PID namespace (it can
-  see and signal your other processes), no seccomp filter and no resource limits.
-- **Other Unix sockets.** Only the sockets listed above are hidden by default.
-  Other local daemons reachable through a socket file (the session D-Bus, an SSH
-  or GPG agent, a display server, a local proxy) stay reachable unless you
+  sees your whole filesystem (the mount namespace is a private copy, created only
+  to hide sockets, not a different view) and runs as you. There is no PID
+  namespace: your other processes are visible in `/proc` (their command lines
+  are readable) and can be signalled (`kill -0` on a host process works). The
+  kernel does refuse the command `/proc/PID/environ`, `cwd` and `exe` of those
+  processes, and, with Yama's default `ptrace_scope=1`, `ptrace` attach (both
+  checked on one host; don't rely on them: Yama can be set to 0). The IPC,
+  UTS, cgroup and time namespaces are the host's: System V IPC and POSIX shared
+  memory (`/dev/shm`) are shared with the host, and the hostname is the host's.
+  There are no resource limits, and the seccomp filter is only the short list
+  above, not a syscall sandbox.
+- **Credentials, by design.** The command inherits your environment variables
+  and can read the files you can: tokens, `~/.ssh` keys, cloud credentials. With
+  no route out they can't be sent anywhere, but anything you open (`--port`,
+  `--allow`, `--allow-socket`) is open to all of it. The SSH agent and gpg-agent
+  sockets are hidden, not the key files.
+- **Unix sockets that aren't on the default list.** Display servers (X11,
+  Wayland), the accessibility bus, PulseAudio/PipeWire, a local proxy, and any
+  other daemon reachable through a socket file stay reachable unless you
   `--hide-socket` them, and anything they can do for the command goes
-  unchecked.
+  unchecked. (The reasoning for X11 and Wayland is in [the session
+  section](#the-users-session-d-bus-systemd-snapd-agents).) Sockets that appear
+  after the command starts aren't hidden either.
 - **File descriptors the command inherits.** A socket that nullroute's parent
   opened before starting it (and left inheritable) belongs to the host's
   network namespace and keeps working inside the sandbox. Start nullroute from a
@@ -554,7 +691,9 @@ See [SECURITY.md](SECURITY.md) for how to report a way around the isolation.
    needed) plus a new network namespace, which starts with only a loopback device.
 2. Maps your real uid/gid into the user namespace, so tools don't think they're root.
 3. Brings `lo` up (it starts down).
-4. `exec`s your command. Run as an ordinary user (not root), it holds no
+4. Sets `no_new_privs` and installs the seccomp filter (see above), after the
+   last socket and ioctl that setup itself needs.
+5. `exec`s your command. Run as an ordinary user (not root), it holds no
    capabilities after exec, so it can't add interfaces, change routes, or create
    another namespace to get out.
 

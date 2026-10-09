@@ -30,6 +30,8 @@ mod report;
 #[cfg(target_os = "linux")]
 mod sandbox;
 #[cfg(target_os = "linux")]
+mod seccomp;
+#[cfg(target_os = "linux")]
 mod signals;
 
 use clap::{Parser, Subcommand};
@@ -61,9 +63,11 @@ enum Cmd {
         #[arg(short, long = "port", value_name = "PORT", value_delimiter = ',', value_parser = clap::value_parser!(u16).range(1..))]
         ports: Vec<u16>,
 
-        /// Also hide this Unix socket (repeatable). Container-runtime sockets
-        /// (docker.sock, podman.sock, containerd, buildkit) and the system D-Bus
-        /// are hidden by default.
+        /// Also hide this Unix socket (repeatable), e.g. an X11 or Wayland
+        /// display socket or a local proxy. Container-runtime sockets, the
+        /// system and session D-Bus, the systemd user manager, snapd, SSH and
+        /// keyring agents ($SSH_AUTH_SOCK) and gpg-agent/dirmngr are hidden by
+        /// default (see --dry-run for the list on this machine).
         #[arg(long = "hide-socket", value_name = "PATH")]
         hide_sockets: Vec<std::path::PathBuf>,
 
@@ -71,7 +75,8 @@ enum Cmd {
         /// (repeatable). E.g. --allow-socket /var/run/docker.sock for tests that
         /// start containers; those containers will have network access. Or
         /// --allow-socket /run/dbus/system_bus_socket for the system D-Bus (which
-        /// can resolve names through systemd-resolved).
+        /// can resolve names through systemd-resolved), or --allow-socket
+        /// "$SSH_AUTH_SOCK" to let the command use your SSH agent.
         #[arg(long = "allow-socket", value_name = "PATH")]
         allow_sockets: Vec<std::path::PathBuf>,
 
@@ -96,6 +101,14 @@ enum Cmd {
         /// (see the README).
         #[arg(long = "seal-docker-pulls", value_name = "MODE", value_enum)]
         seal_docker_pulls: Option<docker::PullPolicy>,
+
+        /// With --seal-docker: also let the command run code in, start, restart,
+        /// attach to or copy files into containers that have a network (ones it
+        /// didn't create here: docker exec, docker start...). By default those
+        /// are refused, because the code would run with that network. This
+        /// unseals them.
+        #[arg(long = "seal-docker-allow-existing")]
+        seal_docker_allow_existing: bool,
 
         /// Let this host through (repeatable or comma-separated):
         /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
@@ -135,6 +148,13 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         report_json: Option<std::path::PathBuf>,
 
+        /// Don't install the seccomp filter (no_new_privs is still set). By
+        /// default the command can't open AF_VSOCK, Bluetooth, NFC or QIPCRTR
+        /// sockets, can't use io_uring or the TIOCSTI/TIOCLINUX terminal
+        /// ioctls (all fail with an error). Use this for a tool that needs one.
+        #[arg(long = "no-seccomp")]
+        no_seccomp: bool,
+
         /// Print what would be hidden, forwarded and allowed, then exit.
         #[arg(long)]
         dry_run: bool,
@@ -162,12 +182,14 @@ fn main() -> ExitCode {
             seal_docker,
             seal_docker_sockets,
             seal_docker_pulls,
+            seal_docker_allow_existing,
             allow,
             resolve,
             no_dns,
             strict,
             quiet,
             report_json,
+            no_seccomp,
             dry_run,
             inspect,
             argv,
@@ -175,6 +197,12 @@ fn main() -> ExitCode {
             if seal_docker_pulls.is_some() && !seal_docker && seal_docker_sockets.is_empty() {
                 eprintln!(
                     "nullroute: --seal-docker-pulls only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
+                );
+                return ExitCode::from(2);
+            }
+            if seal_docker_allow_existing && !seal_docker && seal_docker_sockets.is_empty() {
+                eprintln!(
+                    "nullroute: --seal-docker-allow-existing only applies to sealed Docker sockets; add --seal-docker (or --seal-docker-socket PATH)"
                 );
                 return ExitCode::from(2);
             }
@@ -230,11 +258,17 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::from(2);
             }
-            let mut seal = seal_docker_sockets;
-            if seal_docker {
-                seal.extend(docker::docker_api_sockets());
-            }
-            let mut plan = match hide::plan(&hide_sockets, &allow_sockets, &seal) {
+            let seal_defaults = if seal_docker {
+                docker::docker_api_sockets()
+            } else {
+                Vec::new()
+            };
+            let mut plan = match hide::plan(
+                &hide_sockets,
+                &allow_sockets,
+                &seal_docker_sockets,
+                &seal_defaults,
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("nullroute: preparing socket hiding: {e}");
@@ -246,6 +280,7 @@ fn main() -> ExitCode {
                     pulls,
                     allow: allowlist.clone(),
                     ports: ports.clone(),
+                    allow_existing: seal_docker_allow_existing,
                 });
             }
             let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
@@ -262,6 +297,7 @@ fn main() -> ExitCode {
                         &dns::bypass_targets(),
                     )
                     .with_docker_pulls(pulls)
+                    .with_seccomp(!no_seccomp)
                     .render()
                 );
             }
@@ -285,6 +321,7 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                println!("seccomp: {}", inspect::hardening(!no_seccomp));
                 for p in &ports {
                     println!("forwarded port: {p}");
                 }
@@ -313,6 +350,7 @@ fn main() -> ExitCode {
             let opts = RunOpts {
                 strict,
                 report_json,
+                seccomp: !no_seccomp,
             };
             run(
                 &argv,
@@ -339,6 +377,8 @@ const EXIT_REPORT_WRITE_FAILED: i32 = 74;
 struct RunOpts {
     strict: bool,
     report_json: Option<std::path::PathBuf>,
+    /// Install the seccomp filter (no --no-seccomp).
+    seccomp: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -351,7 +391,7 @@ fn run(
     report: &std::sync::Arc<report::Report>,
     opts: &RunOpts,
 ) -> ExitCode {
-    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report) {
+    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, opts.seccomp) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("nullroute: failed to run {:?}: {e}", argv[0]);
