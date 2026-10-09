@@ -163,7 +163,7 @@ enum Cmd {
 
         /// The command and its arguments (put them after --).
         #[arg(required = true, last = true)]
-        argv: Vec<String>,
+        argv: Vec<std::ffi::OsString>,
     },
 }
 
@@ -410,7 +410,7 @@ struct RunOpts {
 
 #[cfg(target_os = "linux")]
 fn run(
-    argv: &[String],
+    argv: &[std::ffi::OsString],
     ports: &[u16],
     hide: Option<&mut hide::Plan>,
     proxy: Option<(u16, std::sync::Arc<proxy::Proxy>)>,

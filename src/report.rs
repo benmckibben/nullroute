@@ -350,7 +350,7 @@ impl Report {
     pub fn write_json(
         &self,
         path: &Path,
-        argv: &[String],
+        argv: &[std::ffi::OsString],
         exit_code: i32,
         strict_failed: bool,
     ) -> io::Result<()> {
@@ -359,7 +359,8 @@ impl Report {
         s.push_str(
             &argv
                 .iter()
-                .map(|a| json_string(a))
+                // JSON text is Unicode: bytes that aren't UTF-8 become U+FFFD here.
+                .map(|a| json_string(&a.to_string_lossy()))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -467,7 +468,7 @@ mod tests {
             "{s}"
         );
         let path = std::env::temp_dir().join(format!("nr-report-cap-{}.json", std::process::id()));
-        r.write_json(&path, &["x".to_string()], 0, true).unwrap();
+        r.write_json(&path, &["x".into()], 0, true).unwrap();
         let json = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(
@@ -604,7 +605,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("r.json");
         let r = Report::new(true);
-        let argv = ["true".to_string()];
+        let argv: [std::ffi::OsString; 1] = ["true".into()];
         r.write_json(&path, &argv, 0, false).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(

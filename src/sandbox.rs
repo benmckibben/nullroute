@@ -39,7 +39,7 @@ enum Role {
 /// Run `argv` inside a hermetic network namespace and wait for it. Each port in
 /// `ports` is bridged from the sandbox's localhost to the host's.
 pub fn run_hermetic(
-    argv: &[String],
+    argv: &[std::ffi::OsString],
     ports: &[u16],
     mut hide: Option<&mut hide::Plan>,
     proxy: Option<(u16, Arc<proxy::Proxy>)>,

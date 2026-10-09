@@ -146,6 +146,10 @@ Findings from a security review of the first version, all fixed before release:
   namespaces can be created on this machine. A failure while setting up the
   sandbox is now reported as "could not set up the sandbox: ..."; "failed to
   run" is kept for the command itself not being found or executable.
+- Command arguments that aren't valid UTF-8 (file names are bytes on Linux) are
+  passed to the command intact instead of being rejected with exit 2 ("invalid
+  UTF-8 was detected in one or more arguments"). In the `--report-json` command
+  list such bytes appear as U+FFFD.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.
