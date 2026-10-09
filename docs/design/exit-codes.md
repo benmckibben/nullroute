@@ -1,5 +1,13 @@
 # Exit codes: what they are, where they are inconsistent, and a consistent policy
 
+> **Update (implemented):** PR A (>64 `--port` values now exit 2) and PR B (an unknown option
+> after `run` is a usage error, exit 2; a missing command exits 127 and a non-executable one 126,
+> without the user-namespace hint; `--dry-run | head` ends by SIGPIPE instead of a panic) have
+> landed. The text below is the original analysis, kept as written, so it describes the code
+> *before* those changes. **Still open:** `--dry-run` accepts a configuration the real run rejects
+> with 125 ("too many listeners"), and the "failed to run" wording is also used for failures
+> after the command has started.
+
 Status: proposal (nothing here is implemented in this PR). Scope: document the exit codes
 nullroute produces today by reading the code and running the binary, list the places where the
 behaviour contradicts its documented meaning or the README contradicts itself, and propose one
