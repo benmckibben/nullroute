@@ -24,6 +24,14 @@
 //!    applying the same rules as the proxy (allowlist, `--resolve` pins, no
 //!    loopback targets).
 //!
+//! The resolver runs in every sandbox, not only with `--allow`: without allowed
+//! names it answers every question `NXDOMAIN`. That is what lets the report (and
+//! `--strict`) see lookups in a plain run, and it makes a lookup fail the same
+//! way everywhere ("Name or service not known", a final answer) instead of the
+//! retryable "Temporary failure in name resolution" a resolver with no route
+//! gives, which clients like musl's sit out for seconds. `--no-dns` switches
+//! it off.
+//!
 //! What is not covered: an IP literal dialled directly never asks DNS, so it
 //! still fails closed with "network unreachable" (ENETUNREACH), as does a port
 //! the name isn't allowed on (connection refused: nothing listens there).
@@ -79,6 +87,7 @@ pub const DEFAULT_PORTS: [u16; 2] = [80, 443];
 const TTL: u32 = 30;
 
 const TYPE_A: u16 = 1;
+const TYPE_AAAA: u16 = 28;
 const TYPE_PTR: u16 = 12;
 const TYPE_ANY: u16 = 255;
 const CLASS_IN: u16 = 1;
@@ -135,7 +144,8 @@ fn add_ports(set: &mut BTreeSet<u16>, port: Option<u16>) {
 
 impl Plan {
     /// Build the plan from the allowlist. None when it has no host names
-    /// (IP literals don't go through DNS, so there is nothing to serve).
+    /// (IP literals don't go through DNS, so there is nothing to map; see
+    /// [`Plan::resolver_only`]).
     pub fn new(allow: &Allowlist) -> Result<Option<Plan>, String> {
         let mut exact: BTreeMap<String, BTreeSet<u16>> = BTreeMap::new();
         let mut wild_ports = BTreeSet::new();
@@ -203,6 +213,22 @@ impl Plan {
         &self.slots
     }
 
+    /// The resolver without any allowed names: every question gets `NXDOMAIN`
+    /// and is recorded. What a run without `--allow` host names gets.
+    pub fn resolver_only() -> Plan {
+        Plan {
+            slots: Vec::new(),
+            exact: BTreeMap::new(),
+            wildcards: Vec::new(),
+            pool: 0..0,
+        }
+    }
+
+    /// Does the plan map any allowed names (as opposed to only refusing)?
+    pub fn has_names(&self) -> bool {
+        !self.slots.is_empty()
+    }
+
     /// Every socket the sandbox must create for the sinkhole, in order.
     pub fn listeners(&self) -> Vec<(Listener, Spec)> {
         let dns = SocketAddr::from((Ipv4Addr::LOCALHOST, PORT));
@@ -263,6 +289,7 @@ impl Plan {
 #[derive(Debug, PartialEq)]
 enum Answer {
     A(Ipv4Addr),
+    Aaaa(std::net::Ipv6Addr),
     Ptr(String),
     /// The name exists but has no record of this type.
     NoData,
@@ -354,6 +381,16 @@ impl Sinkhole {
         if name == "arpa" || name.ends_with(".arpa") {
             return Answer::NxDomain;
         }
+        // "localhost" and friends are this machine, not a lookup (RFC 6761): a
+        // client that asks DNS for them because /etc/hosts has no entry for
+        // one address family must not be reported as reaching out.
+        if proxy::is_localhost_name(name) {
+            return match qtype {
+                TYPE_A | TYPE_ANY if !name.starts_with("ip6-") => Answer::A(Ipv4Addr::LOCALHOST),
+                TYPE_AAAA => Answer::Aaaa(std::net::Ipv6Addr::LOCALHOST),
+                _ => Answer::NoData,
+            };
+        }
         let wants_addr = qtype == TYPE_A || qtype == TYPE_ANY;
         let slot = if !proxy::valid_hostname(name) {
             None
@@ -404,6 +441,7 @@ impl Sinkhole {
         };
         let (rcode, answers) = match self.lookup(&q.name, q.qtype, q.qclass) {
             Answer::A(ip) => (RCODE_OK, vec![(TYPE_A, ip.octets().to_vec())]),
+            Answer::Aaaa(ip) => (RCODE_OK, vec![(TYPE_AAAA, ip.octets().to_vec())]),
             Answer::Ptr(h) => (RCODE_OK, vec![(TYPE_PTR, encode_name(&h))]),
             Answer::NoData => (RCODE_OK, vec![]),
             Answer::NxDomain => (RCODE_NXDOMAIN, vec![]),
@@ -515,7 +553,18 @@ impl Sinkhole {
             return block("port not in --allow");
         }
         match proxy::dial(&host, port, &self.overrides) {
-            Ok(outer) => crate::forward::relay(inner, outer),
+            Ok(mut outer) => {
+                proxy::note_private_peer(&host, &outer, self.report.quiet());
+                // The client dialled this name, but it can still name another
+                // one in the TLS ClientHello; see sni.rs.
+                match proxy::gate_tunnel(&self.allow, &inner, &mut outer, &host, port, Vec::new()) {
+                    Ok(()) => crate::forward::relay(inner, outer),
+                    Err(refusal) => {
+                        proxy::record_refused_tunnel(&self.report, &host, port, &refusal);
+                        let _ = inner.shutdown(Shutdown::Both);
+                    }
+                }
+            }
             Err(DialError::Forbidden(why)) => block(why.reason()),
             Err(DialError::Io(e)) => {
                 let first = self
@@ -735,6 +784,16 @@ pub const RESOLV_CONF: &str = "# Generated by nullroute: names resolve through i
                                nameserver 127.0.0.1\n\
                                options timeout:2 attempts:2\n";
 
+/// Where the sandbox's resolver configuration goes.
+const RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
+
+/// The file the generated resolv.conf is mounted over: `/etc/resolv.conf`
+/// with symlinks followed (systemd, WSL). None if the host has none, in which
+/// case glibc already defaults to 127.0.0.1 and nothing is mounted.
+pub fn resolv_conf_target() -> Option<PathBuf> {
+    std::fs::canonicalize(RESOLV_CONF_PATH).ok()
+}
+
 /// The resolver bypass sockets that exist on this host (canonical paths).
 /// They are masked in every sandbox, with or without `--allow`: otherwise
 /// `nss-resolve` (or anything speaking varlink to systemd-resolved, or nscd)
@@ -765,7 +824,7 @@ impl Files {
     /// Masks for the resolver bypass sockets, always; plus the sinkhole's
     /// resolv.conf when `sinkhole` is set (`--allow` without `--no-dns`).
     pub fn create(sinkhole: bool) -> io::Result<Files> {
-        let resolv = sinkhole.then(|| Path::new("/etc/resolv.conf"));
+        let resolv = sinkhole.then(|| Path::new(RESOLV_CONF_PATH));
         Self::create_for(resolv, &BYPASS_SOCKETS)
     }
 
@@ -850,6 +909,51 @@ mod tests {
     fn a_record(r: &[u8]) -> Ipv4Addr {
         let n = r.len();
         Ipv4Addr::new(r[n - 4], r[n - 3], r[n - 2], r[n - 1])
+    }
+
+    #[test]
+    fn resolver_only_refuses_and_records_every_name() {
+        let plan = Plan::resolver_only();
+        assert!(!plan.has_names());
+        assert!(plan.describe().is_empty());
+        // Just the resolver's own sockets: no address to listen on per name.
+        let kinds: Vec<Listener> = plan.listeners().into_iter().map(|(l, _)| l).collect();
+        assert_eq!(kinds, [Listener::Udp, Listener::Tcp]);
+        let report = Report::new(true);
+        let s = Sinkhole::new(plan, Allowlist::default(), Overrides::new(), report.clone());
+        let r = s.handle(&query(1, "api.example.test", TYPE_A)).unwrap();
+        assert_eq!(rcode(&r), RCODE_NXDOMAIN);
+        assert_eq!(ancount(&r), 0);
+        let e = report.entries();
+        assert_eq!(e.len(), 1);
+        assert_eq!(
+            (e[0].kind, e[0].target.as_str()),
+            (Kind::Dns, "api.example.test")
+        );
+        assert!(report.has_blocks());
+    }
+
+    #[test]
+    fn localhost_names_resolve_locally_and_are_not_recorded() {
+        let report = Report::new(true);
+        let s = Sinkhole::new(
+            Plan::resolver_only(),
+            Allowlist::default(),
+            Overrides::new(),
+            report.clone(),
+        );
+        let r = s.handle(&query(1, "localhost", TYPE_A)).unwrap();
+        assert_eq!((rcode(&r), ancount(&r)), (RCODE_OK, 1));
+        assert_eq!(a_record(&r), Ipv4Addr::LOCALHOST);
+        let r = s.handle(&query(2, "localhost", TYPE_AAAA)).unwrap();
+        assert_eq!((rcode(&r), ancount(&r)), (RCODE_OK, 1));
+        assert_eq!(r[r.len() - 1], 1, "::1");
+        let r = s.handle(&query(3, "web.localhost", TYPE_A)).unwrap();
+        assert_eq!(a_record(&r), Ipv4Addr::LOCALHOST);
+        // Other types: the name exists but has no such record.
+        let r = s.handle(&query(4, "localhost", 16)).unwrap();
+        assert_eq!((rcode(&r), ancount(&r)), (RCODE_OK, 0));
+        assert!(report.is_empty(), "{:?}", report.entries());
     }
 
     #[test]

@@ -1,12 +1,16 @@
 # demo
 
-Assets for the terminal demo (the "15-second aha").
+Assets for the terminal demo (a GIF of about 20 seconds).
 
 | File | What it is |
 |---|---|
 | `run-demo.sh` | Plays the demo live in your terminal (also fine for asciinema). Finds `target/debug`, `target/release` or a `nullroute` on PATH. |
 | `nullroute-demo.tape` | [VHS](https://github.com/charmbracelet/vhs) script that records the same story to `demo/demo.gif` and `demo/demo.mp4`. |
 | `test_leak.py` | The accidental external call used by the tape. |
+
+The committed GIF is a recording of the tape against one build; later builds can
+print slightly different text (for example the wording of a failed lookup or the
+lines of `--inspect`). Re-render it before a release.
 
 ## Rendering the tape
 

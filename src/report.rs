@@ -103,6 +103,11 @@ struct Overflow {
     rewritten_attempts: u64,
 }
 
+/// Version of the --report-json layout. Bumped only for a change that can break
+/// a consumer (a field removed or renamed, a meaning changed); new fields and
+/// new entry kinds don't. See docs/report-json.md.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     /// A Unix socket hidden by default or with --hide-socket.
@@ -251,6 +256,11 @@ impl Report {
         first
     }
 
+    /// Was --quiet given (no live lines)?
+    pub fn quiet(&self) -> bool {
+        self.quiet
+    }
+
     pub fn entries(&self) -> Vec<Entry> {
         self.entries
             .lock()
@@ -355,7 +365,7 @@ impl Report {
         strict_failed: bool,
     ) -> io::Result<()> {
         let (blocked, rewritten) = self.split();
-        let mut s = String::from("{\n  \"command\": [");
+        let mut s = format!("{{\n  \"schema_version\": {SCHEMA_VERSION},\n  \"command\": [");
         s.push_str(
             &argv
                 .iter()
@@ -626,6 +636,51 @@ mod tests {
             "{body}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_matches_the_golden_file() {
+        // The layout is a contract for CI consumers (docs/report-json.md): any
+        // change to this file is a schema change and needs a version decision.
+        let dir = std::env::temp_dir().join(format!("nr-report-golden-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.json");
+        let r = Report::new(true);
+        // Recorded out of order and more than once: the file is sorted by kind
+        // then target and carries counts.
+        r.record(
+            Kind::Rewritten,
+            "containers/create",
+            "forced NetworkMode=none",
+            String::new,
+        );
+        r.record(Kind::Dns, "evil.example", "not in --allow", String::new);
+        r.record(Kind::Dns, "evil.example", "not in --allow", String::new);
+        r.record(
+            Kind::Proxy,
+            "api.github.com:443",
+            "not in --allow",
+            String::new,
+        );
+        r.record(
+            Kind::Socket,
+            "/run/docker.sock",
+            "container runtimes can start containers with full network access",
+            String::new,
+        );
+        r.record(Kind::Docker, "networks/connect", "refused", String::new);
+        let argv: [std::ffi::OsString; 3] = [
+            "sh".into(),
+            "-c".into(),
+            "echo \"hi\"\tthere \\ \u{e9}".into(),
+        ];
+        r.write_json(&path, &argv, 1, true).unwrap();
+        let got = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, include_str!("../tests/golden/report-all-kinds.json"));
+        // And it is valid JSON that says which schema it is.
+        let v: serde_json::Value = serde_json::from_str(&got).unwrap();
+        assert_eq!(v["schema_version"], SCHEMA_VERSION);
     }
 
     #[test]

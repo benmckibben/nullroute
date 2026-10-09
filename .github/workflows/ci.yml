@@ -306,8 +306,8 @@ jobs:
         run: |
           set -euo pipefail
           ./examples/01-python-test-leak/run.sh 2>&1 | tee "$RUNNER_TEMP/example-01.log"
-          # Steps 2-4 assert; the two internet steps (1 and 5) are the only skips.
-          grep -Fx 'examples: 01-python-test-leak: 3 assertions run, 2 skipped (offline mode)' "$RUNNER_TEMP/example-01.log"
+          # Steps 2, 3, 4 and 4b assert; the two internet steps (1 and 5) are the only skips.
+          grep -Fx 'examples: 01-python-test-leak: 4 assertions run, 2 skipped (offline mode)' "$RUNNER_TEMP/example-01.log"
 
       - name: Example 03 (local service port)
         env:

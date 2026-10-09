@@ -59,8 +59,12 @@ impl Topology {
             ),
         };
         Topology {
+            // The resolver needs the mount namespace only to put its
+            // resolv.conf in place (nothing to mount over if the host has none).
             ns_flags: sandbox::namespace_flags(
-                plan.is_some() || dns.is_some() || !masked.is_empty(),
+                plan.is_some()
+                    || (dns.is_some() && dns::resolv_conf_target().is_some())
+                    || !masked.is_empty(),
             ),
             ports: ports.to_vec(),
             blocked,
@@ -141,6 +145,13 @@ impl Topology {
         match &self.dns {
             None => {
                 let _ = writeln!(s, "  dns sinkhole:    none");
+            }
+            Some(lines) if lines.is_empty() => {
+                let _ = writeln!(
+                    s,
+                    "  dns resolver:    127.0.0.1:{} (udp, tcp; every name gets NXDOMAIN and is recorded)",
+                    dns::PORT
+                );
             }
             Some(lines) => {
                 let _ = writeln!(

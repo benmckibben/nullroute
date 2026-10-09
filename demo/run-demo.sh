@@ -32,7 +32,7 @@ type_cmd() {
 
 clear 2>/dev/null || true
 
-echo -e "\033[1;34m=== nullroute: The 15-Second Aha! Demo ===\033[0m\n"
+echo -e "\033[1;34m=== nullroute: terminal demo ===\033[0m\n"
 sleep 0.5
 
 echo -e "\033[1;33m[Scene 1] Running test suite without isolation (external API leak):\033[0m"

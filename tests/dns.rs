@@ -374,14 +374,32 @@ fn no_dns_leaves_resolution_sealed() {
 }
 
 #[test]
-fn no_sinkhole_without_allow_or_for_ip_only_allowlists() {
+fn no_names_to_map_means_a_refuse_everything_resolver() {
+    // Bare runs and IP-only allowlists have no names to map: the resolver
+    // still runs, but it only refuses and records.
     for flags in [&[][..], &["--allow", "10.0.0.5"][..]] {
         let mut args = flags.to_vec();
         args.extend(["--inspect", "--dry-run", "--", "true"]);
         let o = nullroute(&args);
-        assert!(err(&o).contains("  dns sinkhole:    none\n"), "{o:?}");
-        assert!(!out(&o).contains("dns sinkhole"), "{o:?}");
+        assert!(
+            err(&o).contains(
+                "  dns resolver:    127.0.0.1:53 (udp, tcp; every name gets NXDOMAIN and is recorded)\n"
+            ),
+            "{o:?}"
+        );
+        assert!(!err(&o).contains("dns sinkhole"), "{o:?}");
+        assert!(
+            out(&o)
+                .lines()
+                .any(|l| l == "dns resolver: 127.0.0.1:53 (every lookup is refused and recorded)"),
+            "{o:?}"
+        );
+        assert!(!out(&o).contains("synthetic address"), "{o:?}");
     }
+    // --no-dns switches it off.
+    let o = nullroute(&["--no-dns", "--inspect", "--dry-run", "--", "true"]);
+    assert!(err(&o).contains("  dns sinkhole:    none\n"), "{o:?}");
+    assert!(!out(&o).contains("dns "), "{o:?}");
 }
 
 #[test]
@@ -459,4 +477,178 @@ fn bad_flag_combinations_exit_2() {
         "true",
     ]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
+}
+
+// ---- bare runs: the resolver is always on, so lookups are recorded ----------
+
+/// Python: look a name up (once plainly, once with AI_ADDRCONFIG as most C
+/// clients do) and swallow the errors, like a test that logs the failure and
+/// carries on.
+fn swallow_lookup_script(name: &str) -> String {
+    format!(
+        "import socket\n\
+         for flags in (0, socket.AI_ADDRCONFIG):\n    \
+             try:\n        socket.getaddrinfo('{name}', 443, 0, socket.SOCK_STREAM, 0, flags)\n    \
+             except OSError:\n        pass"
+    )
+}
+
+/// Python: plain getaddrinfo (AF_UNSPEC, no flags), print the error number.
+fn plain_resolve_script(name: &str) -> String {
+    format!(
+        "import socket\ntry:\n    socket.getaddrinfo('{name}', 80)\nexcept socket.gaierror as e:\n    print('gaierror', e.errno)"
+    )
+}
+
+#[test]
+fn bare_strict_run_catches_a_swallowed_dns_lookup() {
+    let report = std::env::temp_dir().join(format!("nr-bare-dns-{}.json", std::process::id()));
+    let o = py(
+        &["--strict", "--report-json", report.to_str().unwrap()],
+        &swallow_lookup_script("api.nr.test"),
+    );
+    assert_eq!(o.status.code(), Some(1), "--strict without --allow: {o:?}");
+    assert!(
+        err(&o).contains("nullroute: blocked DNS lookup of api.nr.test (not in --allow)"),
+        "{}",
+        err(&o)
+    );
+    let json = std::fs::read_to_string(&report).unwrap();
+    let _ = std::fs::remove_file(&report);
+    assert!(json.contains(r#""strict_failed": true"#), "{json}");
+    assert!(
+        json.contains(r#""kind": "dns", "target": "api.nr.test""#),
+        "{json}"
+    );
+}
+
+#[test]
+fn bare_run_without_lookups_is_clean_under_strict() {
+    let o = nullroute(&["--strict", "--", "true"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(err(&o), "", "nothing to report: {o:?}");
+}
+
+#[test]
+fn bare_run_lookup_fails_like_an_allow_run() {
+    // NXDOMAIN ("Name or service not known", EAI_NONAME = -2), not the
+    // retryable "Temporary failure in name resolution" (EAI_AGAIN = -3) that a
+    // resolver with no route used to give.
+    let bare = py(&[], &plain_resolve_script("api.nr.test"));
+    let with_allow = py(
+        &["--allow", "other.nr.test"],
+        &plain_resolve_script("api.nr.test"),
+    );
+    assert_eq!(out(&bare), "gaierror -2", "{bare:?}");
+    assert_eq!(out(&bare), out(&with_allow), "{bare:?} vs {with_allow:?}");
+}
+
+#[test]
+fn bare_run_resolv_conf_points_at_the_resolver_and_the_host_is_untouched() {
+    let before = std::fs::read_to_string("/etc/resolv.conf").ok();
+    let o = nullroute(&["--", "cat", "/etc/resolv.conf"]);
+    let stdout = out(&o);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.starts_with('#')).collect();
+    assert_eq!(
+        lines,
+        ["nameserver 127.0.0.1", "options timeout:2 attempts:2"],
+        "{o:?}"
+    );
+    assert_eq!(std::fs::read_to_string("/etc/resolv.conf").ok(), before);
+}
+
+#[test]
+fn port_53_still_bridges_in_a_bare_run() {
+    // Without --allow names there is nothing for the sinkhole to say, so
+    // bridging port 53 keeps working (the resolver steps aside).
+    let o = nullroute(&["--port", "53", "--dry-run", "--", "true"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let o = nullroute(&["--port", "53", "--", "true"]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert_eq!(err(&o), "", "{o:?}");
+}
+
+#[test]
+fn no_dns_also_turns_off_lookup_recording() {
+    let o = py(
+        &["--no-dns", "--strict"],
+        &swallow_lookup_script("api.nr.test"),
+    );
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert!(!err(&o).contains("blocked DNS lookup"), "{}", err(&o));
+}
+
+#[test]
+fn bare_run_records_lookups_that_ask_for_ai_addrconfig() {
+    // glibc skips the query entirely when the only IPv4 address is 127.0.0.1,
+    // which would hide lookups from curl and most C clients.
+    let o = py(&["--strict"], &resolve_script(&["api.nr.test"]));
+    assert_eq!(out(&o), "gaierror -2", "{o:?}");
+    assert!(
+        err(&o).contains("nullroute: blocked DNS lookup of api.nr.test"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+}
+
+#[test]
+fn localhost_is_not_a_lookup_even_when_asked_over_dns() {
+    // `getent hosts` asks for ::1 as well; when /etc/hosts doesn't have it
+    // the query reaches the resolver, which must answer it, not report it.
+    let o = nullroute(&[
+        "--strict",
+        "--",
+        "sh",
+        "-c",
+        "getent hosts localhost || true",
+    ]);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert!(!err(&o).contains("blocked"), "{}", err(&o));
+    let script =
+        "import socket\nprint(sorted({a[4][0] for a in socket.getaddrinfo('localhost', 80)}))";
+    let o = py(&["--strict"], script);
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    assert!(out(&o).contains("127.0.0.1"), "{o:?}");
+}
+
+#[test]
+fn relayed_tls_connection_must_name_the_host_it_dialled() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    let port = echo_server(ip);
+    // The test server echoes back "echo:" + what it read. A ClientHello for
+    // the dialled name goes through; one naming another host is cut off.
+    let script = |sni: &str| {
+        format!(
+            "import socket, struct\n\
+             n = {sni}.encode()\n\
+             entry = b'\\x00' + struct.pack('>H', len(n)) + n\n\
+             lst = struct.pack('>H', len(entry)) + entry\n\
+             ext = struct.pack('>HH', 0, len(lst)) + lst\n\
+             body = b'\\x03\\x03' + bytes(32) + b'\\x00' + b'\\x00\\x02\\x13\\x01' + b'\\x01\\x00' + struct.pack('>H', len(ext)) + ext\n\
+             hs = b'\\x01' + struct.pack('>I', len(body))[1:] + body\n\
+             data = b'\\x16\\x03\\x01' + struct.pack('>H', len(hs)) + hs\n\
+             s = socket.create_connection(('db.nr.test', {port}), timeout=10)\n\
+             try:\n    s.sendall(data)\n    r = s.recv(8)\n    print(r.decode() or 'CLOSED')\n\
+             except OSError:\n    print('CLOSED')"
+        )
+    };
+    let flags = [
+        "--allow",
+        &format!("db.nr.test:{port}"),
+        "--resolve",
+        &format!("db.nr.test:{ip}"),
+    ];
+    let o = py(&flags, &script("'db.nr.test'"));
+    assert_eq!(out(&o), "echo:\u{16}\u{3}\u{1}", "{o:?}");
+    let o = py(&flags, &script("'evil.nr.test'"));
+    assert_eq!(out(&o), "CLOSED", "{o:?}");
+    assert!(
+        err(&o)
+            .contains("nullroute: blocked TLS server name evil.nr.test in a tunnel to db.nr.test:"),
+        "{}",
+        err(&o)
+    );
 }

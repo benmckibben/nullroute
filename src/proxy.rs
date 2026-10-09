@@ -14,6 +14,13 @@
 //!
 //! Blocked hosts get `403` with an explanation, and one warning per host on stderr.
 //!
+//! The allowlist is checked against the host in the request target, which a
+//! client can contradict inside the request: a plain-HTTP request's `Host`
+//! header must name the host it is sent to (or another allowed host), and the
+//! first TLS record of a tunnel (see sni.rs) must name the tunnel's host. What
+//! that can't catch (an SNI that matches with a different `Host` inside TLS)
+//! is spelled out in the README.
+//!
 //! This only covers clients that honour proxy variables (curl, wget, pip,
 //! Python requests/urllib/httpx, Go net/http, Node's fetch with
 //! NODE_USE_ENV_PROXY, Java with flags...). Other clients can reach allowed
@@ -36,8 +43,10 @@ use std::net::{
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
 
+use crate::diag::diagln;
 use crate::limits;
 use crate::report::{Kind, Report};
+use crate::sni::{self, Refusal, Verdict};
 use std::time::Duration;
 
 /// Default port for the proxy inside the sandbox (the conventional proxy port).
@@ -197,7 +206,7 @@ impl Allowlist {
 /// Names that mean "this machine" (glibc/systemd resolve them to loopback
 /// without asking DNS): `localhost`, `*.localhost` (RFC 6761),
 /// `localhost.localdomain` and the Debian `ip6-` aliases.
-fn is_localhost_name(h: &str) -> bool {
+pub(crate) fn is_localhost_name(h: &str) -> bool {
     let h = h.trim_start_matches("*.");
     h == "localhost"
         || h.ends_with(".localhost")
@@ -387,6 +396,7 @@ impl Proxy {
             }
         };
 
+        note_private_peer(&req.host, &upstream, self.report.quiet());
         let mut upstream = upstream;
         if req.connect {
             if client
@@ -395,16 +405,155 @@ impl Proxy {
             {
                 return;
             }
+            // The client's first bytes (a TLS ClientHello, usually) arrive after
+            // the 200; check the server name before anything reaches the host.
+            if let Err(refusal) = gate_tunnel(
+                &self.allow,
+                &client,
+                &mut upstream,
+                &req.host,
+                req.port,
+                rest,
+            ) {
+                record_refused_tunnel(&self.report, &req.host, req.port, &refusal);
+                return;
+            }
         } else {
+            match check_host_header(&head, &req, &self.allow) {
+                HostCheck::Fine => {}
+                HostCheck::Malformed(why) => {
+                    respond(&mut client, 400, &format!("nullroute proxy: {why}"));
+                    return;
+                }
+                HostCheck::Differs(named) => {
+                    self.block_host_header(&req, &named);
+                    respond(
+                        &mut client,
+                        403,
+                        &format!(
+                            "nullroute blocked this request: its Host header names {named}, but it was sent to {}. \
+                             The Host header has to name the host the request goes to; add --allow {named} to permit it.",
+                            req.host
+                        ),
+                    );
+                    return;
+                }
+            }
             let head = rewrite_for_origin(&head, &req);
             if upstream.write_all(&head).is_err() {
                 return;
             }
-        }
-        if !rest.is_empty() && upstream.write_all(&rest).is_err() {
-            return;
+            if !rest.is_empty() && upstream.write_all(&rest).is_err() {
+                return;
+            }
         }
         crate::forward::relay(client, upstream);
+    }
+
+    /// Record a plain-HTTP request whose Host header names another host.
+    fn block_host_header(&self, req: &Request, named: &str) {
+        let target = format!("{named}:{}", req.port);
+        let why = format!(
+            "Host header differs from the request target {}; not in --allow",
+            req.host
+        );
+        self.report.record(Kind::Proxy, &target, &why, || {
+            format!(
+                "nullroute: blocked Host: {named} in a request to {} (not in --allow; the Host header must name the host the request goes to)",
+                req.host
+            )
+        });
+    }
+}
+
+/// Record a tunnel (or relayed connection) refused by [`gate_tunnel`].
+pub(crate) fn record_refused_tunnel(report: &Report, host: &str, port: u16, refusal: &Refusal) {
+    match refusal {
+        Refusal::Name(name) => {
+            let why =
+                format!("TLS server name differs from the tunnel's host {host}; not in --allow");
+            report.record(Kind::Proxy, &format!("{name}:{port}"), &why, || {
+                format!(
+                    "nullroute: blocked TLS server name {name} in a tunnel to {host}:{port} (not in --allow; the server name must be the host the tunnel goes to)"
+                )
+            });
+        }
+        Refusal::Unreadable => {
+            report.record(
+                Kind::Proxy,
+                &format!("{host}:{port}"),
+                "unreadable TLS ClientHello",
+                || {
+                    format!(
+                        "nullroute: blocked a tunnel to {host}:{port} (unreadable TLS ClientHello)"
+                    )
+                },
+            );
+        }
+    }
+}
+
+/// Look at the start of what the client sends into a tunnel to `host:port`.
+/// If it is a TLS ClientHello naming a server other than `host` (and not
+/// itself allowed), refuse. Otherwise the bytes read so far are written to
+/// `upstream`, so the relay can carry on from there.
+pub(crate) fn gate_tunnel(
+    allow: &Allowlist,
+    client: &TcpStream,
+    upstream: &mut TcpStream,
+    host: &str,
+    port: u16,
+    initial: Vec<u8>,
+) -> Result<(), Refusal> {
+    let tunnel_host = Allowlist::norm(host);
+    let ok = |name: &str| Allowlist::norm(name) == tunnel_host || allow.allows(name, port);
+    match sni::gate(client, upstream, initial, ok) {
+        Verdict::Refuse(r) => Err(r),
+        Verdict::Pass(first) => {
+            // A failed write just means the tunnel is already gone.
+            if !first.is_empty() {
+                let _ = upstream.write_all(&first);
+            }
+            Ok(())
+        }
+    }
+}
+
+/// What the Host header of a plain-HTTP proxy request says.
+#[derive(Debug, PartialEq, Eq)]
+enum HostCheck {
+    /// Absent, the host the request is sent to, or another allowed host.
+    Fine,
+    /// Names a different host that isn't allowed (as it was written).
+    Differs(String),
+    Malformed(&'static str),
+}
+
+/// The proxy checked the host in the request target against the allowlist, but
+/// the server picks the site from the Host header. A client could ask for an
+/// allowed host and name another one there (domain fronting), so the two have
+/// to agree, unless the Host header names a host that is allowed too.
+fn check_host_header(head: &[u8], req: &Request, allow: &Allowlist) -> HostCheck {
+    let text = String::from_utf8_lossy(head);
+    let mut values = text.split("\r\n").skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim().to_string())
+    });
+    let Some(value) = values.next() else {
+        return HostCheck::Fine;
+    };
+    if values.next().is_some() {
+        return HostCheck::Malformed("more than one Host header");
+    }
+    let Some((host, port)) = split_host_port(&value, Some(req.port)) else {
+        return HostCheck::Malformed("invalid Host header");
+    };
+    if Allowlist::norm(&host) == Allowlist::norm(&req.host) || allow.allows(&host, port) {
+        HostCheck::Fine
+    } else {
+        HostCheck::Differs(Allowlist::norm(&host))
     }
 }
 
@@ -559,6 +708,80 @@ impl Forbidden {
             }
             Forbidden::Metadata => "resolves to a cloud metadata address; always blocked",
         }
+    }
+}
+
+/// Is `ip` in space that belongs to a local network rather than the internet,
+/// and if so which? Allowed, but worth a warning: an allowed name or address
+/// there reaches machines on the host's LAN or VPN, which is easy to do by
+/// accident (a corporate name, a split-horizon DNS answer).
+pub(crate) fn private_range(ip: IpAddr) -> Option<&'static str> {
+    let v4 = match ip {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(v6) => {
+            if v6.segments()[0] & 0xfe00 == 0xfc00 {
+                return Some("unique local (fc00::/7)");
+            }
+            embedded_v4(v6)?
+        }
+    };
+    let o = v4.octets();
+    if o[0] == 10 || (o[0] == 172 && (16..32).contains(&o[1])) || (o[0] == 192 && o[1] == 168) {
+        Some("private (RFC 1918)")
+    } else if o[0] == 100 && (64..128).contains(&o[1]) {
+        Some("carrier-grade NAT (100.64.0.0/10)")
+    } else {
+        None
+    }
+}
+
+/// Warnings for `--allow` IP literals and `--resolve` pins in private space,
+/// one line each: they work, but they are a hole to the local network.
+pub fn private_address_warnings(allow: &Allowlist, overrides: &Overrides) -> Vec<String> {
+    let mut v = Vec::new();
+    for e in allow.entries() {
+        if let Pattern::Exact(h) = &e.pattern
+            && let Ok(ip) = h.parse::<IpAddr>()
+            && let Some(range) = private_range(ip)
+        {
+            v.push(format!(
+                "nullroute: warning: --allow {h} is a {range} address: allowing it lets the command reach that machine on your local network"
+            ));
+        }
+    }
+    for (host, ip) in overrides {
+        if let Some(range) = private_range(*ip) {
+            v.push(format!(
+                "nullroute: warning: --resolve {host}:{ip} points at a {range} address on your local network"
+            ));
+        }
+    }
+    v
+}
+
+/// Print one warning per host the first time an allowed name is connected to
+/// an address in private space (see [`private_range`]).
+pub(crate) fn note_private_peer(host: &str, stream: &TcpStream, quiet: bool) {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let Ok(peer) = stream.peer_addr() else { return };
+    let Some(range) = private_range(peer.ip()) else {
+        return;
+    };
+    if host.parse::<IpAddr>().is_ok() {
+        return; // an IP literal was warned about at startup
+    }
+    let first = match SEEN.lock() {
+        Ok(mut seen) if !seen.iter().any(|h| h == host) => {
+            seen.push(host.to_string());
+            true
+        }
+        _ => false,
+    };
+    if first && !quiet {
+        diagln!(
+            "nullroute: warning: {host} resolved to {}, a {range} address on your local network",
+            peer.ip()
+        );
     }
 }
 
@@ -963,6 +1186,118 @@ mod tests {
             dial("mapped.test", 80, &o),
             Err(DialError::Forbidden(Forbidden::Loopback))
         ));
+    }
+
+    #[test]
+    fn private_ranges_are_named() {
+        let r = |s: &str| private_range(s.parse().unwrap());
+        for ip in [
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "::ffff:10.1.2.3",
+        ] {
+            assert_eq!(r(ip), Some("private (RFC 1918)"), "{ip}");
+        }
+        for ip in ["100.64.0.1", "100.127.255.254"] {
+            assert_eq!(r(ip), Some("carrier-grade NAT (100.64.0.0/10)"), "{ip}");
+        }
+        for ip in ["fc00::1", "fd12:3456::1"] {
+            assert_eq!(r(ip), Some("unique local (fc00::/7)"), "{ip}");
+        }
+        for ip in [
+            "93.184.216.34",
+            "172.15.0.1",
+            "172.32.0.1",
+            "192.169.0.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "2001:db8::1",
+            "fe00::1",
+        ] {
+            assert_eq!(r(ip), None, "{ip}");
+        }
+    }
+
+    #[test]
+    fn startup_warns_about_private_allow_entries_and_pins() {
+        let a = al(&[
+            "10.0.0.5",
+            "93.184.216.34",
+            "db.example.com",
+            "fd00::1",
+            "100.64.1.1:443",
+        ]);
+        let mut pins = Overrides::new();
+        pins.insert("db.example.com".into(), "192.168.0.9".parse().unwrap());
+        let w = private_address_warnings(&a, &pins);
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert!(
+            w[0].contains("--allow 10.0.0.5 is a private (RFC 1918) address"),
+            "{w:?}"
+        );
+        assert!(w[1].contains("--allow fd00::1 is a unique local"), "{w:?}");
+        assert!(
+            w[2].contains("--allow 100.64.1.1 is a carrier-grade NAT"),
+            "{w:?}"
+        );
+        assert!(
+            w[3].contains("--resolve db.example.com:192.168.0.9"),
+            "{w:?}"
+        );
+        assert!(private_address_warnings(&al(&["93.184.216.34"]), &Overrides::new()).is_empty());
+    }
+
+    #[test]
+    fn host_header_must_match_the_request_target() {
+        let a = al(&["api.example.com", "other.example.com"]);
+        let check = |head: &str| {
+            let req = parse_request(head.as_bytes()).unwrap();
+            check_host_header(head.as_bytes(), &req, &a)
+        };
+        let get = |hdrs: &str| format!("GET http://api.example.com:8080/x HTTP/1.1\r\n{hdrs}\r\n");
+        assert_eq!(check(&get("")), HostCheck::Fine);
+        assert_eq!(
+            check(&get("Host: api.example.com:8080\r\n")),
+            HostCheck::Fine
+        );
+        assert_eq!(check(&get("host: API.example.com.\r\n")), HostCheck::Fine);
+        assert_eq!(
+            check(&get("Accept: */*\r\nHost:   api.example.com \r\n")),
+            HostCheck::Fine
+        );
+        // Another allowed host is fine; one that isn't is not.
+        assert_eq!(check(&get("Host: other.example.com\r\n")), HostCheck::Fine);
+        assert_eq!(
+            check(&get("Host: evil.example\r\n")),
+            HostCheck::Differs("evil.example".into())
+        );
+        assert_eq!(
+            check(&get("Host: api.example.com.evil.example\r\n")),
+            HostCheck::Differs("api.example.com.evil.example".into())
+        );
+        assert_eq!(
+            check(&get("Host: Evil.Example:81\r\n")),
+            HostCheck::Differs("evil.example".into())
+        );
+        assert!(matches!(
+            check(&get("Host: api.example.com\r\nHost: evil.example\r\n")),
+            HostCheck::Malformed(_)
+        ));
+        assert!(matches!(check(&get("Host: \r\n")), HostCheck::Malformed(_)));
+        assert!(matches!(
+            check(&get("Host: [::1\r\n")),
+            HostCheck::Malformed(_)
+        ));
+        // IP literals, bracketed or not.
+        let a = al(&["2001:db8::1"]);
+        let head = "GET http://[2001:db8::1]:80/ HTTP/1.1\r\nHost: [2001:0db8::1]\r\n\r\n";
+        let req = parse_request(head.as_bytes()).unwrap();
+        assert_eq!(
+            check_host_header(head.as_bytes(), &req, &a),
+            HostCheck::Fine
+        );
     }
 
     #[test]

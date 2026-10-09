@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "command": ["python3", "-c", "import socket\nfor n in ('a.nr.test', 'b.nr.test', 'a.nr.test'):\n    try:\n        socket.getaddrinfo(n, 80, socket.AF_INET)\n    except OSError:\n        pass"],
+  "exit_code": 1,
+  "strict_failed": true,
+  "blocked": [
+    {"kind": "dns", "target": "a.nr.test", "reason": "not in --allow", "count": 2},
+    {"kind": "dns", "target": "b.nr.test", "reason": "not in --allow", "count": 1}
+  ],
+  "rewritten": []
+}

@@ -77,8 +77,10 @@ checks, runs `cargo package` as a packaging check, and leaves the archives and
 `SHA256SUMS` as artifacts of the workflow run. It has a read-only token, uses no
 secrets, and publishes nothing. Publishing is done by hand:
 
-1. Bump `version` in `Cargo.toml` and `Cargo.lock`; in `CHANGELOG.md`, move the
-   `Unreleased` entries under a new `## [X.Y.Z] - YYYY-MM-DD` heading.
+1. Bump `version` in `Cargo.toml` and `Cargo.lock` (the first release is 0.1.0,
+   which they already say); in `CHANGELOG.md`, move the `Unreleased` entries
+   under a new `## [X.Y.Z] - YYYY-MM-DD` heading and drop the "no release has
+   been made yet" sentence.
 2. Merge that to the default branch once CI is green.
 3. Tag the merge commit `vX.Y.Z` and push the tag. Wait for the "Release build"
    run to go green.

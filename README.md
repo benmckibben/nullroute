@@ -13,7 +13,7 @@ nullroute run --port 5432,6379 -- pytest   # local Postgres + Redis still reacha
 ```
 
 <p align="center">
-  <img src="demo/demo.gif" alt="nullroute 15-second terminal demo" width="760" />
+  <img src="demo/demo.gif" alt="nullroute terminal demo (about 20 seconds)" width="760" />
 </p>
 
 Inside, the command runs in its own network namespace: a loopback interface and
@@ -31,14 +31,18 @@ The exit code is passed through, so it drops into CI unchanged.
 
 ## Installing
 
-nullroute is built from source (Rust 1.88 or newer, Linux only; see
-[Requirements](#requirements)):
+There are no release binaries and no published crate yet, so today you build it
+from source (Rust 1.88 or newer, Linux only; see [Requirements](#requirements)):
 
 ```bash
 git clone https://github.com/benmckibben/nullroute
 cd nullroute
 cargo install --locked --path .   # installs nullroute into ~/.cargo/bin
 ```
+
+Don't run `cargo install nullroute`: the name on crates.io currently holds only
+an empty 0.0.0 placeholder, which is not this program. This section will change
+when a release exists.
 
 ## Reaching local services: `--port`
 
@@ -106,6 +110,41 @@ Other details:
   `--port`), and link-local/metadata IPs.
 - Plain-HTTP requests are sent with `Connection: close`: one request per
   proxied connection.
+- **The name has to be the same all the way down.** The allowlist is checked
+  against the host in the request (the proxy's `CONNECT` target or request URL,
+  or the name the client resolved through the sinkhole). A client could ask for
+  an allowed host and then name another one for the server to serve (domain
+  fronting), so nullroute also checks what it can see without decrypting
+  anything:
+  - a plain-HTTP request through the proxy must have a `Host` header that names
+    the host it is sent to (or another allowed host), exactly one `Host` header,
+    or none; anything else gets `403` (or `400` for several) and is reported as
+    a `proxy` block;
+  - the first TLS record of a tunnel (the proxy's `CONNECT` and the sinkhole's
+    relayed connections) is read before anything reaches the host: a ClientHello
+    whose server name (SNI) isn't the tunnel's host or another allowed host is
+    cut off and reported. No SNI (a client dialling an IP address) is let
+    through; a first record that looks like TLS but can't be parsed is refused.
+    Other protocols, and servers that speak first (SSH, SMTP, MySQL), are
+    forwarded untouched. To use a different SNI deliberately (for example a
+    client-facing name for Encrypted Client Hello), allow that name too.
+- **What that doesn't stop.** The server name and the `Host` header inside TLS
+  are the same name for any honest client, but a program that wants to front
+  can send the allowed name in the SNI and a different `Host` in the encrypted
+  request, to a server that serves both (typically several sites behind one CDN
+  address). Plain HTTP through the sinkhole's relay isn't `Host`-checked either:
+  one connection carries many requests. Allowlisting by name can't close this;
+  nullroute stops accidental access, not a client that is trying to get around it
+  (see [What nullroute is not](#what-nullroute-is-not)).
+- **Private and LAN addresses work, on purpose.** `--allow 10.0.0.5`, or a name
+  that resolves into RFC 1918, carrier-grade NAT (100.64.0.0/10) or unique-local
+  (fc00::/7) space, reaches that machine on your network (only loopback,
+  link-local and cloud-metadata addresses are always refused). nullroute prints
+  a warning for an `--allow` or `--resolve` IP in that space, and once per host
+  when an allowed name resolves into it, because that is usually a corporate or
+  split-horizon name you didn't mean to open up. `-q` silences the warnings.
+  An allowed IP allows everything that answers there, but a `Host` header or
+  SNI naming another host is still refused unless that host is allowed too.
 - The proxy listens on `127.0.0.1:3128` inside the sandbox (or the next port
   that isn't a `--port`). An existing `HTTP(S)_PROXY` is overridden; chaining to
   a corporate upstream proxy isn't supported yet.
@@ -117,7 +156,8 @@ nullroute run --allow db.staging.example.com:5432 -- psql -h db.staging.example.
 nullroute run --allow api.github.com -- ./my-static-binary   # ports 80 and 443
 ```
 
-With `--allow`, the sandbox also gets its own resolver:
+Every sandbox gets its own resolver, and with `--allow` host names it becomes a
+sinkhole that maps those names:
 
 1. **Resolver.** nullroute answers DNS on `127.0.0.1:53` (UDP and TCP) inside the
    sandbox, and bind-mounts a generated `/etc/resolv.conf` (`nameserver 127.0.0.1`)
@@ -134,6 +174,7 @@ With `--allow`, the sandbox also gets its own resolver:
    assigned on first lookup and recycled least-recently-resolved first (TTL 30s).
    **Any other name gets `NXDOMAIN`** and is recorded in the report as `dns`.
    `AAAA` queries for allowed names get an empty answer, so clients use IPv4.
+   (`localhost` and `*.localhost` resolve to loopback and aren't reported.)
 3. **Transparent relay.** nullroute listens on each synthetic address on the
    ports that name is allowed on: the `:port` from `--allow`, or **80 and 443**
    when none is given. A connection to `127.77.0.x:PORT` is mapped back to its
@@ -141,10 +182,18 @@ With `--allow`, the sandbox also gets its own resolver:
    resolved on the host, loopback results refused. TLS stays end-to-end, and the
    client sends the right SNI/`Host` because it dialled by name.
 
+**Without `--allow` host names** the resolver still runs: it answers every name
+with `NXDOMAIN` ("Name or service not known") and records the lookup as a `dns`
+block (see [the report](#what-got-blocked-the-report-and---strict)), so a plain
+`nullroute run --strict` catches a test that looks a name up and swallows the
+error. A lookup fails the same way with and without `--allow`: with an answer
+that is final, not the retryable "Temporary failure in name resolution" that a
+resolver with no route gives, which clients such as musl's sit out for seconds.
+
 | Flag | Effect |
 |---|---|
 | `--resolve HOST:IP` | Dial an allowed host at `IP` instead of resolving it on the host, like curl's `--resolve` (repeatable; applies to the proxy too). The host must be allowed; loopback IPs are still refused. |
-| `--no-dns` | Don't run the sinkhole: names don't resolve inside, only proxy-aware clients reach allowed hosts. |
+| `--no-dns` | Don't run the resolver or the sinkhole: names don't resolve inside (the host's `resolv.conf` has no route out, so lookups typically fail with "Temporary failure in name resolution"), only proxy-aware clients reach allowed hosts, and DNS lookups are not recorded, so `--strict` can't see them. |
 
 ```text
 $ nullroute run --allow api.github.com -- python3 -c "import socket; socket.create_connection(('example.com', 443))"
@@ -165,10 +214,13 @@ Limits (all fail closed):
 - An allowed name that has no port and isn't HTTP(S) needs `--allow host:port`.
 - A client with a hard-coded resolver (`dig @8.8.8.8`, DNS-over-HTTPS) bypasses
   `resolv.conf`; it gets "network unreachable" instead of an answer.
-- `--port 53` clashes with the resolver; add `--no-dns` to bridge it.
-- nullroute adds `127.77.0.1/24` to the sandbox's `lo`: routing doesn't need
-  it, but glibc's `AI_ADDRCONFIG` ignores lookups for IPv4 when the only IPv4
-  address is `127.0.0.1`.
+- With `--allow` host names, `--port 53` clashes with the resolver; add
+  `--no-dns` to bridge it. Without them, `--port 53` bridges as asked and the
+  resolver steps aside (lookups are then not recorded).
+- nullroute adds `127.77.0.1/24` to the sandbox's `lo` (in every sandbox that
+  has the resolver): routing doesn't need it, but glibc's `AI_ADDRCONFIG`
+  ignores lookups for IPv4 when the only IPv4 address is `127.0.0.1`, which
+  would hide those lookups from the report.
 
 ## What got blocked: the report and `--strict`
 
@@ -189,7 +241,7 @@ nullroute: blocked 7 attempts to reach 2 targets:
 | Kind | What | Counts as blocked (`--strict`) |
 |---|---|---|
 | `socket` | a connection to a hidden socket | yes |
-| `proxy` | a proxy request to a host that isn't allowed | yes |
+| `proxy` | a proxy request to a host that isn't allowed, or one whose `Host` header or TLS server name names a host that isn't | yes |
 | `dns` | a lookup of a name that isn't allowed, or a relay the sinkhole refused | yes |
 | `docker` | a Docker API request `--seal-docker` (or `--seal-docker-pulls`) refused | yes |
 | `rewritten` | a request `--seal-docker` changed and let through (a container create forced onto `NetworkMode=none`, or a classic `docker build` forced onto `networkmode=none`) | no |
@@ -205,12 +257,13 @@ CLI reconnects).
 
 | Flag | Effect |
 |---|---|
-| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors. A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
+| `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors, as long as the attempt reaches nullroute: DNS lookups (with or without `--allow`), proxy requests and hidden sockets do; a connection straight to an IP address does not (see below). A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
 | `-q`, `--quiet` | Skip the live lines; keep the summary. |
-| `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
+| `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean; layout and compatibility rules in [docs/report-json.md](docs/report-json.md)). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
 
 ```json
 {
+  "schema_version": 1,
   "command": ["docker", "run", "--rm", "alpine", "true"],
   "exit_code": 0,
   "strict_failed": false,
@@ -234,13 +287,20 @@ CLI reconnects).
 | `127` | the command was not found |
 
 The command can exit with any of these itself, so they only mean something when
-the command isn't known to use them. (Like Docker: `125` for "the runner failed", `126` and `127` for the
-contained command that couldn't be invoked or found. Usage errors are `2`, as
-for most CLIs.)
+the command isn't known to use them. In particular a `1` is either the command's
+own or `--strict`'s: with `--report-json`, `"strict_failed": true` says that
+nullroute turned a success into `1` (see [docs/report-json.md](docs/report-json.md)).
+(Like Docker: `125` for "the runner failed", `126` and `127` for the contained
+command that couldn't be invoked or found. Usage errors are `2`, as for most
+CLIs.)
 
-Not listed: a direct connection to an IP address fails inside the kernel
-("network unreachable") without reaching nullroute. Proxy requests, DNS lookups
-and hidden sockets are listed.
+**What `--strict` can't see.** A direct connection to an IP address (`connect()` to
+`93.184.216.34:443`, no name lookup) fails inside the kernel with "network
+unreachable" (`ENETUNREACH`), because the sandbox has only a loopback. Nothing
+reaches nullroute, so there is nothing to record: `--strict` can't tell that
+such a command tried, and it passes if the command swallows the error. Proxy
+requests, DNS lookups and hidden sockets are listed. A program that talks to
+hard-coded IP addresses is only caught by its own failure.
 
 **Signals and process lifetime.** Ctrl-C reaches the command as usual; nullroute
 itself ignores SIGINT/SIGQUIT so it can still print the report, then exits with
@@ -316,15 +376,15 @@ nullroute: inspect: sandbox topology
 
 | Line | Meaning |
 |---|---|
-| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden, sealed or masked, or the DNS sinkhole is on. |
-| `loopback` | The sandbox's own `lo`, brought up before the command runs (plus the synthetic pool address with the DNS sinkhole). |
+| `namespaces` | Linux namespaces the command gets: always `user` and `net`; `mount` when a socket is hidden, sealed or masked, or the resolver has a `resolv.conf` to put in place (almost always). |
+| `loopback` | The sandbox's own `lo`, brought up before the command runs (plus the resolver's synthetic pool address, `127.77.0.1/24`, unless `--no-dns`). |
 | `bridged ports` | `--port` values (sorted, deduplicated), or `none`. |
 | `blocked (403 decoy)` | Sockets replaced by a decoy that answers `403` (defaults + `--hide-socket`, minus `--allow-socket`). |
 | `sealed (--seal-docker proxy)` | Docker sockets proxied with containers forced to `NetworkMode=none`. |
 | `docker pulls` | The `--seal-docker-pulls` mode (only shown when a socket is sealed). `--dry-run` prints it too. |
 | `masked (resolver bypass)` | Local resolver sockets (systemd-resolved varlink, nscd) replaced by an unconnectable file, always. |
 | `upstream proxy` | Where the `--allow` proxy listens inside the sandbox, and the allowed hosts, or `none`. |
-| `dns sinkhole` | The resolver address and each allowed name's synthetic address and relayed ports, or `none` (no `--allow` host names, or `--no-dns`). |
+| `dns sinkhole` / `dns resolver` | The resolver address and each allowed name's synthetic address and relayed ports (`dns sinkhole`); `dns resolver` when there are no allowed names and it only refuses and records every lookup; `none` with `--no-dns` (or `--port 53` and no allowed names). |
 
 The summary is built from the same plan the sandbox is built from, so it shows
 exactly what will be set up. Combine with `--dry-run` to print it and exit
@@ -367,7 +427,7 @@ sandbox. So, also by default:
 |---|---|
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). Any path to the socket works (symlinks are followed); `--dry-run` shows what is hidden. |
 | `--hide-socket PATH` | Hide another socket too, e.g. an X11 or Wayland display socket or a local proxy (repeatable). |
-| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. It validates the options and the listener / file-descriptor budget exactly as a real run does (a configuration that would fail with "too many listeners" fails here too, exit 125), but it does **not** start anything: it can't tell you that user namespaces are disabled, that a port is free, or that the command exists. |
+| `--dry-run` | Print what would be hidden, masked, forwarded and allowed (hidden and sealed sockets, masked resolver sockets, the seccomp filter, forwarded ports, allowed hosts, the DNS resolver or sinkhole mapping, the namespaces), then exit. It validates the options and the listener / file-descriptor budget exactly as a real run does (a configuration that would fail with "too many listeners" fails here too, exit 125), but it does **not** start anything: it can't tell you that user namespaces are disabled, that a port is free, or that the command exists. |
 | `--check-sandbox` | With `--dry-run`: also check that this machine lets nullroute create the user, network and mount namespaces (a throw-away process does the real setup and exits; nothing is left behind). Exit 125 with the same message a real run would give if it can't. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
 
@@ -770,6 +830,63 @@ relays the connections on the host's network.
 - **Docker** (only for `--seal-docker`): a daemon reachable on a Unix socket.
 - **Rust 1.88 or newer** to build from source.
 
+## Troubleshooting
+
+**`could not create an unprivileged user namespace` (exit 125).** nullroute needs
+unprivileged user namespaces; the kernel or a security layer refused one. The
+message names the usual causes:
+
+- *Ubuntu 23.10 and later*: AppArmor restricts them
+  (`sysctl kernel.apparmor_restrict_unprivileged_userns`). Fixing this needs an
+  administrator: either lift the restriction or give the `nullroute` binary an
+  AppArmor profile that allows `userns`.
+- *Other distributions*: `sysctl user.max_user_namespaces` (0 disables them) or, on
+  some Debian kernels, `kernel.unprivileged_userns_clone`.
+- *Inside a container*: Docker's default seccomp profile blocks `unshare`, so
+  `docker run debian /path/to/nullroute run -- true` fails with this message
+  (checked); with `--security-opt seccomp=unconfined` it works. As root inside the
+  container nullroute is [not a boundary](#what-nullroute-is-not), so also pass
+  `--user UID:GID` (checked: works as uid 1000). Nested rootless Podman and
+  Docker work when the outer environment allows user namespaces (not tested).
+- *WSL*: WSL 2 works (this is where nullroute is developed). WSL 1 has no network
+  namespaces.
+
+**My command can't reach the network.** That is the point. Connecting to an IP
+address fails with "Network is unreachable"; a name lookup fails with "Name or
+service not known" and a `blocked DNS lookup of NAME` line. To let something
+through, name it: `--allow api.example.com` for the internet, `--port 5432` for a
+service on this machine's localhost. `nullroute run --inspect --dry-run -- true`
+shows what a given set of flags sets up, and `--strict` turns any blocked attempt
+into exit 1 even if the command swallowed the error.
+
+**`Temporary failure in name resolution`.** Without `--no-dns` nullroute's
+resolver answers every lookup (names that are not allowed get "Name or service
+not known"), so this message means a lookup bypassed it: you passed `--no-dns`, or
+the client talks to a hard-coded resolver (`dig @8.8.8.8`, DNS-over-HTTPS) that
+has no route out. It is a message about the sandbox, not about the name.
+
+**A connection to an allowed name is refused or closed.** Only the allowed ports
+are relayed: without `:PORT`, 80 and 443. For a database use
+`--allow db.example.com:5432`. An IP address in `--allow` works through the proxy
+only, not for a direct `connect()`. A request whose `Host` header or TLS server
+name names a different host than the one you connected to is refused (see
+[What that doesn't stop](#letting-chosen-hosts-through---allow)).
+
+**Exit code 1 (or 125): the command's or nullroute's?** Add `--report-json
+report.json` and read `strict_failed` and `exit_code` ([docs/report-json.md](docs/report-json.md)):
+`strict_failed: true` means the command succeeded and `--strict` failed the run.
+`125`, `126` and `127` are nullroute's own when the message on stderr starts with
+`nullroute:`.
+
+**`docker` fails with `nullroute blocked access to /run/docker.sock`.** Container
+sockets are hidden by default. Use `--seal-docker` (containers get no network) or
+`--allow-socket /run/docker.sock` (they get full network access).
+
+**A warning that an allowed address is private.** `--allow 10.0.0.5`, or a name that
+resolves into RFC 1918, carrier-grade NAT or unique-local space, is reachable on
+purpose; the warning is there in case that is a corporate name you did not mean to
+open up. `-q` silences it.
+
 ## Examples
 
 Turnkey, runnable examples are in [`examples/`](examples/):
@@ -779,7 +896,7 @@ Turnkey, runnable examples are in [`examples/`](examples/):
 - [`examples/03-local-service-port`](examples/03-local-service-port/): Bridging host databases/containers via `--port` with bidirectional loopback isolation.
 - [`examples/04-allowlist-surgical-bridge`](examples/04-allowlist-surgical-bridge/): Surgical egress allowlisting and breach reporting (`--report-json`).
 
-Each example is self-contained and runnable via `./run.sh` in under 5 seconds.
+Each example is self-contained and runs with `./run.sh`. With a built binary each takes about a second or less (0.1 to 0.6 s measured; the ones that use the public internet depend on your connection), and `NULLROUTE_EXAMPLES_OFFLINE=1` skips those steps.
 
 ## Development
 

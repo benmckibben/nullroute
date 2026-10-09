@@ -40,6 +40,7 @@ mod seccomp;
 #[cfg(target_os = "linux")]
 mod signals;
 #[cfg(target_os = "linux")]
+mod sni;
 mod tmpdir;
 
 use crate::diag::{diag, diagln};
@@ -63,7 +64,7 @@ enum Cmd {
     ///
     /// Example: nullroute run -- pytest -x
     #[command(
-        override_usage = "nullroute run [OPTIONS] -- <COMMAND> [ARGS]...",
+        override_usage = "nullroute run [OPTIONS] -- <COMMAND>...",
         after_help = "Note: Place the command and any of its arguments after '--' so flags are not parsed by nullroute.\nExample: nullroute run --port 5432 -- pytest -x"
     )]
     Run {
@@ -81,18 +82,21 @@ enum Cmd {
         hide_sockets: Vec<std::path::PathBuf>,
 
         /// Keep this socket reachable even though it's hidden by default
-        /// (repeatable). E.g. --allow-socket /var/run/docker.sock for tests that
-        /// start containers; those containers will have network access. Or
+        /// (repeatable).
+        ///
+        /// For example --allow-socket /var/run/docker.sock for tests that start
+        /// containers (those containers will have network access), or
         /// --allow-socket /run/dbus/system_bus_socket for the system D-Bus (which
         /// can resolve names through systemd-resolved), or --allow-socket
         /// "$SSH_AUTH_SOCK" to let the command use your SSH agent.
         #[arg(long = "allow-socket", value_name = "PATH")]
         allow_sockets: Vec<std::path::PathBuf>,
 
-        /// Let the command use Docker, but force every container it starts onto
-        /// no network (NetworkMode=none), instead of hiding the socket. Seals the
-        /// standard docker.sock paths. Not a security boundary for hostile images
-        /// (see the README).
+        /// Let the command use Docker, but put every container it starts on no
+        /// network (NetworkMode=none), instead of hiding the socket.
+        ///
+        /// Seals the standard docker.sock paths. Not a security boundary for
+        /// hostile images (see the README).
         #[arg(long = "seal-docker")]
         seal_docker: bool,
 
@@ -101,13 +105,13 @@ enum Cmd {
         #[arg(long = "seal-docker-socket", value_name = "PATH")]
         seal_docker_sockets: Vec<std::path::PathBuf>,
 
-        /// With --seal-docker: what the Docker daemon may contact for the
-        /// command (image pulls, pushes, logins, manifest lookups, URL imports,
-        /// remote build contexts). any (default): anything, as without this
-        /// flag; allowlisted: only pulls, logins and lookups from registries in
-        /// --allow (Docker Hub: --allow docker.io; a localhost registry: --port);
-        /// none: nothing. A classic build's missing FROM image is still pulled
-        /// (see the README).
+        /// With --seal-docker: what the Docker daemon may contact for the command
+        /// (image pulls, pushes, logins, manifest lookups, URL imports, remote
+        /// build contexts).
+        ///
+        /// The default is any: no restriction, as without this flag. A classic
+        /// build's missing FROM image is still pulled (see the README). Docker
+        /// Hub is --allow docker.io; a registry on localhost is --port.
         #[arg(long = "seal-docker-pulls", value_name = "MODE", value_enum)]
         seal_docker_pulls: Option<docker::PullPolicy>,
 
@@ -119,30 +123,45 @@ enum Cmd {
         #[arg(long = "seal-docker-allow-existing")]
         seal_docker_allow_existing: bool,
 
-        /// Let this host through (repeatable or comma-separated):
-        /// api.github.com, *.stripe.dev (subdomains only), or an IP, each
-        /// optionally :PORT. Proxy-aware clients go through an HTTP(S) proxy;
-        /// other clients resolve allowed names via nullroute's DNS sinkhole and
-        /// are relayed on the allowed ports (80/443 without :PORT). localhost and
-        /// loopback, link-local and cloud-metadata IPs are refused (use --port
-        /// for local services).
+        /// Let this host through (repeatable or comma-separated): api.github.com,
+        /// *.stripe.dev (subdomains only), or an IP, each optionally :PORT.
+        ///
+        /// Proxy-aware clients go through an HTTP(S) proxy; other clients resolve
+        /// allowed names via nullroute's DNS sinkhole and are relayed on the
+        /// allowed ports (80 and 443 without :PORT). The Host header of a proxied
+        /// HTTP request and the TLS server name (SNI) of a tunnel must name the
+        /// allowed host too.
+        ///
+        /// localhost and loopback, link-local and cloud-metadata IPs are refused
+        /// (use --port for local services). Private/LAN addresses (RFC 1918,
+        /// 100.64.0.0/10, fc00::/7) work, with a warning.
         #[arg(short, long = "allow", value_name = "HOST", value_delimiter = ',')]
         allow: Vec<String>,
 
-        /// Dial this allowed host at IP instead of resolving it on the host,
-        /// like curl's --resolve (repeatable): --resolve db.internal:10.0.0.5.
+        /// Dial this allowed host at IP instead of resolving it on the host, like
+        /// curl's --resolve (repeatable): --resolve db.internal:10.0.0.5.
+        ///
         /// Loopback, link-local and cloud-metadata addresses are still refused.
         #[arg(long = "resolve", value_name = "HOST:IP")]
         resolve: Vec<String>,
 
-        /// Don't run the DNS sinkhole for --allow: names don't resolve inside
-        /// and only proxy-aware clients can reach allowed hosts.
+        /// Don't run the DNS resolver or sinkhole.
+        ///
+        /// Names then don't resolve inside, only proxy-aware clients can reach
+        /// allowed hosts, and DNS lookups are not recorded (so --strict can't see
+        /// them). Also frees port 53 for --port.
         #[arg(long = "no-dns")]
         no_dns: bool,
 
         /// Fail (exit 1) if anything was blocked, even if the command succeeded.
+        ///
         /// A command that already failed keeps its own exit code. Requests
-        /// --seal-docker rewrote and let through don't count.
+        /// --seal-docker rewrote and let through don't count. With --report-json,
+        /// "strict_failed" tells this exit 1 from the command's own.
+        ///
+        /// Sees DNS lookups (with or without --allow), proxy requests and hidden
+        /// sockets. It can't see a connection straight to an IP address: that
+        /// fails inside the kernel (ENETUNREACH) without reaching nullroute.
         #[arg(long)]
         strict: bool,
 
@@ -150,8 +169,10 @@ enum Cmd {
         #[arg(short, long)]
         quiet: bool,
 
-        /// Also write the breach report as JSON to this file (written on every
-        /// run, with an empty "blocked" list when nothing was blocked). Checked
+        /// Also write the breach report as JSON to this file.
+        ///
+        /// Written on every run, with an empty "blocked" list when nothing was
+        /// blocked; the layout is in docs/report-json.md. The file is checked
         /// before the command runs (exit 2 if it can't be written); if writing
         /// still fails afterwards, a run that would have exited 0 exits 74.
         #[arg(long, value_name = "FILE")]
@@ -164,7 +185,11 @@ enum Cmd {
         #[arg(long = "no-seccomp")]
         no_seccomp: bool,
 
-        /// Print what would be hidden, forwarded and allowed, then exit.
+        /// Print what would be hidden, masked, forwarded and allowed, then exit.
+        ///
+        /// Lists the hidden and sealed sockets, the masked resolver sockets,
+        /// forwarded ports, allowed hosts, the DNS resolver and the namespaces.
+        /// Add --inspect for the full sandbox topology.
         #[arg(long)]
         dry_run: bool,
 
@@ -177,12 +202,13 @@ enum Cmd {
 
         /// Print the sandbox topology (namespaces, loopback, bridged ports,
         /// blocked/sealed sockets, proxy) to stderr before running the command.
+        ///
         /// With --dry-run, print it and exit without running anything.
         #[arg(long)]
         inspect: bool,
 
-        /// The command and its arguments (put them after --).
-        #[arg(required = true, last = true)]
+        /// The command to run, followed by its arguments (put them after --).
+        #[arg(required = true, last = true, value_name = "COMMAND")]
         argv: Vec<std::ffi::OsString>,
     },
 }
@@ -238,11 +264,21 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            if !quiet {
+                for w in proxy::private_address_warnings(&allowlist, &overrides) {
+                    diagln!("{w}");
+                }
+            }
+            // The resolver is always on (it records lookups for --strict and
+            // makes them fail for good); only --no-dns, or --port 53 without
+            // allowed names to map, leaves port 53 alone.
             let dns_plan = if no_dns {
                 None
             } else {
                 match dns::Plan::new(&allowlist) {
-                    Ok(p) => p,
+                    Ok(Some(p)) => Some(p),
+                    Ok(None) if ports.contains(&dns::PORT) => None,
+                    Ok(None) => Some(dns::Plan::resolver_only()),
                     Err(e) => {
                         diagln!("nullroute: {e}");
                         return ExitCode::from(2);
@@ -301,22 +337,19 @@ fn main() -> ExitCode {
                 });
             }
             let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
+            let proxy_info =
+                (!allowlist.is_empty()).then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
+            let topology = inspect::Topology::new(
+                &ports,
+                plan.as_ref(),
+                proxy_info,
+                dns_plan.as_ref(),
+                &dns::bypass_targets(),
+            )
+            .with_docker_pulls(pulls)
+            .with_seccomp(!no_seccomp);
             if inspect {
-                let proxy = (!allowlist.is_empty())
-                    .then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
-                diag!(
-                    "{}",
-                    inspect::Topology::new(
-                        &ports,
-                        plan.as_ref(),
-                        proxy,
-                        dns_plan.as_ref(),
-                        &dns::bypass_targets(),
-                    )
-                    .with_docker_pulls(pulls)
-                    .with_seccomp(!no_seccomp)
-                    .render()
-                );
+                diag!("{}", topology.render());
             }
             if dry_run {
                 // What the real run would refuse, say so now: the listener
@@ -344,6 +377,8 @@ fn main() -> ExitCode {
                 let listing = DryRunListing {
                     plan: plan.as_ref(),
                     pulls,
+                    masked: &topology.masked,
+                    namespaces: topology.namespaces(),
                     ports: &ports,
                     allowed_hosts: &allowed_hosts,
                     proxy: !allowlist.is_empty(),
@@ -390,6 +425,8 @@ fn main() -> ExitCode {
 struct DryRunListing<'a> {
     plan: Option<&'a hide::Plan>,
     pulls: docker::PullPolicy,
+    masked: &'a [std::path::PathBuf],
+    namespaces: Vec<&'static str>,
     ports: &'a [u16],
     allowed_hosts: &'a [String],
     proxy: bool,
@@ -401,12 +438,17 @@ fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::i
     let DryRunListing {
         plan,
         pulls,
+        masked,
+        namespaces,
         ports,
         allowed_hosts,
         proxy,
         dns_plan,
         seccomp,
-    } = *l;
+    } = l;
+    let (pulls, proxy, seccomp) = (*pulls, *proxy, *seccomp);
+    let (plan, dns_plan) = (*plan, *dns_plan);
+    let (ports, allowed_hosts) = (*ports, *allowed_hosts);
     match plan {
         None => writeln!(out, "hidden sockets: none")?,
         Some(p) => {
@@ -421,6 +463,9 @@ fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::i
             }
         }
     }
+    for m in masked.iter() {
+        writeln!(out, "masked resolver socket: {}", m.display())?;
+    }
     writeln!(out, "seccomp: {}", inspect::hardening(seccomp))?;
     for p in ports {
         writeln!(out, "forwarded port: {p}")?;
@@ -431,12 +476,21 @@ fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::i
     if proxy {
         writeln!(out, "proxy: http://127.0.0.1:{}", proxy::pick_port(ports))?;
     }
-    if let Some(d) = dns_plan {
-        writeln!(out, "dns sinkhole: 127.0.0.1:{}", dns::PORT)?;
-        for l in d.describe() {
-            writeln!(out, "synthetic address: {l}")?;
+    match dns_plan {
+        Some(d) if d.has_names() => {
+            writeln!(out, "dns sinkhole: 127.0.0.1:{}", dns::PORT)?;
+            for l in d.describe() {
+                writeln!(out, "synthetic address: {l}")?;
+            }
         }
+        Some(_) => writeln!(
+            out,
+            "dns resolver: 127.0.0.1:{} (every lookup is refused and recorded)",
+            dns::PORT
+        )?,
+        None => {}
     }
+    writeln!(out, "namespaces: {}", namespaces.join(", "))?;
     out.flush()
 }
 

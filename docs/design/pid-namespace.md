@@ -1,10 +1,11 @@
 # A PID namespace for the command
 
-Status: proposal (nothing here is implemented). Scope: close the remaining lifecycle gap
-left by the parent-death-signal work (PR #9 and the signal handling in #13) by running the
-command in its own PID namespace, and say what that changes for everything around it.
+Status: **open proposal** (not implemented). Scope: close the remaining lifecycle gap left by the
+parent-death signal and the signal handling (the command dies with nullroute, but its own children can
+survive) by running the command in its own PID namespace, and say what that changes for everything
+around it.
 
-Evidence tags: **[verified]** = I ran it on the host under [Test host](#test-host);
+Evidence tags: **[verified]** = run on the host under [Test host](#test-host);
 **[reasoned]** = derived from kernel semantics, not run; **[unverified]** = neither.
 Prototype code was throwaway (a ~70-line C program in a temp directory, deleted after use,
 not committed); the core of it is described under [Prototype](#prototype).
@@ -35,7 +36,7 @@ rustc 1.99, a local Docker daemon, unprivileged user (uid 1000, in the `docker` 
 Unprivileged user namespaces enabled (nullroute's own tests run here). cgroup v2 mounted
 with `nsdelegate` and a systemd user manager (delegated cgroup subtree).
 
-## What exists today
+## What exists now
 
 - `lifecycle::die_with_parent`: in the `pre_exec` hook, `prctl(PR_SET_PDEATHSIG, SIGKILL)`,
   then if `getppid() != parent` the child kills itself (the parent died before the prctl).
@@ -46,22 +47,22 @@ with `nsdelegate` and a systemd user manager (delegated cgroup subtree).
   (5 s deadline). Needs `CONFIG_PROC_CHILDREN`.
 - `signals.rs`: SIGINT/SIGQUIT ignored once the command runs (the terminal's group
   delivery reaches the command), SIGTERM/SIGHUP forwarded to the command's pid, all four
-  blocked around spawn, and (#13) the child reads nullroute's `/proc/<ppid>/status`
+  blocked around spawn, and the child reads nullroute's `/proc/<ppid>/status`
   (opened early, read last) to replay a SIGINT/SIGQUIT that landed before the child existed.
 - No PID namespace: the command sees the host's `/proc` and can `kill` the caller's other
   processes (**[verified]**: `kill -0` on an unrelated same-user process succeeds from inside).
   The README's "What nullroute is not" says so.
-- The sandbox does nothing with `/proc` today: `run_hermetic` writes `/proc/self/{setgroups,uid_map,gid_map}`
+- The sandbox does nothing with `/proc` now: `run_hermetic` writes `/proc/self/{setgroups,uid_map,gid_map}`
   from the child, and `signals.rs` opens `/proc/<pid>/status`; nothing mounts it
   (**[verified]** by grepping `src/`: those and the `/proc/self/task` scan in `lifecycle.rs` are the only uses).
 
-What survives a SIGKILL of nullroute today, for completeness: the command dies (PDEATHSIG),
+What survives a SIGKILL of nullroute now, for completeness: the command dies (PDEATHSIG),
 its children live on (**[verified]** above), and a command that is itself a set-user-ID or
 file-capability binary (e.g. `ping` with `cap_net_raw`) also lives on, because exec of such a
 binary clears PDEATHSIG (**[reasoned]**; documented in `lifecycle.rs`; not run, `ping` here is
 not file-capability based).
 
-## Kernel behaviour I measured
+## Kernel behaviour measured
 
 Prototype: a launcher that does `clone(CLONE_NEWUSER|CLONE_NEWNS|CLONE_NEWNET|CLONE_NEWPID|SIGCHLD)`;
 the child is pid 1, writes the id maps, makes mounts private, optionally mounts a fresh
@@ -75,7 +76,7 @@ the child is pid 1, writes the id maps, makes mounts private, optionally mounts 
 | Can pid 1 still write `/proc/self/uid_map` etc. through the host's `/proc`? | Yes **[verified]** (before any remount, "self" resolves in the parent's procfs). |
 | Command's view without a `/proc` remount | Host `/proc`: `NSpid:\t<host pid> 3`; the host's processes are listed. |
 | With a fresh `mount -t proc` (nosuid, nodev, noexec) | 5 numeric entries in `/proc`; `ps -e` lists exactly init, the shell and `ps` itself; the command is pid 2 with parent 1 **[verified]**. |
-| `open(/proc/<nullroute host pid>/status)` after the remount | `ENOENT`, but an fd opened *before* the remount still reads that task's `SigPnd`/`ShdPnd` **[verified]**. `signals.rs` already opens it early for exactly this kind of reason, so #13's logic survives. |
+| `open(/proc/<nullroute host pid>/status)` after the remount | `ENOENT`, but an fd opened *before* the remount still reads that task's `SigPnd`/`ShdPnd` **[verified]**. `signals.rs` already opens it early for exactly this kind of reason, so the early-signal logic survives. |
 | `kill -0 <host pid>` from inside | `No such process` **[verified]**. |
 | `getpgrp()` / `getsid()` in the command | **0 and 0** **[verified]** (group/session leader is outside). |
 | `tcgetpgrp(0)` on a pty | 0 (baseline: the real group id) **[verified]**. |
@@ -83,11 +84,11 @@ the child is pid 1, writes the id maps, makes mounts private, optionally mounts 
 | SIGTERM / SIGINT sent from outside to a pid 1 **without** a handler | Both ignored; the init stayed alive; only SIGKILL works **[verified]**. |
 | Same with a SIGTERM/SIGHUP handler installed | Delivered, forwarded to the command; init exit status 143 **[verified]**. |
 | Exit-status mapping when the init exits with the command's code | `exit 7` → 7; `kill -TERM $$` → 143; `kill -KILL $$` → 137 **[verified]**. |
-| `kill -9` of the launcher (init has PDEATHSIG) | All processes in the namespace die: 0 survivors **[verified]**. Baseline today: 2 survivors **[verified]**. |
+| `kill -9` of the launcher (init has PDEATHSIG) | All processes in the namespace die: 0 survivors **[verified]**. Baseline now: 2 survivors **[verified]**. |
 | Command exits while its background children run | The init's `kill(-1, SIGKILL)` + reap loop left 0 survivors **[verified]**. |
 | `/proc/sys/kernel/ns_last_pid` (to start pids at a high number) | Writable for an id mapped to root; **not writable** for the identity mapping nullroute uses (`I/O error`) **[verified]**. |
 | Fresh `/proc` inside a container with Docker's masked paths | Worked with `--security-opt seccomp=unconfined` (default seccomp blocks the `unshare` anyway) **[verified]**, so the "mount too revealing" kernel check did not trip there. Other container setups: **[unverified]**. |
-| Cost | Prototype (clone + id maps + mounts + fresh `/proc` + exec `true`): about 2.5 ms per run over 200 runs. Today's `nullroute run -q -- true` (debug build, everything else it does): about 4 ms. Not a controlled benchmark; the namespace part is small. |
+| Cost | Prototype (clone + id maps + mounts + fresh `/proc` + exec `true`): about 2.5 ms per run over 200 runs. The current `nullroute run -q -- true` (debug build, everything else it does): about 4 ms. Not a controlled benchmark; the namespace part is small. |
 
 ## Design
 
@@ -96,7 +97,7 @@ the child is pid 1, writes the id maps, makes mounts private, optionally mounts 
 | Option | What | Verdict |
 |---|---|---|
 | **1. Tiny init in nullroute's binary (recommended)** | Between `clone` and `exec`, the child (pid 1) stays in a small loop; a second child (pid 2) execs the command | Reaps zombies, forwards signals, owns teardown. About 60 lines of allocation-free code. |
-| 2. nullroute itself as pid 1 | Put the whole existing process in the namespace, command as child | **Rejected.** It would put the relay/proxy/DNS process in the *same user namespace* as the command. Today the command cannot read `/proc/<nullroute>/ns/net` or ptrace nullroute because nullroute is in the parent user namespace (**[verified]**: the open is denied with `EACCES`). Sharing the namespace removes that barrier for the one process that holds the host network. |
+| 2. nullroute itself as pid 1 | Put the whole existing process in the namespace, command as child | **Rejected.** It would put the relay/proxy/DNS process in the *same user namespace* as the command. Currently the command cannot read `/proc/<nullroute>/ns/net` or ptrace nullroute because nullroute is in the parent user namespace (**[verified]**: the open is denied with `EACCES`). Sharing the namespace removes that barrier for the one process that holds the host network. |
 | 3. Re-exec `/proc/self/exe __init` as pid 1 | Same as 1 but as a fresh exec'd image | Safer than 1 with respect to "Rust code after fork", costs an exec and a hidden subcommand plus passing the listener socketpair. Fall back to this if option 1's post-clone code turns out to need allocation. |
 | 4. `unshare(NEWPID)` in `pre_exec` and let std exec | | **Impossible** (table: the exec'd process is not in the namespace). |
 
@@ -115,7 +116,7 @@ P  nullroute (host pid namespace, host network; relays, proxy, DNS, report)
    └─ C  the command, pid 2  (fork from I, then exec)
 ```
 
-One more process than today, one more `fork` (I → C). Two ways to get there:
+One more process than now, one more `fork` (I → C). Two ways to get there:
 
 - **F2: replace `Command::spawn` with our own `clone` + `exec` (recommended).** The flags go
   straight into the raw `clone` syscall (`syscall(SYS_clone, flags|SIGCHLD, 0, 0, 0, 0)` is
@@ -143,7 +144,7 @@ One more process than today, one more `fork` (I → C). Two ways to get there:
    PDEATHSIG was cleared, e.g. by a credential change.
 2. Write `setgroups`/`uid_map`/`gid_map` via `/proc/self/` (works as pid 1; table).
 3. Make mounts private, bind decoys and masks (as now), then **mount a fresh `proc`** at `/proc`
-   with `MS_NOSUID|MS_NODEV|MS_NOEXEC`. The mount namespace is now always needed: today it is
+   with `MS_NOSUID|MS_NODEV|MS_NOEXEC`. The mount namespace is then always needed: now it is
    created only when sockets are hidden or the sinkhole is on ("even a bare run usually gets one"
    already, because of the resolver masks, but not always).
 4. `lo` up, listener handover, as now.
@@ -151,7 +152,7 @@ One more process than today, one more `fork` (I → C). Two ways to get there:
    `ChildMask::restore` replays an early SIGINT/SIGQUIT using the status fd opened before the
    remount; restore the signal mask), then `exec`.
 6. In I: block nothing, install handlers for SIGTERM/SIGHUP that `kill(C, sig)`, leave SIGINT/SIGQUIT
-   at default (ignored by pid 1; the terminal's group delivery reaches C directly, as today). Loop
+   at default (ignored by pid 1; the terminal's group delivery reaches C directly, as now). Loop
    on `waitpid(-1)` (reaping every orphan reparented to pid 1). When C is reaped: `kill(-1, SIGKILL)`,
    reap until `ECHILD`, `_exit(code)` where code is the exit code or 128+signal.
    If the death pipe reports EOF: `kill(-1, SIGKILL)` and `_exit(137)`.
@@ -167,8 +168,8 @@ One more process than today, one more `fork` (I → C). Two ways to get there:
   children and passes through `status.code()` otherwise, so the visible result is identical
   (**[verified]** 7, 143, 137). The only difference is "killed by signal" versus "exited with
   143" as seen by P, which nothing observes. If I itself is killed (OOM), P sees the signal and
-  reports 128+N as today, and the kernel kills C.
-- **Early SIGINT (#13).** Unchanged: C does the `/proc/<P>/status` replay as its last step. The
+  reports 128+N as now, and the kernel kills C.
+- **Early SIGINT.** Unchanged: C does the `/proc/<P>/status` replay as its last step. The
   fd must be opened while the host `/proc` is still mounted, i.e. in I before step 3 or in P
   before the clone; `open_parent_status` already runs before the namespace changes, and the
   prototype confirmed an fd opened earlier still reads P's pending set after the remount.
@@ -176,11 +177,11 @@ One more process than today, one more `fork` (I → C). Two ways to get there:
   (`NULLROUTE_TEST_HOLD_BEFORE_SPAWN`) keeps working as long as the hold stays before the clone.
 - **Ctrl-C / job control.** Ctrl-C goes to the foreground process group: P (ignores), I (pid 1
   ignores default-action signals from the terminal; **[verified]** for SIGINT from outside) and C
-  (default action). Behaviour matches today. `bash -i` as the command still has job control
+  (default action). Behaviour matches the current one. `bash -i` as the command still has job control
   **[verified]**. What changes: `getpgrp()`, `getsid()` and `tcgetpgrp()` report 0 for a command
   started from an interactive shell (group and session leader are outside the namespace).
   Programs that compare these ids to something they got elsewhere may misbehave
-  (**[unverified]**; nothing I tried did). `SIGTSTP` (Ctrl-Z) stops P and C as today; I ignores it (**[reasoned]**: pid 1 ignores default-action signals).
+  (**[unverified]**; nothing tried did). `SIGTSTP` (Ctrl-Z) stops P and C as now; I ignores it (**[reasoned]**: pid 1 ignores default-action signals).
 - **Subreaper.** With the namespace, orphans reparent to I, not P; `PR_SET_CHILD_SUBREAPER` and the
   `/proc/self/task/*/children` scan (and `CONFIG_PROC_CHILDREN`) are unnecessary on this path. Keep
   them for `--no-pid-ns`. The README's "set-user-ID or file-capability binary survives" caveat
@@ -189,7 +190,7 @@ One more process than today, one more `fork` (I → C). Two ways to get there:
 
 ### What the command sees
 
-| | Today | With a PID namespace |
+| | Now | With a PID namespace |
 |---|---|---|
 | `ps`, `/proc` | the host's processes | only the sandbox's (**[verified]**) |
 | `kill <host pid>` | works for same-user processes | `ESRCH` (**[verified]**) |
@@ -210,7 +211,7 @@ Risks that follow, all **[reasoned]** unless noted:
   not writable under nullroute's identity mapping (**[verified]**); `clone3` with `set_tid` to
   pick a pid is **[unverified]**; or accept and document it, and offer `--no-pid-ns`.
 - **A fresh `/proc` can fail.** Containers that mask `/proc` paths can trip the kernel's "mount
-  would reveal more than the existing mount hides" check; the one container configuration I tried
+  would reveal more than the existing mount hides" check; the one container configuration tried
   worked. Failure should be exit 125 with a hint to use `--no-pid-ns`, not a silent fallback to
   the host's `/proc` (which would show host pids that do not exist in the namespace).
 - **The init's allocation-free requirement** after the raw `clone`. Rust runtime state after a
@@ -257,7 +258,7 @@ be unavailable exactly where nullroute runs in CI. It could still replace `kill_
    "file-capability" paragraphs from the README's signals section and the "no PID namespace" bullet
    from "What nullroute is not" (keep "no seccomp, no resource limits, shared filesystem"), update
    `SECURITY.md`'s "shares your PID namespace" sentence and `--inspect` (a `pid` entry in the
-   namespaces line). Nothing is released, so steps 2 and 3 can be one PR if review is happy.
+   namespaces line). Nothing is released, so steps 2 and 3 can be done together.
 4. Optional later: unique pid base (`clone3`/`set_tid`), `hidepid`, pid limits via `pids.max` (needs
    cgroups, not available unprivileged in general).
 
@@ -267,18 +268,18 @@ New (in `tests/lifecycle.rs` style, real binary, real signals):
 
 - SIGKILL nullroute while the command has background children (`sh -c 'sleep 600 & echo $! > f; wait'`):
   within a short deadline neither the command nor the recorded grandchild pid exists (`kill(pid, 0)`
-  returns `ESRCH` on the host). This is the test that fails today and passes with the namespace.
+  returns `ESRCH` on the host). This is the test that fails without the namespace and passes with it.
 - Same with a command that `setsid`'s its child and with one that double-forks.
 - Exit status: `exit 7`, `kill -TERM $$` (143), `kill -KILL $$` (137), `--strict` and `--report-json`
   values unchanged.
 - `SIGTERM`/`SIGHUP` to nullroute reach the command (existing tests) when the command is not
   pid 1.
-- Early SIGINT/SIGQUIT replay (#13's tests) unchanged and green.
+- Early SIGINT/SIGQUIT replay (the early-signal tests) unchanged and green.
 - `ps -e -o pid=` lists at most the init, the command and `ps`; `test ! -e /proc/<host pid>`;
   `$PPID` is 1; `kill -0 <host pid>` fails.
 - `/proc` mount failure path: simulate with a mount-namespace where `/proc` cannot be remounted
   (hard in CI) or unit-test the error mapping.
-- `--no-pid-ns` keeps today's behaviour (existing subreaper tests).
+- `--no-pid-ns` keeps the current behaviour (existing subreaper tests).
 - Interactive: a pty-driven test with `bash -i` for job control (optional, **[verified]** manually).
 - musl and aarch64 builds still compile (existing CI).
 

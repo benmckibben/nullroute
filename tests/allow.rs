@@ -332,3 +332,306 @@ fn allow_with_port_restricts_to_that_port() {
         "{o:?}"
     );
 }
+
+// ---- the request must be for the host the allowlist checked -----------------
+
+/// Python: send one plain-HTTP request through $HTTP_PROXY with the given extra
+/// header lines, print the status line and the Host headers the server saw.
+fn http_script(target: &str, headers: &str) -> String {
+    format!(
+        "import os, socket, urllib.parse\n\
+         u = urllib.parse.urlparse(os.environ['HTTP_PROXY'])\n\
+         s = socket.create_connection((u.hostname, u.port), timeout=10)\n\
+         s.sendall(('GET http://{target}/x HTTP/1.1\\r\\n{headers}Connection: close\\r\\n\\r\\n').encode())\n\
+         data = b''\n\
+         while True:\n    c = s.recv(4096)\n    if not c: break\n    data += c\n\
+         lines = data.decode().split('\\r\\n')\n\
+         print(lines[0])\n\
+         for l in lines:\n    if l.lower().startswith('host:'): print(l)"
+    )
+}
+
+#[test]
+fn plain_http_host_header_must_name_the_host_that_was_checked() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    let port = reflect_server(ip);
+    let target = format!("{ip}:{port}");
+    let run = |headers: &str, extra: &[&str]| {
+        let script = http_script(&target, headers);
+        let mut args = vec!["--allow", target.as_str()];
+        args.extend_from_slice(extra);
+        args.extend(["--", "python3", "-c", &script]);
+        nullroute(&args)
+    };
+    // The same name: forwarded (with or without the port, any case).
+    for host in [format!("{ip}:{port}"), ip.to_string()] {
+        let o = run(&format!("Host: {host}\\r\\n"), &[]);
+        assert_eq!(out(&o), format!("HTTP/1.1 200 OK\nHost: {host}"), "{o:?}");
+    }
+    // No Host header at all: nothing to disagree with.
+    let o = run("", &[]);
+    assert_eq!(out(&o), "HTTP/1.1 200 OK", "{o:?}");
+
+    // Another name: refused, never reaches the server, and it is reported.
+    let o = run("Host: evil.example\\r\\n", &["--strict"]);
+    assert_eq!(out(&o), "HTTP/1.1 403 Forbidden", "{o:?}");
+    let e = err(&o);
+    assert!(
+        e.contains("nullroute: blocked Host: evil.example in a request to"),
+        "{e}"
+    );
+    assert!(e.contains("  proxy   evil.example:"), "{e}");
+    assert_eq!(o.status.code(), Some(1), "--strict: {o:?}");
+
+    // ...unless that name is allowed too.
+    let o = run("Host: evil.example\\r\\n", &["--allow", "evil.example"]);
+    assert_eq!(out(&o), "HTTP/1.1 200 OK\nHost: evil.example", "{o:?}");
+
+    // Two Host headers are ambiguous: which one does the server believe?
+    let o = run(&format!("Host: {ip}\\r\\nHost: evil.example\\r\\n"), &[]);
+    assert_eq!(out(&o), "HTTP/1.1 400 Bad Request", "{o:?}");
+}
+
+/// The bytes of a TLS ClientHello with the given server name (None: no SNI).
+fn client_hello_py() -> &'static str {
+    "import struct\n\
+     def hello(name):\n    ext = b''\n    if name:\n        n = name.encode()\n        entry = b'\\x00' + struct.pack('>H', len(n)) + n\n        lst = struct.pack('>H', len(entry)) + entry\n        ext = struct.pack('>HH', 0, len(lst)) + lst\n    body = b'\\x03\\x03' + bytes(32) + b'\\x00' + b'\\x00\\x02\\x13\\x01' + b'\\x01\\x00' + struct.pack('>H', len(ext)) + ext\n    hs = b'\\x01' + struct.pack('>I', len(body))[1:] + body\n    return b'\\x16\\x03\\x01' + struct.pack('>H', len(hs)) + hs\n"
+}
+
+/// Python: CONNECT to target through $HTTPS_PROXY, send `payload` (a Python
+/// expression) through the tunnel and print ECHO-OK if the echo server sent it
+/// back, else CLOSED.
+fn tunnel_script(target: &str, payload: &str) -> String {
+    format!(
+        "{hello}import os, socket, urllib.parse\n\
+         u = urllib.parse.urlparse(os.environ['HTTPS_PROXY'])\n\
+         s = socket.create_connection((u.hostname, u.port), timeout=10)\n\
+         s.sendall(b'CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\n\\r\\n')\n\
+         resp = b''\n\
+         while b'\\r\\n\\r\\n' not in resp: resp += s.recv(1)\n\
+         assert b' 200 ' in resp.split(b'\\r\\n')[0], resp\n\
+         data = {payload}\n\
+         try:\n    s.sendall(data)\n    got = b''\n    while len(got) < len(data):\n        c = s.recv(4096)\n        if not c: break\n        got += c\n    print('ECHO-OK' if got == data else 'CLOSED')\n\
+         except OSError:\n    print('CLOSED')",
+        hello = client_hello_py()
+    )
+}
+
+#[test]
+fn connect_tunnel_sni_must_name_the_host_that_was_checked() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    let port = echo_server(ip);
+    let pin = format!("api.nr.test:{ip}");
+    let target = format!("api.nr.test:{port}");
+    let run = |payload: &str, allow: &str, extra: &[&str]| {
+        let script = tunnel_script(&target, payload);
+        let mut args = vec!["--allow", allow, "--resolve", pin.as_str()];
+        args.extend_from_slice(extra);
+        args.extend(["--", "python3", "-c", &script]);
+        nullroute(&args)
+    };
+    // The name asked for: through. No SNI at all: through. Not TLS: through.
+    for payload in [
+        "hello('api.nr.test')",
+        "hello('API.NR.TEST.')",
+        "hello(None)",
+        "b'ping'",
+    ] {
+        let o = run(payload, "api.nr.test", &[]);
+        assert_eq!(out(&o), "ECHO-OK", "{payload}: {o:?}");
+        assert!(!err(&o).contains("blocked"), "{payload}: {}", err(&o));
+    }
+    // A different name inside TLS: the tunnel is closed and it is reported.
+    let o = run("hello('evil.nr.test')", "api.nr.test", &["--strict"]);
+    assert_eq!(out(&o), "CLOSED", "{o:?}");
+    let e = err(&o);
+    assert!(
+        e.contains("nullroute: blocked TLS server name evil.nr.test in a tunnel to api.nr.test:"),
+        "{e}"
+    );
+    assert!(e.contains("  proxy   evil.nr.test:"), "{e}");
+    assert_eq!(o.status.code(), Some(1), "--strict: {o:?}");
+    // ...unless that name is allowed too.
+    let o = run("hello('other.nr.test')", "api.nr.test,other.nr.test", &[]);
+    assert_eq!(out(&o), "ECHO-OK", "{o:?}");
+    // Looks like TLS but can't be read: refused, not guessed at.
+    let o = run("b'\\x16\\x03\\x01\\x00\\x05junk!'", "api.nr.test", &[]);
+    assert_eq!(out(&o), "CLOSED", "{o:?}");
+    assert!(
+        err(&o).contains("unreadable TLS ClientHello"),
+        "{}",
+        err(&o)
+    );
+}
+
+#[test]
+fn connect_tunnel_to_an_ip_literal_refuses_a_foreign_server_name() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    let port = echo_server(ip);
+    let target = format!("{ip}:{port}");
+    let run = |payload: &str| {
+        let script = tunnel_script(&target, payload);
+        nullroute(&["--allow", &ip.to_string(), "--", "python3", "-c", &script])
+    };
+    // A client dialling an IP sends no SNI.
+    assert_eq!(out(&run("hello(None)")), "ECHO-OK");
+    let o = run("hello('evil.nr.test')");
+    assert_eq!(out(&o), "CLOSED", "{o:?}");
+    assert!(
+        err(&o).contains("blocked TLS server name evil.nr.test"),
+        "{}",
+        err(&o)
+    );
+}
+
+#[test]
+fn connect_tunnel_sni_split_over_segments_is_still_checked() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    let port = echo_server(ip);
+    let pin = format!("api.nr.test:{ip}");
+    let target = format!("api.nr.test:{port}");
+    // Send the hello a few bytes at a time with a pause in between.
+    let slow = |name: &str| format!("(lambda d: d)(hello('{name}'))");
+    for (name, want) in [("api.nr.test", "ECHO-OK"), ("evil.nr.test", "CLOSED")] {
+        let script = tunnel_script(&target, &slow(name)).replace(
+            "s.sendall(data)",
+            "import time\n    for i in range(0, len(data), 7):\n        s.sendall(data[i:i+7]); time.sleep(0.01)",
+        );
+        let o = nullroute(&[
+            "--allow",
+            "api.nr.test",
+            "--resolve",
+            &pin,
+            "--",
+            "python3",
+            "-c",
+            &script,
+        ]);
+        assert_eq!(out(&o), want, "{name}: {o:?}");
+    }
+}
+
+#[test]
+fn connect_tunnel_to_a_server_that_speaks_first_is_not_held_up() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    // SMTP/SSH/MySQL style: the server sends a banner and waits.
+    let l = TcpListener::bind((ip, 0)).unwrap();
+    let port = l.local_addr().unwrap().port();
+    thread::spawn(move || {
+        for mut c in l.incoming().flatten() {
+            let _ = c.write_all(b"220 hello\r\n");
+        }
+    });
+    let script = format!(
+        "import os, socket, urllib.parse\n\
+         u = urllib.parse.urlparse(os.environ['HTTPS_PROXY'])\n\
+         s = socket.create_connection((u.hostname, u.port), timeout=10)\n\
+         s.sendall(b'CONNECT {ip}:{port} HTTP/1.1\\r\\n\\r\\n')\n\
+         resp = b''\n\
+         while b'\\r\\n\\r\\n' not in resp: resp += s.recv(1)\n\
+         s.settimeout(5)\n\
+         print(s.recv(64))"
+    );
+    let o = nullroute(&["--allow", &ip.to_string(), "--", "python3", "-c", &script]);
+    assert_eq!(out(&o), "b'220 hello\\r\\n'", "{o:?}");
+}
+
+#[test]
+fn allowing_private_address_space_prints_a_warning() {
+    for (entry, what) in [
+        ("10.0.0.5", "is a private (RFC 1918) address"),
+        ("192.168.1.10:8080", "is a private (RFC 1918) address"),
+        ("100.64.0.1", "is a carrier-grade NAT"),
+        ("fd00::1", "is a unique local"),
+    ] {
+        let o = nullroute(&["--allow", entry, "--dry-run", "--", "true"]);
+        assert!(o.status.success(), "{entry}: {o:?}");
+        let want = format!(
+            "nullroute: warning: --allow {} {what}",
+            entry
+                .rsplit_once(':')
+                .filter(|_| entry.contains('.'))
+                .map_or(entry, |(h, _)| h)
+        );
+        assert!(err(&o).contains(&want), "{entry}: {}", err(&o));
+        assert_eq!(err(&o).lines().count(), 1, "one line: {}", err(&o));
+        // --quiet keeps it out.
+        let o = nullroute(&["-q", "--allow", entry, "--dry-run", "--", "true"]);
+        assert_eq!(err(&o), "", "{entry}: {o:?}");
+    }
+    let o = nullroute(&[
+        "--allow",
+        "93.184.216.34,example.com",
+        "--dry-run",
+        "--",
+        "true",
+    ]);
+    assert_eq!(err(&o), "", "{o:?}");
+    let o = nullroute(&[
+        "--allow",
+        "db.nr.test",
+        "--resolve",
+        "db.nr.test:10.1.2.3",
+        "--dry-run",
+        "--",
+        "true",
+    ]);
+    assert!(
+        err(&o).contains(
+            "warning: --resolve db.nr.test:10.1.2.3 points at a private (RFC 1918) address"
+        ),
+        "{}",
+        err(&o)
+    );
+}
+
+#[test]
+fn an_allowed_name_that_resolves_into_private_space_warns_once() {
+    let Some(ip) = local_ip() else {
+        return eprintln!("skipping: no non-loopback address");
+    };
+    if !matches!(ip, IpAddr::V4(v4) if v4.is_private() || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1])))
+    {
+        return eprintln!("skipping: {ip} isn't in private address space");
+    }
+    let port = echo_server(ip);
+    let pin = format!("lan.nr.test:{ip}");
+    let script = format!("{0}\n{0}", connect_script(&format!("lan.nr.test:{port}")));
+    let o = nullroute(&[
+        "--allow",
+        "lan.nr.test",
+        "--resolve",
+        &pin,
+        "--",
+        "python3",
+        "-c",
+        &script,
+    ]);
+    assert_eq!(
+        out(&o)
+            .matches("HTTP/1.1 200 Connection Established")
+            .count(),
+        2,
+        "it still works: {o:?}"
+    );
+    assert_eq!(
+        err(&o)
+            .matches(&format!(
+                "nullroute: warning: lan.nr.test resolved to {ip}, a "
+            ))
+            .count(),
+        1,
+        "{}",
+        err(&o)
+    );
+}

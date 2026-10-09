@@ -145,15 +145,27 @@ fn base_topology_has_user_and_net_namespaces_and_loopback() {
     let ns = field(&e, "namespaces");
     let ns: Vec<&str> = ns.split(", ").collect();
     assert_eq!(&ns[..2], ["user", "net"], "{e}");
-    assert_eq!(field(&e, "loopback"), "lo: UP (127.0.0.1, ::1)");
+    // The resolver's pool address is on lo in every sandbox.
+    assert_eq!(
+        field(&e, "loopback"),
+        "lo: UP (127.0.0.1, ::1, 127.77.0.1/24)"
+    );
     assert_eq!(field(&e, "bridged ports"), "none");
     assert_eq!(field(&e, "upstream proxy"), "none");
     // The mount namespace is there exactly when some socket is hidden, sealed
-    // or masked.
-    let any_sockets = !section(&e, "blocked").is_empty()
+    // or masked, or the resolver has a resolv.conf to mount.
+    let any_mounts = !section(&e, "blocked").is_empty()
         || !section(&e, "sealed").is_empty()
-        || !section(&e, "masked").is_empty();
-    assert_eq!(ns.contains(&"mount"), any_sockets, "{e}");
+        || !section(&e, "masked").is_empty()
+        || std::fs::canonicalize("/etc/resolv.conf").is_ok();
+    assert_eq!(ns.contains(&"mount"), any_mounts, "{e}");
+
+    // Without the resolver (--no-dns) the loopback is just lo's own addresses.
+    let e = err(&nr(
+        &["--inspect", "--dry-run", "--no-dns", "--", "true"],
+        &t.0,
+    ));
+    assert_eq!(field(&e, "loopback"), "lo: UP (127.0.0.1, ::1)");
 }
 
 #[test]
@@ -360,4 +372,36 @@ fn live_docker_socket_is_reported_as_sealed() {
     assert!(section(&e, "sealed").contains(&real), "{e}");
     assert!(!section(&e, "blocked").contains(&real), "{e}");
     assert_eq!(out(&o).trim(), "ok", "sealed docker still usable: {o:?}");
+}
+
+#[test]
+fn dry_run_lists_everything_inspect_does() {
+    // --dry-run promises what would be hidden, masked, forwarded and allowed:
+    // the masked resolver sockets and the namespaces must be in its stdout,
+    // not only in --inspect's topology.
+    let t = TmpDir::new("dry-complete");
+    let o = nr(
+        &["--inspect", "--dry-run", "--port", "5432", "--", "true"],
+        &t.0,
+    );
+    let (stdout, topology) = (out(&o), err(&o));
+    let masked: Vec<String> = section(&topology, "masked")
+        .iter()
+        .map(|p| format!("masked resolver socket: {}", p.display()))
+        .collect();
+    let listed: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.starts_with("masked resolver socket:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(listed, masked, "{stdout}");
+    let ns = field(&topology, "namespaces");
+    assert!(
+        stdout.lines().any(|l| l == format!("namespaces: {ns}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == "forwarded port: 5432"),
+        "{stdout}"
+    );
 }

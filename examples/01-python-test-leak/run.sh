@@ -120,6 +120,30 @@ rm -f "$REPORT_FILE"
 
 echo ""
 echo "=================================================================="
+echo " STEP 4b: --strict works without --allow too"
+echo " The DNS lookup is recorded even in a bare run, so a command that"
+echo " catches the lookup error and exits 0 still fails under --strict."
+echo "=================================================================="
+set +e
+"$NULLROUTE" run --strict -- python3 -c "
+import socket
+try:
+    socket.getaddrinfo('example.com', 80)
+except OSError as e:
+    print('swallowed:', e)
+"
+BARE_STRICT_EXIT=$?
+set -e
+if [[ $BARE_STRICT_EXIT -eq 1 ]]; then
+    echo "-> --strict turned the swallowed lookup into exit 1, no --allow needed."
+    assertion_passed
+else
+    echo "-> Error: expected exit 1 from --strict, got $BARE_STRICT_EXIT" >&2
+    exit 1
+fi
+
+echo ""
+echo "=================================================================="
 echo " STEP 5: Running with surgical --allow example.com"
 echo " (Opt-in external test; checks internet connectivity first)"
 echo "=================================================================="
