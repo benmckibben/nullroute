@@ -1,10 +1,10 @@
 # Running as root, and inherited file descriptors
 
-Status: proposal (nothing here is implemented). Scope: what `nullroute run` should do
+Status: **open proposal** (not implemented). Scope: what `nullroute run` should do
 when it is started as uid 0, and what it should do about file descriptors the
 caller left open.
 
-Evidence tags: **[verified]** means I ran it on the host described under
+Evidence tags: **[verified]** means run on the host described under
 [Test host](#test-host); **[reasoned]** means derived from kernel semantics but not run;
 **[unverified]** means neither.
 
@@ -19,12 +19,12 @@ Evidence tags: **[verified]** means I ran it on the host described under
 - Recommendation: **option B′**: map a root caller to an unprivileged id *inside* the
   namespace (`65534 0 1`) and change nothing for non-root callers. It is two changed
   lines in the existing `uid_map` code, adds no syscalls to the `pre_exec` hook, and
-  puts a root caller in exactly the state a non-root caller is in today. No flag, no
+  puts a root caller in exactly the state a non-root caller is in now. No flag, no
   refusal. Details and the alternatives are below.
 - Inherited descriptors: a socket opened before nullroute started keeps working inside
   **[verified]**. Recommendation: in the same `pre_exec` hook, mark every inherited
   *socket* above fd 2 close-on-exec, with an opt-out flag. A cheaper, blunter variant is
-  `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`. Both are separate, later PRs.
+  `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`. Both are separate changes.
 
 ## Test host
 
@@ -34,7 +34,7 @@ on this host, so the "real root" runs used it to start nullroute (nothing else w
 as root and nothing on the host was modified). The binary was `cargo build --locked`
 from this branch (no source changes).
 
-## What happens today
+## What happens now
 
 `sandbox.rs`, `run_hermetic`: the parent computes `uid_map = "{uid} {uid} 1"` (and the
 same for gid) before forking. In the child's `pre_exec` closure:
@@ -98,7 +98,7 @@ Container check **[verified]**: in a default Docker container (alpine image, loc
 seccomp profile blocks `unshare(CLONE_NEWUSER)` without `CAP_SYS_ADMIN`), and also as
 `--user 1000`. So on the common "root CI container" setup nullroute cannot start at all
 (it should exit 125 with the user-namespace hint, by the code path in `explain_spawn_error`;
-I did not run nullroute itself inside a container). The root case matters on privileged or
+nullroute itself was not run inside a container). The root case matters on privileged or
 seccomp-relaxed containers, on VMs/runners where jobs run as root, and for `sudo nullroute …`.
 
 ## What the attack is
@@ -110,7 +110,7 @@ systemd-resolved's varlink socket (name resolution on the host's behalf, so DNS 
 nscd. It can also reconfigure its own network namespace (irrelevant: there is nothing to
 connect to) and mount filesystems in its own mount namespace. It cannot leave the network
 namespace. The README says the resolver masks "can't be opted back in"; for a root caller
-that is not true today. Only the Docker decoy was exercised in the experiments; the others
+that is not true now. Only the Docker decoy was exercised in the experiments; the others
 use the same mount mechanism (**[reasoned]**).
 
 ## Options
@@ -128,7 +128,7 @@ override flag (`--allow-root` or similar) for people who accept the exposure.
   re-enables the hole, so the people most likely to hit it end up with no protection.
 - Closes: the attack, for everyone who does not pass the flag.
 - Implementation: about ten lines in `main.rs`, no `pre_exec` changes. Test:
-  `unshare -Ur nullroute run -- true` exits 125 with a message; with the flag it behaves as today.
+  `unshare -Ur nullroute run -- true` exits 125 with a message; with the flag it behaves as now.
 
 ### B. Run, but make root unprivileged inside the sandbox
 
@@ -154,7 +154,7 @@ the last row with a throwaway C program that mimics the `pre_exec` setup):
 
 | Variant | uid / CapEff inside | `umount2` of the decoy | decoy afterwards |
 |---|---|---|---|
-| plain (today) | 0 / `000001ffffffffff` | ok | real socket (`200`) |
+| plain (current) | 0 / `000001ffffffffff` | ok | real socket (`200`) |
 | `no_new_privs` only | 0 / `000001ffffffffff` | **ok** | real socket (`200`) |
 | bounding set dropped + securebits `noroot` (B1) | 0 / `0000000000000000` | `EPERM` | decoy (`403`) |
 | nested user namespace, root → 65534 (like B′) | 65534 / `0000000000000000` | `EPERM` | decoy (`403`) |
@@ -173,7 +173,7 @@ Notes from those runs, which decide between B′ and B1:
   the decoy still fails (`must be superuser to unmount`). **[verified]**
 - Files under B′ **[verified]** (prototype): root-owned files stay readable/writable as the
   owner (the kernel compares the kuid, which is still 0), and other users' files stay
-  inaccessible, the same as with root today.
+  inaccessible, the same as with root now.
 
 What B′ changes for users: `id -u` and `whoami` inside report 65534/`nobody` for a root
 caller, and everything the command creates is still owned by real root on disk. Scripts
@@ -182,13 +182,13 @@ unchanged. `apt`/`chown`/`mount`-style tools fail with `EPERM`, but they already
 not do anything useful (no network, no capabilities outside the sandbox's namespace).
 
 B′ depends on the same kernel rule as above: writing a map whose outer id is 0 needs the
-*parent* to have held `CAP_SETFCAP`. Today's `0 0 1` has the identical requirement, so no
+*parent* to have held `CAP_SETFCAP`. The current `0 0 1` has the identical requirement, so no
 new failure mode appears (a root caller without that capability fails closed, as now).
 **[reasoned]**; not separately tested.
 
 ### C. Document only
 
-Keep today's behaviour and the README bullet. Cost: zero. Leaves a hole in a stated
+Keep the current behaviour and the README bullet. Cost: zero. Leaves a hole in a stated
 guarantee (masks "can't be opted back in") for every `sudo nullroute` user, and the
 documentation is the only protection.
 
@@ -204,7 +204,7 @@ documentation is the only protection.
 - Does not depend on a flag nobody will pass.
 
 If B′ turns out to break a real workflow, B1 is the fallback. A is the strictest and the
-one I would do last, because its override flag recreates the hole.
+the one to do last, because its override flag recreates the hole.
 
 ### Implementation sketch (not applied)
 
@@ -265,12 +265,12 @@ was created in, so one the caller opened earlier keeps talking to the host netwo
 **[verified]**: with fd 8 a TCP connection to a host listener on `127.0.0.1:38765`, opened by
 the calling shell, `nullroute run -- python3 …` could `sendall`/`recv` on fd 8 and got
 `HTTP/1.0 200 OK` from the host server, while a fresh `connect(127.0.0.1:38765)` from inside
-got `ECONNREFUSED`. The probe's descriptor list also showed fd 3, which matches a socket my tool harness leaves
+got `ECONNREFUSED`. The probe's descriptor list also showed fd 3, which matches a socket the tool harness leaves
 open (checked separately: fd 3 is a socket in the harness's shell), so an accidentally inherited
 socket reached the command too and the gap shows up without trying. An inherited host netns fd
 (fd 9, `/proc/self/ns/net`) cannot be entered: `setns` returns `EPERM`. (The same socket test
 as real root was inconclusive because `sudo` closes descriptors above 2 before running the
-command; there is no reason to expect a different result, but I did not demonstrate it.)
+command; there is no reason to expect a different result, but it was not demonstrated.)
 The README documents this as a known limit.
 
 Other kinds of inherited descriptors that matter for the same reason **[reasoned]**:
@@ -295,7 +295,7 @@ never touched: if stdout is a socket (`ssh`, some CI log shippers), it stays usa
    yet; see [pid-namespace.md](pid-namespace.md) if that changes), `fstat` each fd ≥ 3 and
    set `FD_CLOEXEC` on those with `S_ISSOCK`. Async-signal-safe as long as nothing
    allocates. Falls back to option 1 if `/proc/self/fd` cannot be opened.
-3. **Document only** (today).
+3. **Document only** (the current state).
 
 Trade-offs:
 
