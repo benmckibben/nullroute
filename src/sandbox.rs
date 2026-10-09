@@ -27,7 +27,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 
 use crate::report::Report;
-use crate::{dns, forward, hide, lifecycle, proxy, signals};
+use crate::{dns, forward, hide, lifecycle, limits, proxy, signals};
 use std::sync::Arc;
 
 /// What a listener created inside the sandbox is for.
@@ -59,6 +59,10 @@ pub fn run_hermetic(
     // once the command is done (lifecycle.rs).
     lifecycle::become_subreaper();
     let blocked = signals::block()?;
+    // Relaying uses two descriptors per connection: lift the soft descriptor
+    // limit to the hard one for nullroute itself. The command gets the original
+    // back before exec (below).
+    let nofile_original = limits::raise_nofile_limit();
 
     // Prepare everything that allocates *before* fork. The pre_exec closure runs
     // in the forked child, where allocating is not guaranteed safe.
@@ -168,6 +172,11 @@ pub fn run_hermetic(
                 }
                 if let Some(c) = child_side.as_mut() {
                     c.listen_and_send()?;
+                }
+                if let Some(original) = &nofile_original
+                    && libc::setrlimit(libc::RLIMIT_NOFILE, original) != 0
+                {
+                    return Err(io::Error::last_os_error());
                 }
                 // Re-arm after the user-namespace credential change (lifecycle.rs).
                 lifecycle::die_with_parent(parent)?;

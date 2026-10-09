@@ -119,6 +119,26 @@ Findings from a security review of the first version, all fixed before release:
   few milliseconds of setup leaves is swept by the next run (only directories of
   the current user, over a minute old, that no running nullroute holds a lock
   on). `--dry-run` and `--inspect` no longer create them at all.
+- nullroute no longer lets a command make it grow without bound: at most 256
+  connections are relayed at once per `--port` / proxy / DNS-bridge listener (64
+  for DNS over TCP, which also gets a 30 s lifetime and 64 queries per
+  connection, and 32 for socket decoys); one more is closed immediately instead
+  of getting a new thread (300 idle DNS-over-TCP connections used to mean 310
+  threads), a thread that can't be started drops the connection instead of
+  panicking the acceptor, and an accept error (e.g. out of descriptors)
+  backs off instead of spinning. Name lookups for the proxy and the DNS bridge
+  give up after 10 s instead of waiting for a dead resolver.
+- The breach report is bounded: at most 1000 distinct targets are listed, at
+  most 20 live "blocked ..." lines are printed per second, and the summary says
+  how many more attempts were counted but not listed ("... and N more
+  attempts at other targets"); `--report-json` gets a `not_listed` object with
+  the counts when that happens. Suppressed attempts still count as blocks, so
+  `--strict` still fails (a flood of 20000 generated names used to print 40000
+  lines, 2.5 MB).
+- nullroute raises its own soft file-descriptor limit to the hard limit while
+  it runs (the command still gets the soft limit it was started with), and
+  running out of descriptors is reported as that instead of "nothing
+  reachable on the host" for a `--port`.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.

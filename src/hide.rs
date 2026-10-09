@@ -38,6 +38,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::diag::diagln;
+use crate::limits::{self, Limiter};
 use crate::report::{Kind, Report, json_string};
 use crate::tmpdir::PrivateDir;
 
@@ -300,28 +301,35 @@ impl Plan {
             let mode = d.mode;
             let report = report.clone();
             let docker = self.docker.clone();
-            thread::spawn(move || {
-                for conn in listener.incoming() {
-                    let Ok(conn) = conn else { continue };
-                    let target = target.clone();
-                    let report = report.clone();
-                    let docker = docker.clone();
-                    match mode {
-                        Mode::Block => {
-                            let t = target.display().to_string();
-                            report.record(Kind::Socket, &t, reason, || {
-                                format!("nullroute: blocked a connection to {t} ({reason}). Rerun with --allow-socket {t} to permit it.")
-                            });
-                            thread::spawn(move || answer(conn, &target, reason));
+            let limit = Limiter::new(limits::max_connections(limits::MAX_DECOY_CONNECTIONS));
+            thread::Builder::new().name("decoy".into()).spawn(move || {
+                limits::accept_loop(
+                    || listener.accept().map(|(c, _)| c),
+                    |conn| {
+                        let target = target.clone();
+                        let report = report.clone();
+                        let docker = docker.clone();
+                        match mode {
+                            Mode::Block => {
+                                let t = target.display().to_string();
+                                report.record(Kind::Socket, &t, reason, || {
+                                    format!("nullroute: blocked a connection to {t} ({reason}). Rerun with --allow-socket {t} to permit it.")
+                                });
+                                if let Some(permit) = limit.try_acquire() {
+                                    limits::spawn_conn(permit, move || answer(conn, &target, reason));
+                                }
+                            }
+                            Mode::SealDocker => {
+                                if let Some(permit) = limit.try_acquire() {
+                                    limits::spawn_conn(permit, move || {
+                                        crate::docker::handle(conn, &target, &report, &docker)
+                                    });
+                                }
+                            }
                         }
-                        Mode::SealDocker => {
-                            thread::spawn(move || {
-                                crate::docker::handle(conn, &target, &report, &docker)
-                            });
-                        }
-                    }
-                }
-            });
+                    },
+                );
+            })?;
         }
         Ok(())
     }

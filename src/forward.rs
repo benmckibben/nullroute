@@ -17,6 +17,7 @@
 //! `--port` itself: inside, `localhost:PORT` reaches the host's `localhost:PORT`.
 
 use crate::diag::diagln;
+use crate::limits;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -393,24 +394,43 @@ pub fn serve_port(fd: RawFd, port: u16, warned: Arc<AtomicBool>) {
 fn spawn_acceptor(fd: RawFd, port: u16, warned: Arc<AtomicBool>) {
     // SAFETY: fd is a listening TCP socket we received and now own exclusively.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    thread::spawn(move || {
-        for conn in listener.incoming() {
-            let Ok(inner) = conn else { continue };
-            let warned = warned.clone();
-            thread::spawn(move || match connect_host(port) {
-                Ok(outer) => relay(inner, outer),
-                Err(e) => {
-                    // Once per port: a test retrying in a loop shouldn't flood stderr.
-                    if !warned.swap(true, Ordering::Relaxed) {
-                        diagln!(
-                            "nullroute: --port {port}: nothing reachable on the host at localhost:{port} ({e})"
-                        );
+    let limit = limits::Limiter::new(limits::max_connections(limits::MAX_CONNECTIONS));
+    limits::spawn_service(move || {
+        limits::accept_loop(
+            || listener.accept().map(|(c, _)| c),
+            |inner| {
+                let warned = warned.clone();
+                let Some(permit) = limit.try_acquire() else {
+                    return; // too many open: dropping it closes it
+                };
+                limits::spawn_conn(permit, move || match connect_host(port) {
+                    Ok(outer) => relay(inner, outer),
+                    Err(e) => {
+                        // Once per port: a test retrying in a loop shouldn't flood stderr.
+                        if !warned.swap(true, Ordering::Relaxed) {
+                            diagln!(
+                                "nullroute: --port {port}: {}",
+                                describe_connect_error(port, &e)
+                            );
+                        }
+                        let _ = inner.shutdown(Shutdown::Both);
                     }
-                    let _ = inner.shutdown(Shutdown::Both);
-                }
-            });
-        }
+                });
+            },
+        );
     });
+}
+
+/// Why connecting to the host's localhost:port failed, for the warning. Out
+/// of file descriptors is nullroute's own problem, not "nothing is listening".
+fn describe_connect_error(port: u16, e: &io::Error) -> String {
+    if limits::is_out_of_fds(e) {
+        format!(
+            "out of file descriptors while connecting to localhost:{port} ({e}); raise the limit (ulimit -n) or open fewer connections"
+        )
+    } else {
+        format!("nothing reachable on the host at localhost:{port} ({e})")
+    }
 }
 
 /// Connect to the host's localhost:port, IPv4 first, then IPv6.
@@ -429,12 +449,35 @@ pub(crate) fn relay(a: TcpStream, b: TcpStream) {
     let (Ok(mut a_read), Ok(mut b_write)) = (a.try_clone(), b.try_clone()) else {
         return;
     };
-    let up = thread::spawn(move || {
+    // If the second thread can't be started, give up on this connection (it is
+    // closed as the streams drop) rather than panic.
+    let Ok(up) = thread::Builder::new().spawn(move || {
         let _ = io::copy(&mut a_read, &mut b_write);
         let _ = b_write.shutdown(Shutdown::Write);
-    });
+    }) else {
+        return;
+    };
     let (mut b_read, mut a_write) = (b, a);
     let _ = io::copy(&mut b_read, &mut a_write);
     let _ = a_write.shutdown(Shutdown::Write);
     let _ = up.join();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_out_of_descriptors_is_not_reported_as_nothing_listening() {
+        let emfile = io::Error::from_raw_os_error(libc::EMFILE);
+        let msg = describe_connect_error(5432, &emfile);
+        assert!(msg.contains("out of file descriptors"), "{msg}");
+        assert!(!msg.contains("nothing reachable"), "{msg}");
+        let refused = io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        let msg = describe_connect_error(5432, &refused);
+        assert!(
+            msg.contains("nothing reachable on the host at localhost:5432"),
+            "{msg}"
+        );
+    }
 }

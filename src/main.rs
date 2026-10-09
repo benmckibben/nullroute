@@ -28,6 +28,8 @@ mod inspect;
 #[cfg(target_os = "linux")]
 mod lifecycle;
 #[cfg(target_os = "linux")]
+mod limits;
+#[cfg(target_os = "linux")]
 mod proxy;
 #[cfg(target_os = "linux")]
 mod report;

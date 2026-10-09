@@ -31,6 +31,7 @@
 //! nothing back.
 
 use crate::diag::diagln;
+use crate::limits::{self, Limiter};
 use crate::tmpdir::PrivateDir;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -41,14 +42,29 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::forward::Spec;
 use crate::proxy::{self, Allowlist, DialError, Overrides, Pattern};
 use crate::report::{Kind, Report};
 
 /// Where the resolver listens inside the sandbox.
+/// A DNS-over-TCP connection may stay idle this long between messages...
+const TCP_IDLE: Duration = Duration::from_secs(10);
+/// ...must be over after this long in total...
+const TCP_TOTAL: Duration = Duration::from_secs(30);
+/// ...and carries at most this many queries.
+const TCP_MAX_MESSAGES: usize = 64;
+
+/// How long the next read on a DNS-over-TCP connection that has been open for
+/// `open_for` may wait; None once its total time is up.
+fn tcp_read_timeout(open_for: Duration) -> Option<Duration> {
+    TCP_TOTAL
+        .checked_sub(open_for)
+        .filter(|left| !left.is_zero())
+        .map(|left| left.min(TCP_IDLE))
+}
+
 pub const PORT: u16 = 53;
 /// First three octets of the synthetic address pool (127.77.0.1-254).
 const POOL_PREFIX: [u8; 3] = [127, 77, 0];
@@ -403,26 +419,38 @@ impl Sinkhole {
             Listener::Udp => {
                 // SAFETY: fd is a bound UDP socket from the sandbox; we own it.
                 let sock = unsafe { UdpSocket::from_raw_fd(fd) };
-                thread::spawn(move || me.serve_udp(sock));
+                limits::spawn_service(move || me.serve_udp(sock));
             }
             Listener::Tcp => {
                 // SAFETY: fd is a listening TCP socket from the sandbox; we own it.
                 let l = unsafe { TcpListener::from_raw_fd(fd) };
-                thread::spawn(move || {
-                    for c in l.incoming().flatten() {
-                        let me = me.clone();
-                        thread::spawn(move || me.serve_tcp(c));
-                    }
+                let limit = Limiter::new(limits::max_connections(limits::MAX_DNS_TCP_CONNECTIONS));
+                limits::spawn_service(move || {
+                    limits::accept_loop(
+                        || l.accept().map(|(c, _)| c),
+                        |c| {
+                            let me = me.clone();
+                            if let Some(permit) = limit.try_acquire() {
+                                limits::spawn_conn(permit, move || me.serve_tcp(c));
+                            }
+                        },
+                    );
                 });
             }
             Listener::Bridge(slot, port) => {
                 // SAFETY: as above.
                 let l = unsafe { TcpListener::from_raw_fd(fd) };
-                thread::spawn(move || {
-                    for c in l.incoming().flatten() {
-                        let me = me.clone();
-                        thread::spawn(move || me.bridge(c, slot, port));
-                    }
+                let limit = Limiter::new(limits::max_connections(limits::MAX_CONNECTIONS));
+                limits::spawn_service(move || {
+                    limits::accept_loop(
+                        || l.accept().map(|(c, _)| c),
+                        |c| {
+                            let me = me.clone();
+                            if let Some(permit) = limit.try_acquire() {
+                                limits::spawn_conn(permit, move || me.bridge(c, slot, port));
+                            }
+                        },
+                    );
                 });
             }
         }
@@ -442,8 +470,15 @@ impl Sinkhole {
 
     /// DNS over TCP: 2-byte length prefix per message, several per connection.
     fn serve_tcp(&self, mut c: TcpStream) {
-        let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
-        loop {
+        let started = Instant::now();
+        for _ in 0..TCP_MAX_MESSAGES {
+            // Each read gets a deadline, and so does the connection as a
+            // whole: a client that trickles a byte at a time or sends queries
+            // forever doesn't keep a thread for good.
+            let Some(timeout) = tcp_read_timeout(started.elapsed()) else {
+                return;
+            };
+            let _ = c.set_read_timeout(Some(timeout));
             let mut len = [0u8; 2];
             if c.read_exact(&mut len).is_err() {
                 return;
@@ -779,6 +814,18 @@ fn cstring(p: &Path) -> io::Result<CString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_reads_wait_at_most_the_idle_time_and_stop_at_the_total() {
+        assert_eq!(tcp_read_timeout(Duration::ZERO), Some(TCP_IDLE));
+        assert_eq!(tcp_read_timeout(Duration::from_secs(15)), Some(TCP_IDLE));
+        assert_eq!(
+            tcp_read_timeout(TCP_TOTAL - Duration::from_secs(3)),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(tcp_read_timeout(TCP_TOTAL), None);
+        assert_eq!(tcp_read_timeout(TCP_TOTAL + Duration::from_secs(1)), None);
+    }
 
     fn allow(v: &[&str]) -> Allowlist {
         Allowlist::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
