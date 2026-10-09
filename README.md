@@ -498,12 +498,24 @@ mode is filtered the same way as the native one.
 `no_new_privs` means a setuid, setgid or file-capability binary can't raise
 privileges after exec. `sudo` and `su` never worked in the sandbox anyway (only
 your own id is mapped in the user namespace, so a root-owned setuid file has no
-effect); what changes is that a file capability (`cap_net_raw` on `ping` on some
-distributions) is no longer granted. A nested sandbox or helper inherits both
+effect); what changes is that a file capability (`cap_net_raw` on `ping` on Debian
+and Ubuntu) is no longer granted. A nested sandbox or helper inherits both
 settings. `nullroute run --dry-run -- true` and `--inspect` show them.
 
+The case that surprises people is `ping`. The command's first exec still holds
+the capabilities of the sandbox's user namespace, so `nullroute run -- ping ...`
+works, but `nullroute run -- sh -c 'ping ...'` (or `env ping`, or a script or a
+test harness that starts it) is a second exec and fails with `socket: Operation
+not permitted`. Use `--allow-new-privs` for that.
+
 `--no-seccomp` leaves the filter out, for the odd tool that needs one of these
-calls (`no_new_privs` stays set).
+calls (`no_new_privs` stays set). `--allow-new-privs` leaves `no_new_privs` out
+and keeps the filter, for a program that needs a file capability or a setuid
+helper to raise its privileges; give both flags to turn both off. What a program
+can gain that way stays inside the sandbox's own user namespace (only your id is
+mapped, and the network namespace has no interface), but it is a setting you opt
+into, not a default. The filter is installed the same way either way, on the
+strength of the capabilities the sandbox holds until the exec.
 
 ### Letting Docker tests run, with sealed containers
 
@@ -719,7 +731,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
 | Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |
-| Deny AF_VSOCK/Bluetooth/NFC sockets, TIOCSTI and io_uring (seccomp, `no_new_privs`) | ✅ on by default; `--no-seccomp` turns the filter off |
+| Deny AF_VSOCK/Bluetooth/NFC sockets, TIOCSTI and io_uring (seccomp, `no_new_privs`) | ✅ on by default; `--no-seccomp` turns the filter off, `--allow-new-privs` leaves `no_new_privs` unset |
 | Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy, DNS and socket blocks; not direct IP connects |
 | Show the sandbox topology (`--inspect`) | ✅ namespaces, loopback, ports, sockets, proxy, DNS sinkhole |
 | macOS | ❌ no network namespaces; needs a different mechanism |
@@ -780,8 +792,9 @@ See [SECURITY.md](SECURITY.md) for how to report a way around the isolation.
    needed) plus a new network namespace, which starts with only a loopback device.
 2. Maps your real uid/gid into the user namespace, so tools don't think they're root.
 3. Brings `lo` up (it starts down).
-4. Sets `no_new_privs` and installs the seccomp filter (see above), after the
-   last socket and ioctl that setup itself needs.
+4. Sets `no_new_privs` and installs the seccomp filter (see above; either can
+   be turned off with `--allow-new-privs` and `--no-seccomp`), after the last
+   socket and ioctl that setup itself needs.
 5. `exec`s your command. Run as an ordinary user (not root), it holds no
    capabilities after exec, so it can't add interfaces, change routes, or create
    another namespace to get out.

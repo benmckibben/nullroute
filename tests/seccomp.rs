@@ -1,7 +1,8 @@
 //! The seccomp filter and `no_new_privs` (see src/seccomp.rs): socket
 //! families that reach outside the network namespace, terminal input
 //! injection and io_uring are denied, ordinary programs are unaffected, and
-//! `--no-seccomp` turns the filter off.
+//! `--no-seccomp` turns the filter off, `--allow-new-privs` leaves
+//! `no_new_privs` unset.
 
 use std::fs::File;
 use std::process::{Command, Output, Stdio};
@@ -117,6 +118,75 @@ fn filter_and_no_new_privs_are_visible_in_proc() {
     assert_eq!(status(&[]), "NoNewPrivs: 1\nSeccomp: 2");
     // no_new_privs is set either way; only the filter is optional.
     assert_eq!(status(&["--no-seccomp"]), "NoNewPrivs: 1\nSeccomp: 0");
+    // --allow-new-privs is the other switch: the filter stays, no_new_privs doesn't.
+    assert_eq!(status(&["--allow-new-privs"]), "NoNewPrivs: 0\nSeccomp: 2");
+    assert_eq!(
+        status(&["--no-seccomp", "--allow-new-privs"]),
+        "NoNewPrivs: 0\nSeccomp: 0"
+    );
+}
+
+#[test]
+fn allow_new_privs_keeps_the_filter() {
+    // io_uring and AF_VSOCK are still refused when only no_new_privs is off.
+    let uring = "import ctypes\n\
+        libc = ctypes.CDLL(None, use_errno=True)\n\
+        fd = libc.syscall(425, 2, ctypes.create_string_buffer(120))\n\
+        print('created' if fd >= 0 else 'error %d' % ctypes.get_errno())";
+    if out(&outside(uring)) == "created" {
+        let o = nullroute(&["--allow-new-privs", "--", "python3", "-c", uring]);
+        assert_eq!(out(&o), format!("error {}", libc::EPERM), "{o:?}");
+    } else {
+        eprintln!(
+            "skipping the io_uring half of allow_new_privs_keeps_the_filter: no io_uring here"
+        );
+    }
+    if out(&outside(VSOCK)) == "created" {
+        let o = nullroute(&["--allow-new-privs", "--", "python3", "-c", VSOCK]);
+        assert_eq!(out(&o), format!("error {}", libc::EAFNOSUPPORT), "{o:?}");
+    } else {
+        eprintln!("skipping the vsock half of allow_new_privs_keeps_the_filter: no AF_VSOCK here");
+    }
+}
+
+/// The path of a `ping` that gets `cap_net_raw` from a file capability, if
+/// the host has one (on Debian and Ubuntu it does; elsewhere it may be setuid
+/// or use unprivileged ICMP sockets instead).
+fn ping_with_file_capability() -> Option<String> {
+    let path = out(&Command::new("sh")
+        .args(["-c", "command -v ping"])
+        .output()
+        .ok()?);
+    let has_cap = out(&outside(&format!(
+        "import os\ntry:\n os.getxattr({path:?}, 'security.capability'); print('yes')\nexcept OSError: print('no')"
+    ))) == "yes";
+    (!path.is_empty() && has_cap).then_some(path)
+}
+
+#[test]
+fn allow_new_privs_lets_a_file_capability_through() {
+    // The motivating case. A file capability (cap_net_raw on ping) is honoured by
+    // exec only if no_new_privs is off or the process already holds the capability.
+    // The sandbox's child holds its user namespace's capabilities until the
+    // first exec, so a ping run directly works either way, but one started by a
+    // shell (the second exec) has nothing to keep and fails without the flag.
+    let Some(ping) = ping_with_file_capability() else {
+        return eprintln!(
+            "skipping allow_new_privs_lets_a_file_capability_through: no ping with a file capability"
+        );
+    };
+    let script = format!("{ping} -c1 -W1 127.0.0.1");
+    let o = nullroute(&["--allow-new-privs", "--", "sh", "-c", &script]);
+    assert!(
+        o.status.success(),
+        "ping via sh with --allow-new-privs: {o:?}\n{}",
+        err(&o)
+    );
+    let o = nullroute(&["--", "sh", "-c", &script]);
+    assert!(
+        !o.status.success(),
+        "without --allow-new-privs, a file capability must not be granted by a second exec: {o:?}"
+    );
 }
 
 #[test]
@@ -219,4 +289,26 @@ fn inspect_and_dry_run_report_the_hardening() {
         err(&o)
     );
     assert!(out(&o).contains("seccomp: off (--no-seccomp)"), "{o:?}");
+    let o = nullroute(&["--inspect", "--dry-run", "--allow-new-privs", "--", "true"]);
+    assert!(
+        err(&o).contains("  hardening:       seccomp denies socket(")
+            && err(&o).contains("; no_new_privs is off (--allow-new-privs)\n"),
+        "{}",
+        err(&o)
+    );
+    assert!(
+        out(&o).contains("seccomp: seccomp denies") && out(&o).contains("no_new_privs is off"),
+        "{o:?}"
+    );
+    let o = nullroute(&[
+        "--dry-run",
+        "--no-seccomp",
+        "--allow-new-privs",
+        "--",
+        "true",
+    ]);
+    assert!(
+        out(&o).contains("seccomp: off (--no-seccomp, --allow-new-privs)"),
+        "{o:?}"
+    );
 }

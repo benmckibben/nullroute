@@ -27,7 +27,10 @@
 //!   AArch64 filters its 32-bit ARM mode the same way. Any other ABI gets `ENOSYS`.
 //!
 //! `no_new_privs` is set first (it is also what lets an unprivileged process
-//! install a filter). It is set even with `--no-seccomp`. Inside the user
+//! install a filter). It is set even with `--no-seccomp`; `--allow-new-privs`
+//! leaves it out (the filter, if wanted, is then installed on the strength of
+//! the capabilities the process holds in its own user namespace until exec).
+//! Inside the user
 //! namespace only the caller's own id is mapped, so a setuid-root binary
 //! (`sudo`, `su`) never gained anything there; what `no_new_privs` changes is that
 //! setuid, setgid and file capabilities can no longer raise privileges after
@@ -39,6 +42,24 @@
 //! and a dependency would add more than that to audit.
 
 use std::io;
+
+/// Which of the two hardening steps run before the command: the seccomp filter
+/// (`--no-seccomp` turns it off) and `no_new_privs` (`--allow-new-privs` turns
+/// it off). Both are on by default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hardening {
+    pub seccomp: bool,
+    pub no_new_privs: bool,
+}
+
+impl Default for Hardening {
+    fn default() -> Self {
+        Hardening {
+            seccomp: true,
+            no_new_privs: true,
+        }
+    }
+}
 
 /// One BPF instruction (`struct sock_filter`).
 pub type Insn = libc::sock_filter;
@@ -157,9 +178,13 @@ impl Filter {
         Some(Filter { prog })
     }
 
-    /// Set `no_new_privs` and load the filter. Two `prctl` calls and nothing
-    /// else, so it is async-signal-safe (no allocation, no locks).
-    pub fn install(&self) -> io::Result<()> {
+    /// Set `no_new_privs` (unless `set_no_new_privs` is false) and load the
+    /// filter. Two `prctl` calls and nothing else, so it is async-signal-safe
+    /// (no allocation, no locks). Without `no_new_privs` the kernel only accepts
+    /// the filter from a process with `CAP_SYS_ADMIN` in its user namespace
+    /// (which the sandbox's child has until exec); otherwise this fails with
+    /// `EACCES` and the command does not start, rather than run unfiltered.
+    pub fn install(&self, set_no_new_privs: bool) -> io::Result<()> {
         let fprog = libc::sock_fprog {
             len: self.prog.len() as u16, // checked in new()
             filter: self.prog.as_ptr() as *mut Insn,
@@ -167,7 +192,7 @@ impl Filter {
         // SAFETY: `fprog` points at `self.prog`, alive for the call; the kernel
         // copies the program and doesn't write to it.
         unsafe {
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            if set_no_new_privs && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::prctl(
@@ -334,15 +359,21 @@ fn assemble(abis: &[Abi]) -> Option<Vec<Insn>> {
     a.finish()
 }
 
-/// A one-line description for `--inspect` and `--dry-run`.
-pub fn describe() -> String {
+/// A one-line description of the filter (and of `no_new_privs`, set or not) for
+/// `--inspect` and `--dry-run`.
+pub fn describe(no_new_privs: bool) -> String {
     let families: Vec<&str> = DENIED_FAMILIES.iter().map(|(_, n)| *n).collect();
     let ioctls: Vec<&str> = DENIED_IOCTLS.iter().map(|(_, n)| *n).collect();
-    format!(
-        "no_new_privs; seccomp denies socket({}), ioctl({}), io_uring_setup",
+    let filter = format!(
+        "seccomp denies socket({}), ioctl({}), io_uring_setup",
         families.join("/"),
         ioctls.join("/")
-    )
+    );
+    if no_new_privs {
+        format!("no_new_privs; {filter}")
+    } else {
+        format!("{filter}; no_new_privs is off (--allow-new-privs)")
+    }
 }
 
 #[cfg(test)]
@@ -591,9 +622,22 @@ mod tests {
 
     #[test]
     fn describe_names_what_is_denied() {
-        let d = describe();
+        let d = describe(true);
         for want in ["AF_VSOCK", "TIOCSTI", "io_uring_setup", "no_new_privs"] {
             assert!(d.contains(want), "{d}");
         }
+        assert!(d.starts_with("no_new_privs; seccomp denies"), "{d}");
+        let d = describe(false);
+        assert!(d.starts_with("seccomp denies"), "{d}");
+        assert!(
+            d.ends_with("no_new_privs is off (--allow-new-privs)"),
+            "{d}"
+        );
+    }
+
+    #[test]
+    fn hardening_defaults_to_everything_on() {
+        let h = Hardening::default();
+        assert!(h.seccomp && h.no_new_privs);
     }
 }

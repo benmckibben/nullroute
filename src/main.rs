@@ -178,12 +178,24 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         report_json: Option<std::path::PathBuf>,
 
-        /// Don't install the seccomp filter (no_new_privs is still set). By
-        /// default the command can't open AF_VSOCK, Bluetooth, NFC or QIPCRTR
-        /// sockets, can't use io_uring or the TIOCSTI/TIOCLINUX terminal
-        /// ioctls (all fail with an error). Use this for a tool that needs one.
+        /// Don't install the seccomp filter (no_new_privs is still set; see
+        /// --allow-new-privs). By default the command can't open AF_VSOCK,
+        /// Bluetooth, NFC or QIPCRTR sockets, can't use io_uring or the
+        /// TIOCSTI/TIOCLINUX terminal ioctls (all fail with an error). Use this
+        /// for a tool that needs one.
         #[arg(long = "no-seccomp")]
         no_seccomp: bool,
+
+        /// Don't set no_new_privs, so a setuid, setgid or file-capability
+        /// program can still raise its privileges when it runs (a ping binary
+        /// that carries cap_net_raw as a file capability, say).
+        ///
+        /// Only your own id is mapped inside the sandbox, so a root-owned setuid
+        /// file (sudo, su) has no effect either way. The seccomp filter stays on
+        /// unless --no-seccomp is also given. A nested nullroute or any other
+        /// child inherits the setting.
+        #[arg(long = "allow-new-privs")]
+        allow_new_privs: bool,
 
         /// Print what would be hidden, masked, forwarded and allowed, then exit.
         ///
@@ -232,6 +244,7 @@ fn main() -> ExitCode {
             quiet,
             report_json,
             no_seccomp,
+            allow_new_privs,
             dry_run,
             check_sandbox,
             inspect,
@@ -336,6 +349,10 @@ fn main() -> ExitCode {
                     allow_existing: seal_docker_allow_existing,
                 });
             }
+            let hardening = seccomp::Hardening {
+                seccomp: !no_seccomp,
+                no_new_privs: !allow_new_privs,
+            };
             let allowed_hosts: Vec<String> = allow.iter().map(|h| normalize_host(h)).collect();
             let proxy_info =
                 (!allowlist.is_empty()).then(|| (proxy::pick_port(&ports), allowed_hosts.clone()));
@@ -347,7 +364,7 @@ fn main() -> ExitCode {
                 &dns::bypass_targets(),
             )
             .with_docker_pulls(pulls)
-            .with_seccomp(!no_seccomp);
+            .with_hardening(hardening);
             if inspect {
                 diag!("{}", topology.render());
             }
@@ -383,7 +400,7 @@ fn main() -> ExitCode {
                     allowed_hosts: &allowed_hosts,
                     proxy: !allowlist.is_empty(),
                     dns_plan: dns_plan.as_ref(),
-                    seccomp: !no_seccomp,
+                    hardening,
                 };
                 return match write_dry_run(&mut out, &listing) {
                     Ok(()) => ExitCode::SUCCESS,
@@ -406,7 +423,7 @@ fn main() -> ExitCode {
             let opts = RunOpts {
                 strict,
                 report_json,
-                seccomp: !no_seccomp,
+                hardening,
             };
             run(
                 &argv,
@@ -431,7 +448,7 @@ struct DryRunListing<'a> {
     allowed_hosts: &'a [String],
     proxy: bool,
     dns_plan: Option<&'a dns::Plan>,
-    seccomp: bool,
+    hardening: seccomp::Hardening,
 }
 
 fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::io::Result<()> {
@@ -444,9 +461,9 @@ fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::i
         allowed_hosts,
         proxy,
         dns_plan,
-        seccomp,
+        hardening,
     } = l;
-    let (pulls, proxy, seccomp) = (*pulls, *proxy, *seccomp);
+    let (pulls, proxy, hardening) = (*pulls, *proxy, *hardening);
     let (plan, dns_plan) = (*plan, *dns_plan);
     let (ports, allowed_hosts) = (*ports, *allowed_hosts);
     match plan {
@@ -466,7 +483,7 @@ fn write_dry_run(out: &mut impl std::io::Write, l: &DryRunListing<'_>) -> std::i
     for m in masked.iter() {
         writeln!(out, "masked resolver socket: {}", m.display())?;
     }
-    writeln!(out, "seccomp: {}", inspect::hardening(seccomp))?;
+    writeln!(out, "seccomp: {}", inspect::hardening(hardening))?;
     for p in ports {
         writeln!(out, "forwarded port: {p}")?;
     }
@@ -510,8 +527,9 @@ const EXIT_OUTPUT_FAILED: i32 = 74;
 struct RunOpts {
     strict: bool,
     report_json: Option<std::path::PathBuf>,
-    /// Install the seccomp filter (no --no-seccomp).
-    seccomp: bool,
+    /// Which of the seccomp filter and no_new_privs to apply (--no-seccomp,
+    /// --allow-new-privs).
+    hardening: seccomp::Hardening,
 }
 
 #[cfg(target_os = "linux")]
@@ -524,7 +542,8 @@ fn run(
     report: &std::sync::Arc<report::Report>,
     opts: &RunOpts,
 ) -> ExitCode {
-    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, opts.seccomp) {
+    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, opts.hardening)
+    {
         Ok(s) => s,
         Err(e) => {
             if sandbox::command_exit_code(&e).is_some() {

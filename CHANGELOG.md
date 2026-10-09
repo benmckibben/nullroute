@@ -133,6 +133,13 @@ Hardening that the first release ships with:
   because io_uring can create sockets without `socket()`. Nothing else is
   filtered. `--no-seccomp` turns the filter off; `no_new_privs` stays. See the
   README for the effect on setuid and file-capability binaries.
+- `--allow-new-privs` leaves `no_new_privs` unset (the seccomp filter stays,
+  unless `--no-seccomp` is given too). Needed when a file capability or setuid
+  helper has to work: `ping` carries `cap_net_raw` as a file capability on Debian
+  and Ubuntu, so `nullroute run -- ping` worked (the command's first exec still
+  holds the sandbox's capabilities) while `nullroute run -- sh -c 'ping ...'`
+  failed with `Operation not permitted`. `--dry-run` and `--inspect` show which
+  of the two are on.
 
 - `--seal-docker` only rewrote container creation, so containers that already
   existed were unsealed: `docker exec db sh -c 'echo x | nc 172.17.0.1 9999'`

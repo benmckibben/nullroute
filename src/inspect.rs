@@ -30,16 +30,16 @@ pub struct Topology {
     pub dns: Option<Vec<String>>,
     /// `--seal-docker-pulls`, when a Docker socket is sealed.
     pub docker_pulls: Option<docker::PullPolicy>,
-    /// The seccomp filter is installed (no `--no-seccomp`).
-    pub seccomp: bool,
+    /// Which of the seccomp filter and `no_new_privs` are on.
+    pub hardening: crate::seccomp::Hardening,
 }
 
-/// What `--inspect` and `--dry-run` say about the seccomp filter.
-pub fn hardening(seccomp: bool) -> String {
-    if seccomp {
-        crate::seccomp::describe()
-    } else {
-        "off (--no-seccomp); no_new_privs is still set".to_string()
+/// What `--inspect` and `--dry-run` say about the seccomp filter and `no_new_privs`.
+pub fn hardening(h: crate::seccomp::Hardening) -> String {
+    match (h.seccomp, h.no_new_privs) {
+        (true, nnp) => crate::seccomp::describe(nnp),
+        (false, true) => "off (--no-seccomp); no_new_privs is still set".to_string(),
+        (false, false) => "off (--no-seccomp, --allow-new-privs)".to_string(),
     }
 }
 
@@ -73,13 +73,14 @@ impl Topology {
             proxy,
             dns: dns.map(dns::Plan::describe),
             docker_pulls: None,
-            seccomp: true,
+            hardening: crate::seccomp::Hardening::default(),
         }
     }
 
-    /// Show whether the seccomp filter is installed (`--no-seccomp`).
-    pub fn with_seccomp(mut self, on: bool) -> Self {
-        self.seccomp = on;
+    /// Show which of the seccomp filter and `no_new_privs` are on
+    /// (`--no-seccomp`, `--allow-new-privs`).
+    pub fn with_hardening(mut self, h: crate::seccomp::Hardening) -> Self {
+        self.hardening = h;
         self
     }
 
@@ -106,7 +107,7 @@ impl Topology {
     pub fn render(&self) -> String {
         let mut s = String::from("nullroute: inspect: sandbox topology\n");
         let _ = writeln!(s, "  namespaces:      {}", self.namespaces().join(", "));
-        let _ = writeln!(s, "  hardening:       {}", hardening(self.seccomp));
+        let _ = writeln!(s, "  hardening:       {}", hardening(self.hardening));
         let pool = if self.dns.is_some() {
             format!(", {}", dns::POOL_CIDR)
         } else {
@@ -193,13 +194,16 @@ mod tests {
             proxy: None,
             dns: None,
             docker_pulls: None,
-            seccomp: true,
+            hardening: crate::seccomp::Hardening::default(),
         }
     }
 
     #[test]
     fn minimal_topology_reports_none_everywhere() {
-        let hardening = format!("  hardening:       {}", hardening(true));
+        let hardening = format!(
+            "  hardening:       {}",
+            hardening(crate::seccomp::Hardening::default())
+        );
         let expected = [
             "nullroute: inspect: sandbox topology",
             "  namespaces:      user, net",
@@ -262,7 +266,7 @@ mod tests {
             proxy: Some((3128, vec!["api.github.com".into(), "*.stripe.dev".into()])),
             dns: Some(vec!["api.github.com -> 127.77.0.1 (ports 80, 443)".into()]),
             docker_pulls: Some(docker::PullPolicy::Allowlisted),
-            seccomp: true,
+            hardening: crate::seccomp::Hardening::default(),
         };
         let out = t.render();
         assert!(
@@ -332,10 +336,25 @@ mod tests {
             on.contains("  hardening:       no_new_privs; seccomp denies socket("),
             "{on}"
         );
-        let off = bare().with_seccomp(false).render();
+        let h = |seccomp, no_new_privs| crate::seccomp::Hardening {
+            seccomp,
+            no_new_privs,
+        };
+        let off = bare().with_hardening(h(false, true)).render();
         assert!(
             off.contains("  hardening:       off (--no-seccomp); no_new_privs is still set\n"),
             "{off}"
+        );
+        let nnp_off = bare().with_hardening(h(true, false)).render();
+        assert!(
+            nnp_off.contains("  hardening:       seccomp denies socket(")
+                && nnp_off.contains("; no_new_privs is off (--allow-new-privs)\n"),
+            "{nnp_off}"
+        );
+        let both = bare().with_hardening(h(false, false)).render();
+        assert!(
+            both.contains("  hardening:       off (--no-seccomp, --allow-new-privs)\n"),
+            "{both}"
         );
     }
 
