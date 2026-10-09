@@ -669,10 +669,10 @@ mod tests {
             String::new,
         );
         r.record(Kind::Docker, "networks/connect", "refused", String::new);
-        let argv = [
-            "sh".to_string(),
-            "-c".to_string(),
-            "echo \"hi\"\tthere \\ \u{e9}".to_string(),
+        let argv: [std::ffi::OsString; 3] = [
+            "sh".into(),
+            "-c".into(),
+            "echo \"hi\"\tthere \\ \u{e9}".into(),
         ];
         r.write_json(&path, &argv, 1, true).unwrap();
         let got = std::fs::read_to_string(&path).unwrap();
