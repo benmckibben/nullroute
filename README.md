@@ -386,7 +386,7 @@ sandbox. So, also by default:
 |---|---|
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
 | `--hide-socket PATH` | Hide another socket too, e.g. an SSH agent or a local proxy (repeatable). |
-| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. |
+| `--dry-run` | Print what would be hidden, masked, forwarded and allowed (hidden and sealed sockets, masked resolver sockets, forwarded ports, allowed hosts, the DNS resolver or sinkhole mapping, the namespaces), then exit. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
 
 ### Letting Docker tests run, with sealed containers

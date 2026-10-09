@@ -373,3 +373,35 @@ fn live_docker_socket_is_reported_as_sealed() {
     assert!(!section(&e, "blocked").contains(&real), "{e}");
     assert_eq!(out(&o).trim(), "ok", "sealed docker still usable: {o:?}");
 }
+
+#[test]
+fn dry_run_lists_everything_inspect_does() {
+    // --dry-run promises what would be hidden, masked, forwarded and allowed:
+    // the masked resolver sockets and the namespaces must be in its stdout,
+    // not only in --inspect's topology.
+    let t = TmpDir::new("dry-complete");
+    let o = nr(
+        &["--inspect", "--dry-run", "--port", "5432", "--", "true"],
+        &t.0,
+    );
+    let (stdout, topology) = (out(&o), err(&o));
+    let masked: Vec<String> = section(&topology, "masked")
+        .iter()
+        .map(|p| format!("masked resolver socket: {}", p.display()))
+        .collect();
+    let listed: Vec<String> = stdout
+        .lines()
+        .filter(|l| l.starts_with("masked resolver socket:"))
+        .map(String::from)
+        .collect();
+    assert_eq!(listed, masked, "{stdout}");
+    let ns = field(&topology, "namespaces");
+    assert!(
+        stdout.lines().any(|l| l == format!("namespaces: {ns}")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|l| l == "forwarded port: 5432"),
+        "{stdout}"
+    );
+}

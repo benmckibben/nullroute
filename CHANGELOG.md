@@ -54,8 +54,9 @@ will contain.
   `--port 53` without allowed names still bridges port 53. `--strict` and the
   report can't see a connection straight to an IP address (it fails in the
   kernel with `ENETUNREACH`); the README says so.
-- `--dry-run` and `--inspect`: show what would be hidden, bridged, allowed and
-  sealed, and the sandbox topology.
+- `--dry-run` and `--inspect`: show what would be hidden, masked, bridged,
+  allowed and sealed (`--dry-run` includes the masked resolver sockets and the
+  namespaces), and the sandbox topology.
 - Linux builds for x86_64 and aarch64, glibc and musl (static) targets. Other
   targets fail to build with a single clear error.
 - CI: rustfmt, clippy, tests on stable and the MSRV (Rust 1.88) and on musl,
