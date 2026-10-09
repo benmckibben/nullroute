@@ -31,18 +31,22 @@ The exit code is passed through, so it drops into CI unchanged.
 
 ## Installing
 
-There are no release binaries and no published crate yet, so today you build it
-from source (Rust 1.88 or newer, Linux only; see [Requirements](#requirements)):
+Rust 1.88 or newer, Linux only (see [Requirements](#requirements)):
+
+```bash
+cargo install --locked nullroute   # installs nullroute into ~/.cargo/bin
+```
+
+or from a checkout:
 
 ```bash
 git clone https://github.com/benmckibben/nullroute
 cd nullroute
-cargo install --locked --path .   # installs nullroute into ~/.cargo/bin
+cargo install --locked --path .
 ```
 
-Don't run `cargo install nullroute`: the name on crates.io currently holds only
-an empty 0.0.0 placeholder, which is not this program. This section will change
-when a release exists.
+Each GitHub release also carries Linux archives for x86_64 and aarch64 with a
+`SHA256SUMS` file.
 
 ## Reaching local services: `--port`
 
