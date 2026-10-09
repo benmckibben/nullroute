@@ -136,8 +136,22 @@ jobs:
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           unshare --user --net --map-current-user true
+      # Docker Hub rate-limits anonymous pulls from the shared runner addresses
+      # (HTTP 429), which failed CI at random. Pull the same image from the AWS
+      # public mirror, which has no such limit, and tag it as `alpine`, the name
+      # the tests look for.
       - name: Pull alpine for --seal-docker tests
-        run: docker pull alpine
+        run: |
+          img=public.ecr.aws/docker/library/alpine:latest
+          for attempt in 1 2 3 4 5; do
+            if docker pull "$img"; then
+              docker tag "$img" alpine
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "could not pull $img" >&2
+          exit 1
       - run: cargo test --locked --no-fail-fast -- --show-output
 
   # cargo package builds the .crate that would go to crates.io, entirely
