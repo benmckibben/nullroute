@@ -148,6 +148,13 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
 
+        /// With --dry-run, also check that this machine lets nullroute create
+        /// the namespaces a run needs (a throw-away process does the real
+        /// setup and exits; nothing is left behind). Without it --dry-run only
+        /// checks the options and the listener/descriptor budget.
+        #[arg(long, requires = "dry_run")]
+        check_sandbox: bool,
+
         /// Print the sandbox topology (namespaces, loopback, bridged ports,
         /// blocked/sealed sockets, proxy) to stderr before running the command.
         /// With --dry-run, print it and exit without running anything.
@@ -178,6 +185,7 @@ fn main() -> ExitCode {
             quiet,
             report_json,
             dry_run,
+            check_sandbox,
             inspect,
             argv,
         } => {
@@ -275,6 +283,19 @@ fn main() -> ExitCode {
                 );
             }
             if dry_run {
+                // What the real run would refuse, say so now: the listener
+                // and descriptor budget, and (opt-in) whether namespaces can
+                // be created at all.
+                let listeners =
+                    sandbox::planned_listeners(&ports, !allowlist.is_empty(), dns_plan.as_ref());
+                if let Err(e) = forward::check_budget(listeners, limits::effective_nofile_limit()) {
+                    diagln!("nullroute: could not set up the sandbox: {e}");
+                    return ExitCode::from(125);
+                }
+                if check_sandbox && let Err(e) = sandbox::probe_namespaces() {
+                    diagln!("nullroute: could not set up the sandbox: {e}");
+                    return ExitCode::from(125);
+                }
                 // Rust ignores SIGPIPE, so a reader that exits early (| head)
                 // would turn a write error into a panic (101). The listing is
                 // the result of the command, not a diagnostic: die by the
@@ -400,7 +421,13 @@ fn run(
     let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report) {
         Ok(s) => s,
         Err(e) => {
-            diagln!("nullroute: failed to run {:?}: {e}", argv[0]);
+            if sandbox::command_exit_code(&e).is_some() {
+                diagln!("nullroute: failed to run {:?}: {e}", argv[0]);
+            } else {
+                // Not the command's fault: nothing was started, or the
+                // sandbox around it couldn't be built.
+                diagln!("nullroute: could not set up the sandbox: {e}");
+            }
             // Like docker run and shells: 127 = command not found, 126 = found
             // but not executable. Otherwise 125, "the runner failed", as opposed
             // to the command; keeps the two distinguishable.

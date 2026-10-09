@@ -21,7 +21,6 @@
 //! `--port` forwarding; see forward.rs. With `--allow`, names resolve through
 //! the DNS sinkhole instead (dns.rs), which needs the mount namespace too.
 
-use std::ffi::CString;
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
@@ -70,10 +69,11 @@ pub fn run_hermetic(
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
     let uid_map = format!("{uid} {uid} 1\n");
     let gid_map = format!("{gid} {gid} 1\n");
+    // Constant C strings: nothing to allocate or fail on.
     let paths = (
-        CString::new("/proc/self/setgroups").unwrap(),
-        CString::new("/proc/self/uid_map").unwrap(),
-        CString::new("/proc/self/gid_map").unwrap(),
+        c"/proc/self/setgroups",
+        c"/proc/self/uid_map",
+        c"/proc/self/gid_map",
     );
 
     // Every listener the parent will serve is created inside the sandbox and
@@ -160,9 +160,9 @@ pub fn run_hermetic(
                     return Err(io::Error::last_os_error());
                 }
                 // An unprivileged process must deny setgroups before writing gid_map.
-                write_file(&paths.0, b"deny")?;
-                write_file(&paths.1, uid_map.as_bytes())?;
-                write_file(&paths.2, gid_map.as_bytes())?;
+                write_file(paths.0, b"deny")?;
+                write_file(paths.1, uid_map.as_bytes())?;
+                write_file(paths.2, gid_map.as_bytes())?;
                 if let Some(m) = mounts.as_ref() {
                     hide::apply_in_child(m)?;
                 }
@@ -297,6 +297,56 @@ fn hold_for_test() {
 #[cfg(not(debug_assertions))]
 fn hold_for_test() {}
 
+/// How many sockets the sandbox will create for these options: two per
+/// forwarded port (IPv4 and IPv6), two for the proxy, and the sinkhole's.
+/// Shared by the real run and --dry-run.
+pub fn planned_listeners(ports: &[u16], proxy: bool, dns: Option<&dns::Plan>) -> usize {
+    let proxy_ports = if proxy { 2 } else { 0 };
+    ports.len() * 2 + proxy_ports + dns.map_or(0, |d| d.listeners().len())
+}
+
+/// Check that this machine lets nullroute create the namespaces a run needs
+/// (--dry-run --check-sandbox): start a throw-away process that does exactly
+/// the namespace setup of the real child (user, network and mount namespaces,
+/// the uid/gid maps, loopback up) and exits. Nothing is left behind: the
+/// namespaces die with the process. The error is the one a real run would
+/// report, with the same hint about AppArmor / sysctls.
+pub fn probe_namespaces() -> io::Result<()> {
+    let program = std::env::current_exe()?;
+    // SAFETY: getuid/getgid have no preconditions and cannot fail.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    let uid_map = format!("{uid} {uid} 1\n");
+    let gid_map = format!("{gid} {gid} 1\n");
+    let flags = namespace_flags(true);
+    let mut cmd = Command::new(program);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // SAFETY: the closure only makes raw syscalls and works on memory
+    // prepared above (the same steps as the real child's setup).
+    unsafe {
+        cmd.pre_exec(move || {
+            let setup = || -> io::Result<()> {
+                if libc::unshare(flags) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                write_file(c"/proc/self/setgroups", b"deny")?;
+                write_file(c"/proc/self/uid_map", uid_map.as_bytes())?;
+                write_file(c"/proc/self/gid_map", gid_map.as_bytes())?;
+                loopback_up()
+            };
+            setup().map_err(|e| {
+                io::Error::from_raw_os_error(
+                    e.raw_os_error().unwrap_or(libc::EIO) | SETUP_ERROR_TAG,
+                )
+            })
+        });
+    }
+    let mut child = cmd.spawn().map_err(classify_spawn_error)?;
+    child.wait().map(drop)
+}
+
 /// The namespaces the child unshares: always user + net, plus a mount
 /// namespace when there are sockets to hide or resolver sockets to mask, or
 /// the DNS sinkhole needs its resolv.conf. Shared with `--inspect`.
@@ -305,7 +355,7 @@ pub fn namespace_flags(mount_ns: bool) -> libc::c_int {
 }
 
 /// open + write + close with raw syscalls (safe to call in pre_exec).
-fn write_file(path: &CString, data: &[u8]) -> io::Result<()> {
+fn write_file(path: &std::ffi::CStr, data: &[u8]) -> io::Result<()> {
     // SAFETY: path is a valid NUL-terminated string; data is a valid slice.
     unsafe {
         let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);

@@ -130,14 +130,32 @@ fn cmsg_words(n: usize) -> usize {
     space.div_ceil(8)
 }
 
-/// Create the socketpair and preallocate the child's buffers.
-pub fn prepare(specs: &[Spec]) -> io::Result<(ParentSide, ChildSide)> {
-    if specs.len() > MAX_LISTENERS {
+/// Descriptors nullroute needs besides the listeners (stdio, the socketpair,
+/// the sentinel's pipes, the report file, threads' sockets...).
+const FD_OVERHEAD: u64 = 64;
+
+/// Can `listeners` sockets be created and handed over? Checked by the real run
+/// and by --dry-run alike, so a configuration that would fail doesn't pass a
+/// dry run: at most MAX_LISTENERS, and they (plus a margin) must fit in the
+/// descriptor limit `fd_limit`.
+pub fn check_budget(listeners: usize, fd_limit: u64) -> io::Result<()> {
+    if listeners > MAX_LISTENERS {
         return Err(io::Error::other(format!(
-            "too many listeners ({} > {MAX_LISTENERS})",
-            specs.len()
+            "too many listeners ({listeners} > {MAX_LISTENERS})"
         )));
     }
+    if listeners as u64 + FD_OVERHEAD > fd_limit {
+        return Err(io::Error::other(format!(
+            "too many listeners for the file descriptor limit ({listeners} listeners need about {} descriptors, the limit is {fd_limit}); raise it with ulimit -n",
+            listeners as u64 + FD_OVERHEAD
+        )));
+    }
+    Ok(())
+}
+
+/// Create the socketpair and preallocate the child's buffers.
+pub fn prepare(specs: &[Spec]) -> io::Result<(ParentSide, ChildSide)> {
+    check_budget(specs.len(), crate::limits::effective_nofile_limit())?;
     let mut sv = [0 as libc::c_int; 2];
     // SAFETY: sv is a valid 2-element array. SEQPACKET keeps chunks as messages
     // and, unlike DGRAM, can't silently drop one.
@@ -465,6 +483,19 @@ pub(crate) fn relay(a: TcpStream, b: TcpStream) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_listener_budget_covers_both_the_count_and_the_descriptor_limit() {
+        assert!(check_budget(MAX_LISTENERS, 1 << 20).is_ok());
+        let e = check_budget(MAX_LISTENERS + 1, 1 << 20).unwrap_err();
+        assert!(
+            e.to_string().contains("too many listeners (1025 > 1024)"),
+            "{e}"
+        );
+        assert!(check_budget(100, 164).is_ok());
+        let e = check_budget(100, 163).unwrap_err();
+        assert!(e.to_string().contains("file descriptor limit"), "{e}");
+    }
+
     use super::*;
 
     #[test]

@@ -139,6 +139,13 @@ Findings from a security review of the first version, all fixed before release:
   it runs (the command still gets the soft limit it was started with), and
   running out of descriptors is reported as that instead of "nothing
   reachable on the host" for a `--port`.
+- `--dry-run` no longer says everything is fine for a configuration the real run
+  rejects: it applies the same listener and file-descriptor budget (32 pool
+  addresses x 40 ports used to pass a dry run and then fail with "too many
+  listeners", exit 125). New `--dry-run --check-sandbox` also checks that
+  namespaces can be created on this machine. A failure while setting up the
+  sandbox is now reported as "could not set up the sandbox: ..."; "failed to
+  run" is kept for the command itself not being found or executable.
 - `--report-json` is checked before the command runs (exit `2` if it can't be
   written); a write failure at the end of an otherwise successful run now exits
   `74` instead of `0`.

@@ -185,6 +185,20 @@ pub fn raise_nofile_limit() -> Option<libc::rlimit> {
     (unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0).then_some(cur)
 }
 
+/// The soft descriptor limit nullroute will have once it has raised it
+/// ([`raise_nofile_limit`]); what --dry-run checks the listener budget against.
+pub fn effective_nofile_limit() -> u64 {
+    let mut cur = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: a valid out-pointer.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut cur) } != 0 {
+        return 1024;
+    }
+    cur.rlim_cur.max(cur.rlim_max.min(1 << 20))
+}
+
 /// Accept connections until the listener is unusable, handing each to `serve`.
 /// `accept` is the listener's accept call. Errors that say "try again later"
 /// (out of descriptors, an aborted connection) are retried after a short

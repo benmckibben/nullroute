@@ -331,7 +331,8 @@ sandbox. So, also by default:
 |---|---|
 | `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
 | `--hide-socket PATH` | Hide another socket too, e.g. an SSH agent or a local proxy (repeatable). |
-| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. |
+| `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. It validates the options and the listener / file-descriptor budget exactly as a real run does (a configuration that would fail with "too many listeners" fails here too, exit 125), but it does **not** start anything: it can't tell you that user namespaces are disabled, that a port is free, or that the command exists. |
+| `--check-sandbox` | With `--dry-run`: also check that this machine lets nullroute create the user, network and mount namespaces (a throw-away process does the real setup and exits; nothing is left behind). Exit 125 with the same message a real run would give if it can't. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
 
 ### Letting Docker tests run, with sealed containers
