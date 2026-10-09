@@ -329,10 +329,51 @@ sandbox. So, also by default:
 
 | Flag | Effect |
 |---|---|
-| `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). |
-| `--hide-socket PATH` | Hide another socket too, e.g. an SSH agent or a local proxy (repeatable). |
+| `--allow-socket PATH` | Keep a default-hidden socket reachable (repeatable). Any path to the socket works (symlinks are followed); `--dry-run` shows what is hidden. |
+| `--hide-socket PATH` | Hide another socket too, e.g. an X11 or Wayland display socket or a local proxy (repeatable). |
 | `--dry-run` | Print the sockets that would be hidden, the ports forwarded and the DNS sinkhole mapping, then exit. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
+
+### The user's session: D-Bus, systemd, snapd, agents
+
+The same goes for the services of your login session. Their sockets are plain
+files, so a command in the sandbox could ask them to do things *outside* the
+sandbox, with the host's network. For example, `systemd-run --user` over the
+session bus starts a process in the host's network namespace
+(`busctl --user list` works from inside a bare sandbox unless these are
+hidden). So, also by default, nullroute hides the ones that exist on your
+machine:
+
+| Hidden | Where | Why |
+|---|---|---|
+| session D-Bus | `$DBUS_SESSION_BUS_ADDRESS` (`unix:path=`), `$XDG_RUNTIME_DIR/bus`, `/run/user/UID/bus` | starts processes on the host (`systemd-run --user`, D-Bus activation) |
+| systemd user manager | `…/systemd/private` in the same directories | starts processes on the host |
+| snapd | `/run/snapd.socket`, `/run/snapd-snap.socket`, `…/snapd-session-agent.socket` | installs and runs snaps, with network |
+| SSH and keyring agents | `$SSH_AUTH_SOCK`, `…/ssh-agent.socket`, `…/openssh_agent`, `…/gcr/ssh`, `…/keyring/*` | sign with your keys for anything the command can reach |
+| gpg-agent and dirmngr | `…/gnupg/S.*`, `~/.gnupg/S.*`, `$GNUPGHOME/S.*` | dirmngr fetches keys over the host's network (a `gpg --recv-keys` inside would go out) |
+| more container runtimes | rootless Docker/Podman/containerd/BuildKit, Docker Desktop, Colima, Rancher Desktop, Lima, OrbStack, k3s, CRI-O, LXD, libvirt | start containers and VMs with a network |
+
+Nothing is printed for the ones you don't have. A connection to a hidden
+socket gets the same decoy as above, is reported, and counts as a block for
+`--strict`; `--allow-socket PATH` brings one back (for instance
+`--allow-socket "$SSH_AUTH_SOCK"` if the command has to use your SSH agent, which
+it can only do over a route you've opened with `--allow` or `--port`).
+`nullroute run --dry-run -- true` lists what is hidden on this machine.
+
+Not hidden, on purpose:
+
+- **Abstract sockets** (a D-Bus address like `unix:abstract=/tmp/dbus-…`, X11's
+  `@/tmp/.X11-unix/X0`): they belong to a network namespace, so the sandbox's own
+  empty one already keeps the host's out. (Checked: connecting to a host's
+  abstract socket from inside fails with `ECONNREFUSED`.)
+- **Display servers** (`/tmp/.X11-unix/X0`, `$XDG_RUNTIME_DIR/wayland-0`) and the
+  accessibility bus (`$XDG_RUNTIME_DIR/at-spi/bus_*`). They can read the screen
+  and inject keystrokes into other windows, which could be turned into running
+  something on the host, but that is not a path to the network, and hiding them
+  would break GUI test runs. If that matters to you, `--hide-socket` them, or
+  don't run untrusted code on a desktop session.
+- `$XDG_RUNTIME_DIR/systemd/notify` (readiness notifications only), PulseAudio
+  and PipeWire, dconf.
 
 ### Letting Docker tests run, with sealed containers
 
@@ -504,7 +545,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails, `127`/`126` if the command isn't found/executable) |
 | Reach chosen services on the host's localhost (`--port`) | ✅ TCP, IPv4 + IPv6 |
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
-| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes and the system D-Bus |
+| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents |
 | Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
 | Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); not a boundary for hostile images |
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |

@@ -1653,22 +1653,7 @@ fn relay(client: UnixStream, upstream: UnixStream) {
 /// Docker sockets that speak the Docker HTTP API (so they can be sealed).
 /// containerd/buildkit use a different (gRPC) protocol and are not sealed.
 pub fn docker_api_sockets() -> Vec<PathBuf> {
-    let mut v = vec![
-        PathBuf::from("/var/run/docker.sock"),
-        PathBuf::from("/run/docker.sock"),
-    ];
-    if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
-        v.push(PathBuf::from(xdg).join("docker.sock"));
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        v.push(PathBuf::from(home).join(".docker/run/docker.sock"));
-    }
-    if let Ok(h) = std::env::var("DOCKER_HOST")
-        && let Some(p) = h.strip_prefix("unix://")
-    {
-        v.push(PathBuf::from(p));
-    }
-    v
+    crate::hide::SocketEnv::from_env().docker_api_sockets()
 }
 
 #[cfg(test)]

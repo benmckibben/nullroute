@@ -84,9 +84,25 @@ Findings from a security review of the first version, all fixed before release:
   endpoints, `0.0.0.0/8` and IPv6 forms that wrap a forbidden IPv4 address.
   `--allow` entries that can never work (`localhost`, loopback and link-local
   IPs) are rejected at startup.
+- The user's session services are hidden by default too, because their
+  sockets reach processes outside the network namespace: the session D-Bus
+  (`$DBUS_SESSION_BUS_ADDRESS`, `$XDG_RUNTIME_DIR/bus`; `busctl --user list`
+  worked from inside and `systemd-run --user` ran a command in the host's
+  network namespace), the systemd user manager, snapd, SSH and keyring agents
+  (`$SSH_AUTH_SOCK`), gpg-agent and dirmngr (a `gpg --recv-keys` inside reached
+  the network through the host's dirmngr), and more container runtimes
+  (rootless containerd and BuildKit, Docker Desktop, Colima, Rancher Desktop,
+  Lima, OrbStack, k3s, CRI-O, LXD, libvirt). Only sockets that exist are hidden,
+  without a message for the rest. `--allow-socket PATH` brings one back, and
+  `--dry-run`/`--inspect` list them. Display servers (X11, Wayland) and abstract
+  sockets are not hidden; see the README for why.
 
 ### Fixed
 
+- `--seal-docker` no longer prints a "not found, ignoring" warning for each
+  standard Docker socket that doesn't exist on the machine (it warned twice on
+  an ordinary host). Only a `--seal-docker-socket` path that can't be used is
+  reported, plus one line if no Docker socket was found at all.
 - The command no longer outlives nullroute: it gets SIGKILL when nullroute dies
   (`PR_SET_PDEATHSIG`), and whatever it leaves running when it exits (background
   jobs, daemons, even `setsid` ones) is killed before nullroute exits.

@@ -61,9 +61,11 @@ enum Cmd {
         #[arg(short, long = "port", value_name = "PORT", value_delimiter = ',', value_parser = clap::value_parser!(u16).range(1..))]
         ports: Vec<u16>,
 
-        /// Also hide this Unix socket (repeatable). Container-runtime sockets
-        /// (docker.sock, podman.sock, containerd, buildkit) and the system D-Bus
-        /// are hidden by default.
+        /// Also hide this Unix socket (repeatable), e.g. an X11 or Wayland
+        /// display socket or a local proxy. Container-runtime sockets, the
+        /// system and session D-Bus, the systemd user manager, snapd, SSH and
+        /// keyring agents ($SSH_AUTH_SOCK) and gpg-agent/dirmngr are hidden by
+        /// default (see --dry-run for the list on this machine).
         #[arg(long = "hide-socket", value_name = "PATH")]
         hide_sockets: Vec<std::path::PathBuf>,
 
@@ -71,7 +73,8 @@ enum Cmd {
         /// (repeatable). E.g. --allow-socket /var/run/docker.sock for tests that
         /// start containers; those containers will have network access. Or
         /// --allow-socket /run/dbus/system_bus_socket for the system D-Bus (which
-        /// can resolve names through systemd-resolved).
+        /// can resolve names through systemd-resolved), or --allow-socket
+        /// "$SSH_AUTH_SOCK" to let the command use your SSH agent.
         #[arg(long = "allow-socket", value_name = "PATH")]
         allow_sockets: Vec<std::path::PathBuf>,
 
@@ -230,11 +233,17 @@ fn main() -> ExitCode {
                 );
                 return ExitCode::from(2);
             }
-            let mut seal = seal_docker_sockets;
-            if seal_docker {
-                seal.extend(docker::docker_api_sockets());
-            }
-            let mut plan = match hide::plan(&hide_sockets, &allow_sockets, &seal) {
+            let seal_defaults = if seal_docker {
+                docker::docker_api_sockets()
+            } else {
+                Vec::new()
+            };
+            let mut plan = match hide::plan(
+                &hide_sockets,
+                &allow_sockets,
+                &seal_docker_sockets,
+                &seal_defaults,
+            ) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("nullroute: preparing socket hiding: {e}");
