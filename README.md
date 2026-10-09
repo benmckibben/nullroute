@@ -375,6 +375,39 @@ Not hidden, on purpose:
 - `$XDG_RUNTIME_DIR/systemd/notify` (readiness notifications only), PulseAudio
   and PipeWire, dconf.
 
+### Other ways out: seccomp and `no_new_privs`
+
+A few kernel interfaces reach outside the network namespace (or into the
+terminal you started the command from), and a command that is meant to have no
+network has no use for them. nullroute sets `no_new_privs` and installs a small
+seccomp filter before running the command. It denies, with an error and
+without killing the command:
+
+| Call | Result | Why |
+|---|---|---|
+| `socket(AF_VSOCK)` | `EAFNOSUPPORT` | a channel to the host or hypervisor on microVMs, WSL2, Hyper-V, Firecracker and Docker Desktop (it isn't scoped to the network namespace) |
+| `socket(AF_BLUETOOTH)`, `AF_NFC`, `AF_QIPCRTR` | `EAFNOSUPPORT` | hardware, also outside the namespace |
+| `ioctl(TIOCSTI)`, `ioctl(TIOCLINUX)` | `EPERM` | push input into the terminal the command was started from: on kernels with `dev.tty.legacy_tiocsti=1` that is typing into your shell |
+| `io_uring_setup()` | `EPERM` | io_uring can create sockets without `socket()`, so it would walk around the list above; programs already handle this error where `kernel.io_uring_disabled` is set |
+
+Everything else is allowed, including `AF_UNIX`, `AF_INET`, `AF_INET6`,
+`AF_NETLINK` and `AF_PACKET`. It is tested with bash, Python, Node, curl, git, the
+Docker CLI (`--seal-docker`), cargo and a nested nullroute; `ptrace` isn't filtered
+(strace and gdb should work, but weren't tried). It is not a syscall sandbox. On x86-64 the x32
+ABI fails with `ENOSYS` and 32-bit x86 programs can't use `socketcall()` (their
+direct `socket` calls are filtered like native ones); on AArch64 the 32-bit ARM
+mode is filtered the same way as the native one.
+
+`no_new_privs` means a setuid, setgid or file-capability binary can't raise
+privileges after exec. `sudo` and `su` never worked in the sandbox anyway (only
+your own id is mapped in the user namespace, so a root-owned setuid file has no
+effect); what changes is that a file capability (`cap_net_raw` on `ping` on some
+distributions) is no longer granted. A nested sandbox or helper inherits both
+settings. `nullroute run --dry-run -- true` and `--inspect` show them.
+
+`--no-seccomp` leaves the filter out, for the odd tool that needs one of these
+calls (`no_new_privs` stays set).
+
 ### Letting Docker tests run, with sealed containers
 
 `--seal-docker` is the middle ground between hiding docker.sock (the command
@@ -551,6 +584,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |
 | Allowlist (`--allow api.github.com,*.stripe.dev`) | ✅ HTTP(S) via proxy; any TCP client by host name via the DNS sinkhole (80/443 or `:port`) |
 | Allowlist for direct IP-literal connections | ❌ proxy only; raw connects to an IP fail with `ENETUNREACH` |
+| Deny AF_VSOCK/Bluetooth/NFC sockets, TIOCSTI and io_uring (seccomp, `no_new_privs`) | ✅ on by default; `--no-seccomp` turns the filter off |
 | Report what was blocked (+ `--strict`, `--report-json`) | ✅ proxy, DNS and socket blocks; not direct IP connects |
 | Show the sandbox topology (`--inspect`) | ✅ namespaces, loopback, ports, sockets, proxy, DNS sinkhole |
 | macOS | ❌ no network namespaces; needs a different mechanism |
@@ -595,7 +629,9 @@ See [SECURITY.md](SECURITY.md) for how to report a way around the isolation.
    needed) plus a new network namespace, which starts with only a loopback device.
 2. Maps your real uid/gid into the user namespace, so tools don't think they're root.
 3. Brings `lo` up (it starts down).
-4. `exec`s your command. Run as an ordinary user (not root), it holds no
+4. Sets `no_new_privs` and installs the seccomp filter (see above), after the
+   last socket and ioctl that setup itself needs.
+5. `exec`s your command. Run as an ordinary user (not root), it holds no
    capabilities after exec, so it can't add interfaces, change routes, or create
    another namespace to get out.
 

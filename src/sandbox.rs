@@ -7,6 +7,7 @@
 //!    - map our real uid/gid into the user namespace, so the command still runs
 //!      as "you", not as a fake root.
 //!    - bring `lo` up (it starts DOWN), so 127.0.0.1 works inside.
+//!    - set no_new_privs and install a small seccomp filter (seccomp.rs).
 //! 2. exec the command. It keeps no capabilities after exec (it isn't root in
 //!    the namespace), so it can't add interfaces or routes to get back out.
 //!
@@ -27,7 +28,7 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
 
 use crate::report::Report;
-use crate::{dns, forward, hide, lifecycle, proxy, signals};
+use crate::{dns, forward, hide, lifecycle, proxy, seccomp, signals};
 use std::sync::Arc;
 
 /// What a listener created inside the sandbox is for.
@@ -46,6 +47,7 @@ pub fn run_hermetic(
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
     dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
+    use_seccomp: bool,
 ) -> io::Result<ExitStatus> {
     let (program, args) = argv
         .split_first()
@@ -109,6 +111,12 @@ pub fn run_hermetic(
         None
     };
     let flags = namespace_flags(need_mount_ns);
+    // Built here because building allocates; the child only installs it.
+    let seccomp_filter = if use_seccomp {
+        seccomp::Filter::new()
+    } else {
+        None
+    };
     let pool_address = dns.is_some();
 
     // From here until the handlers are installed, SIGINT/SIGQUIT/SIGTERM/SIGHUP
@@ -161,6 +169,12 @@ pub fn run_hermetic(
                 }
                 // Re-arm after the user-namespace credential change (lifecycle.rs).
                 lifecycle::die_with_parent(parent)?;
+                // After the last socket and ioctl the setup itself needs (the
+                // filter denies some of them), before the command exists.
+                match seccomp_filter.as_ref() {
+                    Some(f) => f.install()?,
+                    None => seccomp::set_no_new_privs()?,
+                }
                 // Last: unblock, so nothing is delivered before setup is done. A
                 // SIGINT/SIGQUIT that reached only nullroute is passed on here.
                 child_mask.restore(parent_status)?;

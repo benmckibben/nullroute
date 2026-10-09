@@ -97,6 +97,17 @@ Findings from a security review of the first version, all fixed before release:
   `--dry-run`/`--inspect` list them. Display servers (X11, Wayland) and abstract
   sockets are not hidden; see the README for why.
 
+- The command runs with `no_new_privs` and a small seccomp filter (x86-64 and
+  AArch64): `socket()` with `AF_VSOCK` (a side channel to the hypervisor or host
+  on microVMs, WSL2, Hyper-V, Firecracker and Docker Desktop), `AF_BLUETOOTH`,
+  `AF_NFC` or `AF_QIPCRTR` fails with `EAFNOSUPPORT`; `ioctl(TIOCSTI)` and
+  `ioctl(TIOCLINUX)`, which inject input into the terminal the command was
+  started from, fail with `EPERM` (on kernels with `dev.tty.legacy_tiocsti=1`
+  that was typing into the parent shell); `io_uring_setup()` fails with `EPERM`,
+  because io_uring can create sockets without `socket()`. Nothing else is
+  filtered. `--no-seccomp` turns the filter off; `no_new_privs` stays. See the
+  README for the effect on setuid and file-capability binaries.
+
 ### Fixed
 
 - `--seal-docker` no longer prints a "not found, ignoring" warning for each

@@ -30,6 +30,8 @@ mod report;
 #[cfg(target_os = "linux")]
 mod sandbox;
 #[cfg(target_os = "linux")]
+mod seccomp;
+#[cfg(target_os = "linux")]
 mod signals;
 
 use clap::{Parser, Subcommand};
@@ -138,6 +140,13 @@ enum Cmd {
         #[arg(long, value_name = "FILE")]
         report_json: Option<std::path::PathBuf>,
 
+        /// Don't install the seccomp filter (no_new_privs is still set). By
+        /// default the command can't open AF_VSOCK, Bluetooth, NFC or QIPCRTR
+        /// sockets, can't use io_uring or the TIOCSTI/TIOCLINUX terminal
+        /// ioctls (all fail with an error). Use this for a tool that needs one.
+        #[arg(long = "no-seccomp")]
+        no_seccomp: bool,
+
         /// Print what would be hidden, forwarded and allowed, then exit.
         #[arg(long)]
         dry_run: bool,
@@ -171,6 +180,7 @@ fn main() -> ExitCode {
             strict,
             quiet,
             report_json,
+            no_seccomp,
             dry_run,
             inspect,
             argv,
@@ -271,6 +281,7 @@ fn main() -> ExitCode {
                         &dns::bypass_targets(),
                     )
                     .with_docker_pulls(pulls)
+                    .with_seccomp(!no_seccomp)
                     .render()
                 );
             }
@@ -294,6 +305,7 @@ fn main() -> ExitCode {
                         }
                     }
                 }
+                println!("seccomp: {}", inspect::hardening(!no_seccomp));
                 for p in &ports {
                     println!("forwarded port: {p}");
                 }
@@ -322,6 +334,7 @@ fn main() -> ExitCode {
             let opts = RunOpts {
                 strict,
                 report_json,
+                seccomp: !no_seccomp,
             };
             run(
                 &argv,
@@ -348,6 +361,8 @@ const EXIT_REPORT_WRITE_FAILED: i32 = 74;
 struct RunOpts {
     strict: bool,
     report_json: Option<std::path::PathBuf>,
+    /// Install the seccomp filter (no --no-seccomp).
+    seccomp: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -360,7 +375,7 @@ fn run(
     report: &std::sync::Arc<report::Report>,
     opts: &RunOpts,
 ) -> ExitCode {
-    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report) {
+    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, opts.seccomp) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("nullroute: failed to run {:?}: {e}", argv[0]);
