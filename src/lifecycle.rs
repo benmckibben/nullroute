@@ -53,6 +53,14 @@ pub fn die_with_parent(parent: libc::pid_t) -> io::Result<()> {
     Ok(())
 }
 
+/// How many threads this process has, from /proc/self/task; None if that
+/// can't be read. nullroute starts its worker threads only after the command
+/// has been forked, so before that it must be 1: the child of a fork in a
+/// multi-threaded process may only call async-signal-safe functions.
+pub fn thread_count() -> Option<usize> {
+    Some(std::fs::read_dir("/proc/self/task").ok()?.count())
+}
+
 /// Make nullroute the reaper of whatever the command orphans, so
 /// [`kill_leftovers`] can find it. Call before spawning. Best effort.
 pub fn become_subreaper() {
@@ -121,4 +129,21 @@ fn children() -> Vec<libc::pid_t> {
 pub fn on_main_thread() -> bool {
     // SAFETY: gettid/getpid have no preconditions.
     unsafe { libc::syscall(libc::SYS_gettid) == libc::getpid() as libc::c_long }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thread_count_sees_other_threads() {
+        let (stop, hold) = std::sync::mpsc::channel::<()>();
+        let before = thread_count().unwrap();
+        let t = std::thread::spawn(move || {
+            let _ = hold.recv();
+        });
+        assert!(thread_count().unwrap() > before);
+        drop(stop);
+        t.join().unwrap();
+    }
 }

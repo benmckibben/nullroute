@@ -139,6 +139,10 @@ pub fn run_hermetic(
     let parent = unsafe { libc::getpid() };
     // A bystander in our process group, to tell group-directed signals from
     // pid-directed ones (signals.rs). Forked while we are still single-threaded.
+    debug_assert!(
+        lifecycle::thread_count().is_none_or(|n| n == 1),
+        "nullroute must still be single-threaded when it forks"
+    );
     let sentinel = blocked.spawn_sentinel(parent);
 
     let mut cmd = Command::new(program);
@@ -146,8 +150,13 @@ pub fn run_hermetic(
     if let Some((pp, _)) = &proxy {
         cmd.envs(proxy::env_vars(*pp));
     }
-    // SAFETY: the closure only makes raw syscalls (no allocation, no locks),
-    // which is what pre_exec requires.
+    // SAFETY: pre_exec runs between fork and exec, where only async-signal-safe
+    // operations are allowed. The closure and everything it calls make raw
+    // syscalls on memory prepared before the fork: no allocation (errors are
+    // io::Error::last_os_error / from_raw_os_error, which don't box), no locks,
+    // no std I/O. tests/pre_exec_hygiene.rs checks the functions on this path
+    // for allocating constructs. The sentinel's fork (signals.rs) is made while
+    // nullroute still has a single thread, and the debug_assert above checks it.
     unsafe {
         cmd.pre_exec(move || {
             let mut setup = || -> io::Result<()> {

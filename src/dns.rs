@@ -592,7 +592,9 @@ pub fn add_pool_address() -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             if n < 20 || u16::from_ne_bytes([ack[4], ack[5]]) != NLMSG_ERROR {
-                return Err(io::Error::other("unexpected rtnetlink reply"));
+                // from_raw_os_error, not io::Error::other: this runs in the forked
+                // child, where nothing may allocate.
+                return Err(io::Error::from_raw_os_error(libc::EPROTO));
             }
             match i32::from_ne_bytes([ack[16], ack[17], ack[18], ack[19]]) {
                 0 => Ok(()),
