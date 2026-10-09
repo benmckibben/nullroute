@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "command": ["sh", "-c", "echo \"hi\"\u0009there \\ é"],
+  "exit_code": 1,
+  "strict_failed": true,
+  "blocked": [
+    {"kind": "socket", "target": "/run/docker.sock", "reason": "container runtimes can start containers with full network access", "count": 1},
+    {"kind": "proxy", "target": "api.github.com:443", "reason": "not in --allow", "count": 1},
+    {"kind": "docker", "target": "networks/connect", "reason": "refused", "count": 1},
+    {"kind": "dns", "target": "evil.example", "reason": "not in --allow", "count": 2}
+  ],
+  "rewritten": [
+    {"kind": "rewritten", "target": "containers/create", "reason": "forced NetworkMode=none", "count": 1}
+  ]
+}

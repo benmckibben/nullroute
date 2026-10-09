@@ -247,10 +247,11 @@ CLI reconnects).
 |---|---|
 | `--strict` | Exit 1 if anything was blocked, even if the command succeeded. Catches tests that swallow network errors, as long as the attempt reaches nullroute: DNS lookups (with or without `--allow`), proxy requests and hidden sockets do; a connection straight to an IP address does not (see below). A command that already failed keeps its own exit code. `rewritten` entries don't count, so `--strict --seal-docker` passes when the command only starts (sealed) containers or runs (sealed) classic builds. |
 | `-q`, `--quiet` | Skip the live lines; keep the summary. |
-| `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
+| `--report-json FILE` | Write the report as JSON for CI artifacts (always written, `"blocked": []` and `"rewritten": []` when clean; layout and compatibility rules in [docs/report-json.md](docs/report-json.md)). The file is checked before the command runs: if it can't be written (missing directory, a directory, no permission) nullroute exits 2 without running anything. If writing still fails at the end, a run that would have exited 0 exits 74 instead; a non-zero exit is kept. |
 
 ```json
 {
+  "schema_version": 1,
   "command": ["docker", "run", "--rm", "alpine", "true"],
   "exit_code": 0,
   "strict_failed": false,
@@ -274,7 +275,9 @@ CLI reconnects).
 | `127` | the command was not found |
 
 The command can exit with any of these itself, so they only mean something when
-the command isn't known to use them. (Like Docker: `125` for "the runner failed", `126` and `127` for the
+the command isn't known to use them. In particular a `1` is either the command's
+own or `--strict`'s: with `--report-json`, `"strict_failed": true` says that
+nullroute turned a success into `1` (see [docs/report-json.md](docs/report-json.md)). (Like Docker: `125` for "the runner failed", `126` and `127` for the
 contained command that couldn't be invoked or found. Usage errors are `2`, as
 for most CLIs.)
 

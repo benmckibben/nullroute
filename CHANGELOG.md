@@ -43,7 +43,8 @@ will contain.
 - Report of everything that was blocked, printed live and as a summary;
   `--strict` (fail if anything was blocked), `--quiet`, and `--report-json FILE`
   (including a separate `rewritten` list for requests `--seal-docker` changed
-  and let through).
+  and let through). The file starts with `"schema_version": 1` and its layout
+  is documented in `docs/report-json.md` and pinned by golden-file tests.
 - DNS lookups are recorded in every run, with or without `--allow`: the
   sandbox's resolver answers `NXDOMAIN` for any name that isn't allowed, so
   `--strict` catches a command that looks a name up and swallows the error. A

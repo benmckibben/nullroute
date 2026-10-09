@@ -376,3 +376,27 @@ fn sigterm_is_forwarded_to_the_command() {
     assert_eq!(status.code(), Some(42));
     let _ = std::io::stdout().flush();
 }
+
+#[test]
+fn report_json_of_a_real_run_matches_the_golden_file() {
+    // Same layout contract as the unit golden in report.rs, through the real
+    // binary: a strict run whose command swallows three lookups of two names.
+    let t = Tmp::new("json-golden");
+    let out = t.0.join("r.json");
+    let script = "import socket\nfor n in ('a.nr.test', 'b.nr.test', 'a.nr.test'):\n    try:\n        socket.getaddrinfo(n, 80, socket.AF_INET)\n    except OSError:\n        pass";
+    let o = nr(
+        &[
+            "--strict",
+            "--report-json",
+            out.to_str().unwrap(),
+            "--",
+            "python3",
+            "-c",
+            script,
+        ],
+        &t,
+    );
+    assert_eq!(o.status.code(), Some(1), "{o:?}");
+    let got = std::fs::read_to_string(&out).unwrap();
+    assert_eq!(got, include_str!("golden/report-dns.json"), "{got}");
+}
