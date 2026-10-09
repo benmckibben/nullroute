@@ -1,7 +1,26 @@
 //! --seal-docker: the command can use Docker, but containers it starts get no
-//! network. Skipped when there's no reachable Docker daemon or no alpine image.
+//! network. A test that finds no reachable Docker daemon or no alpine image
+//! can't test anything: it says so loudly ("SKIPPED ..."), and with
+//! NULLROUTE_REQUIRE_DOCKER set (CI does) it fails instead. A test that does
+//! run prints a "docker-test-ran: NAME" line; CI counts them and compares with
+//! the number of tests that use have_alpine(), so a skip can't hide.
 
 use std::process::{Command, Output};
+
+/// What a Docker test can't do without: skip loudly, or fail if Docker was
+/// declared mandatory.
+fn unavailable(what: &str) -> bool {
+    let test = std::thread::current().name().unwrap_or("?").to_string();
+    if std::env::var_os("NULLROUTE_REQUIRE_DOCKER").is_some() {
+        panic!("{test}: {what}, but NULLROUTE_REQUIRE_DOCKER is set");
+    }
+    eprintln!(
+        "
+!!! SKIPPED {test}: {what}. This test did not test anything. !!!
+"
+    );
+    false
+}
 
 fn docker_ok() -> bool {
     Command::new("docker")
@@ -9,14 +28,22 @@ fn docker_ok() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+        || unavailable("no reachable Docker daemon")
 }
 
 fn have_alpine() -> bool {
-    Command::new("docker")
+    let present = Command::new("docker")
         .args(["image", "inspect", "alpine"])
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if present {
+        println!(
+            "docker-test-ran: {}",
+            std::thread::current().name().unwrap_or("?")
+        );
+    }
+    present || unavailable("no alpine image (docker pull alpine)")
 }
 
 fn nr(args: &[&str]) -> Output {
@@ -250,6 +277,7 @@ fn have_buildx() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+        || unavailable("no docker buildx")
 }
 
 /// A build context whose RUN step reports whether it had network.

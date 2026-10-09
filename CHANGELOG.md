@@ -118,7 +118,7 @@ Findings from a security review of the first version, all fixed before release:
   are removed as soon as the command has started, and what a kill during the
   few milliseconds of setup leaves is swept by the next run (only directories of
   the current user, over a minute old, that no running nullroute holds a lock
-  on). `--dry-run` and `--inspect` no longer create them at all.
+  on). `--dry-run` no longer creates them at all.
 - nullroute no longer lets a command make it grow without bound: at most 256
   connections are relayed at once per `--port` / proxy / DNS-bridge listener (64
   for DNS over TCP, which also gets a 30 s lifetime and 64 queries per

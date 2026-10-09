@@ -237,7 +237,15 @@ and hidden sockets are listed.
 **Signals and process lifetime.** Ctrl-C reaches the command as usual; nullroute
 itself ignores SIGINT/SIGQUIT so it can still print the report, then exits with
 the command's status (130). SIGTERM and SIGHUP sent to nullroute are forwarded
-to the command, also when they arrive while the command is still starting. A
+to the command, also when they arrive while the command is still starting, and
+the command gets each exactly once: a signal sent to nullroute's pid
+(`kill -TERM PID`) is forwarded, while one sent to the whole process group
+(`kill -TERM -PGID`, `timeout`), which already reaches the command because it
+is in the group, is not forwarded again. (nullroute tells the two apart with a
+small helper process of its own in the group; if that can't be started, signals
+are forwarded unconditionally. A command that moved to another group always gets
+the forwarded copy.) The signal is also never sent to the command's pid once it
+has exited and been reaped. A
 SIGINT/SIGQUIT that reaches nullroute before the command exists (Ctrl-C right
 after you hit enter) is passed on to it as well: it stops the command before it
 runs, instead of vanishing while the command runs on. The command never outlives
@@ -251,6 +259,25 @@ signal only covers direct children), and a command that is itself a set-user-ID
 or file-capability binary (`ping` on many distros) survives too, because exec
 clears the setting. Send nullroute SIGTERM first (as `timeout` and CI runners
 do) so it can clean up.
+
+**Scratch files.** The decoy sockets and the generated resolver files are
+bind-mounted into the sandbox from a private directory in the temp dir
+(`nullroute-*`, `nullroute-dns-*`). It is removed as soon as the command has
+started, so a killed or crashed nullroute leaves nothing behind; what a kill
+during the few milliseconds of setup leaves is swept by the next run (only
+directories of the current user, over a minute old, that no running nullroute
+has locked). `--dry-run` (with or without `--inspect`) creates nothing.
+
+**Limits.** nullroute relays at most 256 connections at a time per
+`--port` / proxy / DNS-bridge listener (64 for DNS over TCP, 32 for socket
+decoys); one more is closed immediately. DNS-over-TCP connections last at most
+30 s, and name lookups for the proxy give up after 10 s. The report lists at
+most 1000 distinct targets and the terminal gets at most 20 live lines per
+second; the summary says how many more attempts were counted ("... and N more
+attempts at other targets"), they still make `--strict` fail, and
+`--report-json` gets a `not_listed` object with the counts. nullroute raises its
+own soft file-descriptor limit to the hard limit while it runs; the command
+gets the soft limit it was started with.
 
 ## Seeing the sandbox: `--inspect`
 
