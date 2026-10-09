@@ -19,7 +19,7 @@ will contain.
   must follow `--`; an unknown option before it is a usage error (exit 2).
   `--dry-run | head` ends quietly by SIGPIPE instead of panicking.
 - `--port`: bridge chosen ports of the host's localhost into the sandbox
-  (TCP, IPv4 and IPv6).
+  (TCP, IPv4 and IPv6). At most 64; more is a usage error (exit 2).
 - `--allow`: let chosen hosts through (`host`, `*.domain`, IP literals, optional
   `:port`) via an HTTP(S) proxy (`HTTP_PROXY` and friends) and, for clients that
   ignore proxy variables, a DNS sinkhole with a transparent TCP relay on
