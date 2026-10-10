@@ -240,5 +240,40 @@ Hardening that the first release ships with:
   only starts sealed containers.
 - musl targets build (the `ioctl` request type differs from glibc).
 
+### Known limitations
+
+What 0.1.0 does not do, and what nobody has checked. The README's `What
+nullroute is not` section has the detail; this is the short version.
+
+- **It stops accidental network access; it is not a boundary for hostile code.**
+  The command sees your filesystem and credentials and runs as you. Run as root
+  it keeps its capabilities and can unmount the socket decoys. A socket the
+  parent opened before starting it keeps working inside. Anything you open with
+  `--port`, `--allow`, `--allow-socket` or a Docker socket is open to the
+  command.
+- **`no_new_privs` is on by default.** A program that needs a file capability
+  through a second exec (`ping` started by `sh -c`, on Debian and Ubuntu) fails;
+  `--allow-new-privs` turns that off, and `--no-seccomp` does not.
+- **Tested on x86_64 only.** CI runs the test suite on Ubuntu 24.04 (x86_64,
+  glibc and musl). The aarch64 targets are compiled and linted, not run. The
+  development host was a WSL2 kernel. Other distributions and kernels are
+  untested.
+- **Never exercised:**
+  - `AF_VSOCK` on a host that really has vsock: the tests check that creating
+    the socket is refused, not what could have been sent over it;
+  - a kernel where `TIOCSTI` is still enabled (`dev.tty.legacy_tiocsti=1`),
+    where the denial matters most;
+  - rootless Docker, Docker Desktop, Podman and the other runtimes whose socket
+    paths are hidden or sealed: `--seal-docker` was run against a classic
+    local Docker daemon only;
+  - a real failure to start a connection thread (`EAGAIN`): the code drops that
+    connection instead of crashing, but nothing has provoked it;
+  - Go programs under the sandbox (the README example uses `go test`; Go's
+    resolver retry behaviour has not been run here).
+- **Linux only.** No macOS support; it needs unprivileged user namespaces
+  (Ubuntu 23.10+ restricts them through AppArmor by default).
+- **No external security review.** The code had an internal review and fixes
+  before this release, which is not the same thing.
+
 [Unreleased]: https://github.com/benmckibben/nullroute/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/benmckibben/nullroute/releases/tag/v0.1.0
