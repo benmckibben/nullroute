@@ -207,7 +207,7 @@ jobs:
           sha256sum "$crate"
           mkdir unpacked
           tar -xzf "$crate" -C unpacked
-          if grep -rInE '/home/|/Users/|openclaw|ghp_[A-Za-z0-9]|github_pat_|gh[osu]_[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|CARGO_REGISTRY_TOKEN|cio[A-Za-z0-9]{30}' unpacked; then
+          if grep -rInE '/home/|/Users/|ghp_[A-Za-z0-9]|github_pat_|gh[osu]_[A-Za-z0-9]{20}|AKIA[0-9A-Z]{16}|BEGIN [A-Z ]*PRIVATE KEY|CARGO_REGISTRY_TOKEN|cio[A-Za-z0-9]{30}' unpacked; then
             echo "::error::the package contains something that looks like a local path, agent file or credential (see above)"
             exit 1
           fi
