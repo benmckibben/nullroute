@@ -29,6 +29,17 @@ processes or the credentials of the command (see [What nullroute is
 not](#what-nullroute-is-not)).
 The exit code is passed through, so it drops into CI unchanged.
 
+> **Warning: sockets the caller already has open still work inside.** A socket
+> is tied to the network namespace it was created in, not to whoever holds it.
+> If the process that starts nullroute has a connected socket open and didn't
+> mark it close-on-exec (a connection a CI agent keeps, a listener a supervisor
+> hands down, a test harness's helper), the command inherits it and can send
+> and receive over it, whatever the sealed namespace says. nullroute prints a
+> `warning: fd N is a socket inherited from the caller` line for each one it
+> finds when it starts a run; it does not close them. Start it from a process
+> that hasn't opened network connections for it, or close the descriptor or set
+> `FD_CLOEXEC` on it first. See [What nullroute is not](#what-nullroute-is-not).
+
 ## Installing
 
 Rust 1.88 or newer, Linux only (see [Requirements](#requirements)):
@@ -782,8 +793,17 @@ protected:
   after the command starts aren't hidden either.
 - **File descriptors the command inherits.** A socket that nullroute's parent
   opened before starting it (and left inheritable) belongs to the host's
-  network namespace and keeps working inside the sandbox. Start nullroute from a
-  shell or CI step that hasn't opened network connections for it.
+  network namespace and keeps working inside the sandbox: the command can use it
+  to send and receive, to whatever it is connected to. This is ordinary
+  fork/exec behaviour. nullroute warns about each such socket on stderr
+  (`warning: fd N is a socket inherited from the caller`, with the address
+  family; up to five are named) and leaves it open. Start nullroute from a shell
+  or CI step that hasn't opened network connections for it, or close the
+  descriptor or mark it close-on-exec first. It looks at sockets only: an
+  inherited file or pipe is not a network path, though it may reach something
+  else you didn't intend. Closing inherited sockets by default (with an opt-out
+  for programs that pass sockets on purpose) is proposed in
+  [the design note](docs/design/running-as-root.md) and not done.
 - **Running nullroute as root.** The sandbox assumes an unprivileged user. As
   uid 0 the command is root inside its own namespaces, keeps its capabilities,
   and can unmount the socket decoys and masks (it still can't reach the host's

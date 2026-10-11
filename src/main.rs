@@ -24,6 +24,8 @@ mod forward;
 #[cfg(target_os = "linux")]
 mod hide;
 #[cfg(target_os = "linux")]
+mod inherited;
+#[cfg(target_os = "linux")]
 mod inspect;
 #[cfg(target_os = "linux")]
 mod lifecycle;
@@ -424,6 +426,9 @@ fn main() -> ExitCode {
                         ExitCode::from(EXIT_OUTPUT_FAILED as u8)
                     }
                 };
+            }
+            for w in inherited::warnings(&inherited::sockets()) {
+                diagln!("{w}");
             }
             let report = report::Report::new(quiet);
             let proxy = (!allowlist.is_empty()).then(|| {

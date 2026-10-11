@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escalated. Checked with a command that traps TERM and has a background child:
   killed after the delay, the child cleaned up, exit status 137; a command that
   exits within the delay is left alone.
+- A `warning: fd N is a socket inherited from the caller (...)` line on stderr,
+  for each socket (up to five, then a count) that nullroute starts with open and
+  not close-on-exec. Such a socket is inherited by the command and keeps working
+  inside the sandbox, so a caller that had a connection open could hand the
+  command a way out. Nothing is closed and the run goes on; `--dry-run` doesn't
+  warn. The README now says so near the top. Checked by passing a unix and a
+  TCP socket down to nullroute (named, run unchanged), a close-on-exec socket
+  and a clean start (no warning).
 
 ## [0.1.0] - 2026-10-09
 
