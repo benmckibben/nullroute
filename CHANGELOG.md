@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `--kill-after SECS`: SIGKILL the command SECS seconds after the first SIGTERM
+  or SIGHUP that reaches nullroute, if it is still running. Without the flag
+  nothing changes: nullroute forwards the signal once and waits for as long as
+  the command runs, so a command that ignores SIGTERM keeps it (and a CI job)
+  waiting; this is now said in the README. SIGINT and SIGQUIT are not
+  escalated. Checked with a command that traps TERM and has a background child:
+  killed after the delay, the child cleaned up, exit status 137; a command that
+  exits within the delay is left alone.
+
 ## [0.1.0] - 2026-10-09
 
 The first release.

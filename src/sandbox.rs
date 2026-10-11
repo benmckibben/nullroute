@@ -26,6 +26,7 @@
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, ExitStatus};
+use std::time::Duration;
 
 use crate::report::Report;
 use crate::{diagln, dns, forward, hide, lifecycle, limits, proxy, seccomp, signals};
@@ -38,6 +39,17 @@ enum Role {
     Dns(dns::Listener),
 }
 
+/// How the command is run, apart from what it is allowed to reach.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RunOptions {
+    /// Which of the seccomp filter and `no_new_privs` to apply (`--no-seccomp`,
+    /// `--allow-new-privs`).
+    pub hardening: seccomp::Hardening,
+    /// SIGKILL the command this long after a SIGTERM / SIGHUP reached nullroute
+    /// if it is still running (`--kill-after`); None: wait for it indefinitely.
+    pub kill_after: Option<Duration>,
+}
+
 /// Run `argv` inside a hermetic network namespace and wait for it. Each port in
 /// `ports` is bridged from the sandbox's localhost to the host's.
 pub fn run_hermetic(
@@ -47,8 +59,12 @@ pub fn run_hermetic(
     proxy: Option<(u16, Arc<proxy::Proxy>)>,
     dns: Option<&Arc<dns::Sinkhole>>,
     report: &Arc<Report>,
-    hardening: seccomp::Hardening,
+    options: RunOptions,
 ) -> io::Result<ExitStatus> {
+    let RunOptions {
+        hardening,
+        kill_after,
+    } = options;
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no command given"))?;
@@ -240,7 +256,7 @@ pub fn run_hermetic(
     // the child's socket end.
     drop(cmd);
     let mut child = spawned?;
-    let fwd = match blocked.start(child.id(), sentinel) {
+    let fwd = match blocked.start(child.id(), sentinel, kill_after) {
         Ok(f) => f,
         Err(e) => {
             let _ = child.kill();
