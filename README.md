@@ -317,7 +317,14 @@ is in the group, is not forwarded again. (nullroute tells the two apart with a
 small helper process of its own in the group; if that can't be started, signals
 are forwarded unconditionally. A command that moved to another group always gets
 the forwarded copy.) The signal is also never sent to the command's pid once it
-has exited and been reaped. A
+has exited and been reaped.
+nullroute never escalates on its own: a command that ignores SIGTERM (`trap '' TERM`)
+is sent it once, and nullroute then waits for as long as the command runs, as
+`timeout` does without `-k`, so a CI job can hang until its own limit.
+`--kill-after SECS` is the opt-in fix: SECS seconds after the first SIGTERM or
+SIGHUP reaches nullroute (the timer isn't restarted by later signals), a command
+that is still running gets SIGKILL. nullroute then cleans up as usual and exits
+with 137, the command's status. SIGINT and SIGQUIT are not escalated. A
 SIGINT/SIGQUIT that reaches nullroute before the command exists (Ctrl-C right
 after you hit enter) is passed on to it as well: it stops the command before it
 runs, instead of vanishing while the command runs on. The command never outlives
@@ -434,6 +441,7 @@ sandbox. So, also by default:
 | `--dry-run` | Print what would be hidden, masked, forwarded and allowed (hidden and sealed sockets, masked resolver sockets, the seccomp filter, forwarded ports, allowed hosts, the DNS resolver or sinkhole mapping, the namespaces), then exit. It validates the options and the listener / file-descriptor budget exactly as a real run does (a configuration that would fail with "too many listeners" fails here too, exit 125), but it does **not** start anything: it can't tell you that user namespaces are disabled, that a port is free, or that the command exists. |
 | `--check-sandbox` | With `--dry-run`: also check that this machine lets nullroute create the user, network and mount namespaces (a throw-away process does the real setup and exits; nothing is left behind). Exit 125 with the same message a real run would give if it can't. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
+| `--kill-after SECS` | SIGKILL the command SECS seconds (1 to 86400) after a SIGTERM or SIGHUP reached nullroute, if it is still running. Without it a command that ignores SIGTERM keeps nullroute waiting. |
 
 ### The user's session: D-Bus, systemd, snapd, agents
 
