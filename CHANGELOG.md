@@ -7,36 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- The WSL interop socket (`/run/WSL/*_interop`, and wherever `$WSL_INTEROP`
-  points) is hidden by default, like the other sockets that start things outside
-  the sandbox. Interop starts Windows programs, which are not bound by the
-  sandbox's network namespace. A connection to it now gets the decoy and is
-  reported. Checked on a WSL2 host that has the socket (the decoy answers
-  `403` for `/run/WSL/2_interop` and the `1_interop` symlink to it); not
-  checked: that a Windows program started through it really has network access
-  (there is no Windows drive on that host).
-
-### Added
-
-- `--kill-after SECS`: SIGKILL the command SECS seconds after the first SIGTERM
-  or SIGHUP that reaches nullroute, if it is still running. Without the flag
-  nothing changes: nullroute forwards the signal once and waits for as long as
-  the command runs, so a command that ignores SIGTERM keeps it (and a CI job)
-  waiting; this is now said in the README. SIGINT and SIGQUIT are not
-  escalated. Checked with a command that traps TERM and has a background child:
-  killed after the delay, the child cleaned up, exit status 137; a command that
-  exits within the delay is left alone.
-- A `warning: fd N is a socket inherited from the caller (...)` line on stderr,
-  for each socket (up to five, then a count) that nullroute starts with open and
-  not close-on-exec. Such a socket is inherited by the command and keeps working
-  inside the sandbox, so a caller that had a connection open could hand the
-  command a way out. Nothing is closed and the run goes on; `--dry-run` doesn't
-  warn. The README now says so near the top. Checked by passing a unix and a
-  TCP socket down to nullroute (named, run unchanged), a close-on-exec socket
-  and a clean start (no warning).
-
 ## [0.1.0] - 2026-10-09
 
 The first release.
@@ -113,6 +83,22 @@ The first release.
   and each example prints an `examples: <name>: N assertions run, M skipped`
   summary; CI runs examples 01 and 03 this way, plus `shellcheck`.
 
+- `--kill-after SECS`: SIGKILL the command SECS seconds (1 to 86400) after the
+  first SIGTERM or SIGHUP that reaches nullroute, if it is still running. Without
+  the flag nullroute forwards the signal once and waits for as long as the
+  command runs, as `timeout` does without `-k`, so a command that ignores
+  SIGTERM keeps nullroute (and a CI job) waiting. SIGINT and SIGQUIT are not
+  escalated. Checked with a command that traps TERM and has a background child:
+  killed after the delay, the child cleaned up, exit status 137; a command that
+  exits within the delay is left alone.
+- A `warning: fd N is a socket inherited from the caller (...)` line on stderr
+  for each socket (up to five, then a count) that nullroute starts with open and
+  not close-on-exec. Such a socket is inherited by the command and keeps working
+  inside the sandbox, so a caller that had a connection open could hand the
+  command a way out. Nothing is closed and the run goes on; `--dry-run` doesn't
+  warn. Checked by passing a unix and a TCP socket down to nullroute (named, run
+  unchanged), a close-on-exec socket and a clean start (no warning).
+
 ### Security
 
 Hardening that the first release ships with:
@@ -180,6 +166,15 @@ Hardening that the first release ships with:
   network (`NetworkMode: none`): the ones created through the sandbox, in this
   or an earlier run, still work. Reads (`inspect`, `logs`, `ps`, `cp` out) are
   unaffected. `--seal-docker-allow-existing` opts out and unseals them.
+
+- The WSL interop socket (`/run/WSL/*_interop`, and wherever `$WSL_INTEROP`
+  points) is hidden by default too: interop starts Windows programs, which are
+  not bound by the sandbox's network namespace. A connection to it gets the decoy
+  and is reported. Checked on a WSL2 host that has the socket (the decoy answers
+  `403` for `/run/WSL/2_interop` and the `1_interop` symlink to it); not
+  checked: that a Windows program started through it really has network access
+  (there is no Windows drive on that host).
+
 
 ### Fixed
 
@@ -278,9 +273,13 @@ nullroute is not` section has the detail; this is the short version.
 - **It stops accidental network access; it is not a boundary for hostile code.**
   The command sees your filesystem and credentials and runs as you. Run as root
   it keeps its capabilities and can unmount the socket decoys. A socket the
-  parent opened before starting it keeps working inside. Anything you open with
+  parent opened before starting it keeps working inside (nullroute warns about
+  each one at start-up and leaves it open). Anything you open with
   `--port`, `--allow`, `--allow-socket` or a Docker socket is open to the
   command.
+- **A command that ignores SIGTERM keeps nullroute waiting.** nullroute forwards
+  the signal once and never escalates on its own; `--kill-after SECS` is the
+  opt-in SIGKILL.
 - **`no_new_privs` is on by default.** A program that needs a file capability
   through a second exec (`ping` started by `sh -c`, on Debian and Ubuntu) fails;
   `--allow-new-privs` turns that off, and `--no-seccomp` does not.
@@ -298,6 +297,8 @@ nullroute is not` section has the detail; this is the short version.
     local Docker daemon only;
   - a real failure to start a connection thread (`EAGAIN`): the code drops that
     connection instead of crashing, but nothing has provoked it;
+  - a Windows program started through the WSL interop socket (it is hidden;
+    nobody tried to start one without the decoy);
   - Go programs under the sandbox (the README example uses `go test`; Go's
     resolver retry behaviour has not been run here).
 - **Linux only.** No macOS support; it needs unprivileged user namespaces
