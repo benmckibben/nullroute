@@ -65,6 +65,7 @@ fn run(root: &TmpDir, envs: &[(&str, String)], args: &[&str]) -> Output {
         "SSH_AUTH_SOCK",
         "GNUPGHOME",
         "DOCKER_HOST",
+        "WSL_INTEROP",
     ] {
         c.env_remove(k);
     }
@@ -133,7 +134,10 @@ fn session_sockets_are_hidden_inside_and_reachable_outside() {
     let bus = t.path("elsewhere/custom-bus");
     cases.push(("$SSH_AUTH_SOCK", agent.clone(), service(&agent)));
     cases.push(("$DBUS_SESSION_BUS_ADDRESS", bus.clone(), service(&bus)));
+    let wsl = t.path("elsewhere/7_interop");
+    cases.push(("$WSL_INTEROP", wsl.clone(), service(&wsl)));
     let envs = [
+        ("WSL_INTEROP", wsl.display().to_string()),
         ("SSH_AUTH_SOCK", agent.display().to_string()),
         (
             "DBUS_SESSION_BUS_ADDRESS",

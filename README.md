@@ -452,6 +452,7 @@ machine:
 | snapd | `/run/snapd.socket`, `/run/snapd-snap.socket`, `…/snapd-session-agent.socket` | installs and runs snaps, with network |
 | SSH and keyring agents | `$SSH_AUTH_SOCK`, `…/ssh-agent.socket`, `…/openssh_agent`, `…/gcr/ssh`, `…/keyring/*` | sign with your keys for anything the command can reach |
 | gpg-agent and dirmngr | `…/gnupg/S.*`, `~/.gnupg/S.*`, `$GNUPGHOME/S.*` | dirmngr fetches keys over the host's network (a `gpg --recv-keys` inside would go out) |
+| WSL interop | `/run/WSL/*_interop`, `$WSL_INTEROP` | starts Windows programs, which are not in the sandbox's network namespace |
 | more container runtimes | rootless Docker/Podman/containerd/BuildKit, Docker Desktop, Colima, Rancher Desktop, Lima, OrbStack, k3s, CRI-O, LXD, libvirt | start containers and VMs with a network |
 
 Nothing is printed for the ones you don't have. A connection to a hidden
@@ -729,7 +730,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails, `127`/`126` if the command isn't found/executable) |
 | Reach chosen services on the host's localhost (`--port`) | ✅ TCP, IPv4 + IPv6 |
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
-| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents |
+| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents, the WSL interop socket |
 | Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
 | Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); running code in, starting or attaching to existing containers that have a network is refused; not a boundary for hostile images |
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |
