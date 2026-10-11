@@ -328,7 +328,14 @@ is in the group, is not forwarded again. (nullroute tells the two apart with a
 small helper process of its own in the group; if that can't be started, signals
 are forwarded unconditionally. A command that moved to another group always gets
 the forwarded copy.) The signal is also never sent to the command's pid once it
-has exited and been reaped. A
+has exited and been reaped.
+nullroute never escalates on its own: a command that ignores SIGTERM (`trap '' TERM`)
+is sent it once, and nullroute then waits for as long as the command runs, as
+`timeout` does without `-k`, so a CI job can hang until its own limit.
+`--kill-after SECS` is the opt-in fix: SECS seconds after the first SIGTERM or
+SIGHUP reaches nullroute (the timer isn't restarted by later signals), a command
+that is still running gets SIGKILL. nullroute then cleans up as usual and exits
+with 137, the command's status. SIGINT and SIGQUIT are not escalated. A
 SIGINT/SIGQUIT that reaches nullroute before the command exists (Ctrl-C right
 after you hit enter) is passed on to it as well: it stops the command before it
 runs, instead of vanishing while the command runs on. The command never outlives
@@ -445,6 +452,7 @@ sandbox. So, also by default:
 | `--dry-run` | Print what would be hidden, masked, forwarded and allowed (hidden and sealed sockets, masked resolver sockets, the seccomp filter, forwarded ports, allowed hosts, the DNS resolver or sinkhole mapping, the namespaces), then exit. It validates the options and the listener / file-descriptor budget exactly as a real run does (a configuration that would fail with "too many listeners" fails here too, exit 125), but it does **not** start anything: it can't tell you that user namespaces are disabled, that a port is free, or that the command exists. |
 | `--check-sandbox` | With `--dry-run`: also check that this machine lets nullroute create the user, network and mount namespaces (a throw-away process does the real setup and exits; nothing is left behind). Exit 125 with the same message a real run would give if it can't. |
 | `--inspect` | Print the full sandbox topology to stderr before running (see above). |
+| `--kill-after SECS` | SIGKILL the command SECS seconds (1 to 86400) after a SIGTERM or SIGHUP reached nullroute, if it is still running. Without it a command that ignores SIGTERM keeps nullroute waiting. |
 
 ### The user's session: D-Bus, systemd, snapd, agents
 
@@ -463,6 +471,7 @@ machine:
 | snapd | `/run/snapd.socket`, `/run/snapd-snap.socket`, `…/snapd-session-agent.socket` | installs and runs snaps, with network |
 | SSH and keyring agents | `$SSH_AUTH_SOCK`, `…/ssh-agent.socket`, `…/openssh_agent`, `…/gcr/ssh`, `…/keyring/*` | sign with your keys for anything the command can reach |
 | gpg-agent and dirmngr | `…/gnupg/S.*`, `~/.gnupg/S.*`, `$GNUPGHOME/S.*` | dirmngr fetches keys over the host's network (a `gpg --recv-keys` inside would go out) |
+| WSL interop | `/run/WSL/*_interop`, `$WSL_INTEROP` | starts Windows programs, which are not in the sandbox's network namespace |
 | more container runtimes | rootless Docker/Podman/containerd/BuildKit, Docker Desktop, Colima, Rancher Desktop, Lima, OrbStack, k3s, CRI-O, LXD, libvirt | start containers and VMs with a network |
 
 Nothing is printed for the ones you don't have. A connection to a hidden
@@ -740,7 +749,7 @@ nullroute hasn't had a 1.0 release; options and output formats may still change
 | Exit code / signal passthrough | ✅ (`128+N` for signals, `125` if nullroute itself fails, `127`/`126` if the command isn't found/executable) |
 | Reach chosen services on the host's localhost (`--port`) | ✅ TCP, IPv4 + IPv6 |
 | Reach a Docker container by its container IP | ❌ (publish it on localhost and use `--port`) |
-| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents |
+| Hide Unix-socket escapes (`docker.sock` etc.) | ✅ on by default for container runtimes, the system and session D-Bus, the systemd user manager, snapd, SSH/GPG agents, the WSL interop socket |
 | Block out-of-band DNS via local resolvers | ✅ resolved varlink + nscd always masked; D-Bus hidden by default |
 | Sandbox containers the command starts (`--seal-docker`) | ✅ forced to `NetworkMode=none` (classic builds too; BuildKit, Swarm services and plugins refused); running code in, starting or attaching to existing containers that have a network is refused; not a boundary for hostile images |
 | Limit what the Docker daemon pulls for the command (`--seal-docker-pulls`) | ✅ `allowlisted` (registries in `--allow`) or `none`; except a classic build's missing `FROM` image |

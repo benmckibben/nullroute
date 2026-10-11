@@ -62,7 +62,7 @@ buggy. For example:
   (Docker, Podman, containerd, BuildKit, CRI-O, k3s, LXD, libvirt, Docker
   Desktop, Colima, Rancher Desktop, Lima, OrbStack), the system D-Bus, the
   session D-Bus, the systemd user manager, snapd, SSH and keyring agents
-  (`$SSH_AUTH_SOCK`), gpg-agent and dirmngr, and systemd-resolved and nscd (the
+  (`$SSH_AUTH_SOCK`), gpg-agent and dirmngr, the WSL interop socket, and systemd-resolved and nscd (the
   README lists the paths); a service that can be asked to act on the host's
   network from one of those is in scope, an unlisted one is a feature request;
 - getting past the seccomp filter or `no_new_privs`: creating an `AF_VSOCK`,

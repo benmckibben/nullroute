@@ -63,6 +63,14 @@ fn nullroute(argv: &[&str]) -> Command {
     c
 }
 
+/// Like [`nullroute`], with flags for `run` before the command.
+fn nullroute_with(flags: &[&str], argv: &[&str]) -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
+    c.arg("run").args(flags).arg("--").args(argv);
+    c.stdin(Stdio::null());
+    c
+}
+
 fn read_pid(path: &Path) -> Option<libc::pid_t> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -349,6 +357,104 @@ fn sigint_to_the_group_while_running_reaches_the_command_once() {
     unsafe { libc::kill(pid, libc::SIGTERM) };
     assert_eq!(wait_with_timeout(nr).code(), Some(42));
     assert_eq!(count(), 1, "the command saw a different number of SIGINTs");
+}
+
+/// A command that ignores SIGTERM and a background child of its own.
+fn stubborn_script(pidfile: &Path, childfile: &Path) -> String {
+    format!(
+        "trap '' TERM; echo $$ > {}; sleep 600 & echo $! > {}; wait; while :; do sleep 0.05; done",
+        pidfile.display(),
+        childfile.display()
+    )
+}
+
+#[test]
+fn a_command_that_ignores_sigterm_keeps_nullroute_waiting_without_kill_after() {
+    let mut cl = Cleanup::new("stubborn-default");
+    let (pidfile, childfile) = (cl.file("command.pid"), cl.file("child.pid"));
+    let script = stubborn_script(&pidfile, &childfile);
+    cl.nullroutes
+        .push(nullroute(&["sh", "-c", &script]).spawn().unwrap());
+    poll("the command to start", || read_pid(&pidfile));
+    let nr = &mut cl.nullroutes[0];
+    unsafe { libc::kill(nr.id() as libc::pid_t, libc::SIGTERM) };
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        nr.try_wait().unwrap().is_none(),
+        "nullroute gave up on a command that ignores SIGTERM without --kill-after"
+    );
+    assert!(is_alive(read_pid(&pidfile).unwrap()));
+    // Cleanup kills it.
+}
+
+#[test]
+fn kill_after_sigkills_a_command_that_ignores_sigterm() {
+    let mut cl = Cleanup::new("stubborn-kill-after");
+    let (pidfile, childfile) = (cl.file("command.pid"), cl.file("child.pid"));
+    let script = stubborn_script(&pidfile, &childfile);
+    cl.nullroutes.push(
+        nullroute_with(&["--kill-after", "1"], &["sh", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    let command = poll("the command to start", || read_pid(&pidfile));
+    let child = poll("its child to start", || read_pid(&childfile));
+    let nr = &mut cl.nullroutes[0];
+    let sent = Instant::now();
+    unsafe { libc::kill(nr.id() as libc::pid_t, libc::SIGTERM) };
+    let status = wait_with_timeout(nr);
+    let took = sent.elapsed();
+    assert_eq!(
+        status.signal().or(status.code().map(|c| c - 128)),
+        Some(libc::SIGKILL),
+        "exit status {status:?}"
+    );
+    assert!(
+        took >= Duration::from_millis(900),
+        "escalated before the delay: {took:?}"
+    );
+    assert!(!is_alive(command), "the command survived");
+    poll("the command's child to be killed", || {
+        (!is_alive(child)).then_some(())
+    });
+}
+
+#[test]
+fn kill_after_leaves_a_command_that_exits_in_time_alone() {
+    let mut cl = Cleanup::new("kill-after-polite");
+    let pidfile = cl.file("command.pid");
+    let script = format!(
+        "trap 'exit 42' TERM; echo $$ > {}; while :; do sleep 0.02; done",
+        pidfile.display()
+    );
+    cl.nullroutes.push(
+        nullroute_with(&["--kill-after", "5"], &["sh", "-c", &script])
+            .spawn()
+            .unwrap(),
+    );
+    poll("the command to start", || read_pid(&pidfile));
+    let nr = &mut cl.nullroutes[0];
+    let sent = Instant::now();
+    unsafe { libc::kill(nr.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(wait_with_timeout(nr).code(), Some(42));
+    assert!(
+        sent.elapsed() < Duration::from_secs(4),
+        "waited for the delay"
+    );
+}
+
+#[test]
+fn kill_after_rejects_zero_and_non_numbers() {
+    for bad in ["0", "-1", "soon", "1.5"] {
+        let o = nullroute_with(&["--kill-after", bad], &["true"])
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "--kill-after {bad}: {o:?}");
+        assert!(
+            String::from_utf8_lossy(&o.stderr).contains("error:"),
+            "--kill-after {bad}: {o:?}"
+        );
+    }
 }
 
 #[test]

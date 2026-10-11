@@ -78,8 +78,9 @@ enum Cmd {
         /// Also hide this Unix socket (repeatable), e.g. an X11 or Wayland
         /// display socket or a local proxy. Container-runtime sockets, the
         /// system and session D-Bus, the systemd user manager, snapd, SSH and
-        /// keyring agents ($SSH_AUTH_SOCK) and gpg-agent/dirmngr are hidden by
-        /// default (see --dry-run for the list on this machine).
+        /// keyring agents ($SSH_AUTH_SOCK), gpg-agent/dirmngr and the WSL
+        /// interop socket are hidden by default (see --dry-run for the list on
+        /// this machine).
         #[arg(long = "hide-socket", value_name = "PATH")]
         hide_sockets: Vec<std::path::PathBuf>,
 
@@ -199,6 +200,17 @@ enum Cmd {
         #[arg(long = "allow-new-privs")]
         allow_new_privs: bool,
 
+        /// Seconds to wait, after SIGTERM or SIGHUP reaches nullroute, for the
+        /// command to exit before it is sent SIGKILL.
+        ///
+        /// Without this nullroute forwards the signal once and then waits for as
+        /// long as the command runs, so a command that ignores SIGTERM keeps
+        /// nullroute (and a CI job) waiting. The timer starts at the first
+        /// SIGTERM or SIGHUP and is not restarted by later ones. Like
+        /// `timeout --kill-after`. Ctrl-C (SIGINT, SIGQUIT) is not escalated.
+        #[arg(long = "kill-after", value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..=86_400))]
+        kill_after: Option<u64>,
+
         /// Print what would be hidden, masked, forwarded and allowed, then exit.
         ///
         /// Lists the hidden and sealed sockets, the masked resolver sockets,
@@ -247,6 +259,7 @@ fn main() -> ExitCode {
             report_json,
             no_seccomp,
             allow_new_privs,
+            kill_after,
             dry_run,
             check_sandbox,
             inspect,
@@ -429,6 +442,7 @@ fn main() -> ExitCode {
                 strict,
                 report_json,
                 hardening,
+                kill_after: kill_after.map(std::time::Duration::from_secs),
             };
             run(
                 &argv,
@@ -535,6 +549,8 @@ struct RunOpts {
     /// Which of the seccomp filter and no_new_privs to apply (--no-seccomp,
     /// --allow-new-privs).
     hardening: seccomp::Hardening,
+    /// --kill-after.
+    kill_after: Option<std::time::Duration>,
 }
 
 #[cfg(target_os = "linux")]
@@ -547,8 +563,11 @@ fn run(
     report: &std::sync::Arc<report::Report>,
     opts: &RunOpts,
 ) -> ExitCode {
-    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, opts.hardening)
-    {
+    let options = sandbox::RunOptions {
+        hardening: opts.hardening,
+        kill_after: opts.kill_after,
+    };
+    let status = match sandbox::run_hermetic(argv, ports, hide, proxy, dns, report, options) {
         Ok(s) => s,
         Err(e) => {
             if sandbox::command_exit_code(&e).is_some() {

@@ -8,6 +8,11 @@
 //! - SIGTERM / SIGHUP sent to nullroute (a CI timeout, a closed terminal) are
 //!   forwarded to the command, which otherwise wouldn't see them, exactly once:
 //!   not when the command got the signal anyway (see "Group or pid" below).
+//!   nullroute never escalates on its own: a command that ignores the signal
+//!   keeps it waiting, as long as the command runs. `--kill-after SECS` is the
+//!   opt-in escalation: SECS seconds after the first SIGTERM / SIGHUP that
+//!   reaches nullroute, a command that is still running gets SIGKILL (once; see
+//!   [`Forwarder::arm_escalation`]).
 //!
 //! # How they are received
 //!
@@ -83,6 +88,7 @@ use std::ffi::CString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::process::Child;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -129,6 +135,11 @@ pub struct Forwarder {
     sentinel: Option<Sentinel>,
     /// `kill(2)`; replaceable so tests can watch what would be sent.
     send: fn(libc::pid_t, libc::c_int) -> libc::c_int,
+    /// `--kill-after`: how long after a SIGTERM / SIGHUP the command may keep
+    /// running before it is sent SIGKILL. None: never.
+    kill_after: Option<Duration>,
+    /// The escalation timer has been started (it is started once).
+    escalating: AtomicBool,
 }
 
 fn real_kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
@@ -142,11 +153,14 @@ impl Forwarder {
         pid: libc::pid_t,
         sentinel: Option<Sentinel>,
         send: fn(libc::pid_t, libc::c_int) -> libc::c_int,
+        kill_after: Option<Duration>,
     ) -> Arc<Forwarder> {
         Arc::new(Forwarder {
             target: Mutex::new(Some(pid)),
             sentinel,
             send,
+            kill_after,
+            escalating: AtomicBool::new(false),
         })
     }
 
@@ -168,6 +182,37 @@ impl Forwarder {
         (self.send)(pid, sig);
     }
 
+    /// SIGKILL the command, unless it has gone. Same lock as [`Forwarder::deliver`],
+    /// so it can't reach a pid that was already reaped.
+    fn kill_now(&self) {
+        let target = lock(&self.target);
+        if let Some(pid) = *target {
+            (self.send)(pid, libc::SIGKILL);
+        }
+    }
+
+    /// A SIGTERM / SIGHUP has reached nullroute: with `--kill-after`, start
+    /// the one timer that SIGKILLs the command if it is still running when it
+    /// ends. Later signals don't restart or shorten it. If the timer thread
+    /// can't be started the command is killed at once rather than left to
+    /// ignore the signal for ever.
+    fn arm_escalation(self: &Arc<Self>) {
+        let Some(after) = self.kill_after else { return };
+        if self.escalating.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let me = self.clone();
+        let started = std::thread::Builder::new()
+            .name("kill-after".into())
+            .spawn(move || {
+                std::thread::sleep(after);
+                me.kill_now();
+            });
+        if started.is_err() {
+            self.kill_now();
+        }
+    }
+
     /// Take the handled signals on a thread of their own, for the life of the
     /// process. The signals must be blocked in the calling thread (`Blocked`).
     fn start(self: &Arc<Self>) -> io::Result<()> {
@@ -178,7 +223,7 @@ impl Forwarder {
             .map(drop)
     }
 
-    fn run(&self) {
+    fn run(self: &Arc<Self>) {
         let set = handled_set();
         loop {
             // SAFETY: valid set; the siginfo is written by the kernel.
@@ -203,7 +248,7 @@ impl Forwarder {
     /// `timeout`), take what is pending as one batch (standard signals
     /// coalesce, so each is forwarded at most once), ask the sentinel which of
     /// them were group-directed, and forward the rest.
-    fn handle(&self, first: libc::c_int) {
+    fn handle(self: &Arc<Self>, first: libc::c_int) {
         std::thread::sleep(SETTLE);
         let set = handled_set();
         let none = libc::timespec {
@@ -223,6 +268,9 @@ impl Forwarder {
                 break;
             }
         }
+        // The command is being asked to stop (by the forward, or by the group's
+        // own copy): from here on it has `--kill-after` to do so.
+        self.arm_escalation();
         let group = self
             .sentinel
             .as_ref()
@@ -542,8 +590,14 @@ impl Blocked {
         self,
         child_pid: u32,
         sentinel: Option<SentinelHandle>,
+        kill_after: Option<Duration>,
     ) -> io::Result<Arc<Forwarder>> {
-        let fwd = Forwarder::new(child_pid as libc::pid_t, sentinel.map(|s| s.0), real_kill);
+        let fwd = Forwarder::new(
+            child_pid as libc::pid_t,
+            sentinel.map(|s| s.0),
+            real_kill,
+            kill_after,
+        );
         fwd.start()?;
         // The signal thread owns the signals now; don't unblock them.
         std::mem::forget(self);
@@ -766,7 +820,7 @@ mod tests {
 
     #[test]
     fn forwards_to_the_command_until_it_is_marked_gone() {
-        let fwd = Forwarder::new(1_000_001, None, record);
+        let fwd = Forwarder::new(1_000_001, None, record, None);
         fwd.deliver(libc::SIGTERM, false);
         assert_eq!(sent_to(1_000_001), 1);
         fwd.mark_gone();
@@ -786,7 +840,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         for round in 0..50 {
             let pid = 1_100_000 + round;
-            let fwd = Forwarder::new(pid, None, record);
+            let fwd = Forwarder::new(pid, None, record, None);
             let stop = AtomicBool::new(false);
             std::thread::scope(|s| {
                 for _ in 0..4 {
@@ -812,11 +866,77 @@ mod tests {
         }
     }
 
+    /// Every (pid, signal) sent through [`record_sig`].
+    static SIGS: Mutex<Vec<(libc::pid_t, libc::c_int)>> = Mutex::new(Vec::new());
+
+    fn record_sig(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
+        lock(&SIGS).push((pid, sig));
+        0
+    }
+
+    fn sigs_to(pid: libc::pid_t) -> Vec<libc::c_int> {
+        lock(&SIGS)
+            .iter()
+            .filter(|(p, _)| *p == pid)
+            .map(|(_, s)| *s)
+            .collect()
+    }
+
+    #[test]
+    fn escalation_kills_a_command_that_is_still_running_after_the_delay() {
+        let pid = 1_200_001;
+        let fwd = Forwarder::new(pid, None, record_sig, Some(Duration::from_millis(50)));
+        fwd.arm_escalation();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while sigs_to(pid).is_empty() {
+            assert!(std::time::Instant::now() < deadline, "no SIGKILL");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(sigs_to(pid), [libc::SIGKILL]);
+    }
+
+    #[test]
+    fn escalation_is_armed_once() {
+        let pid = 1_200_002;
+        let fwd = Forwarder::new(pid, None, record_sig, Some(Duration::from_millis(30)));
+        for _ in 0..5 {
+            fwd.arm_escalation();
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            sigs_to(pid),
+            [libc::SIGKILL],
+            "one SIGKILL, not one per signal"
+        );
+    }
+
+    #[test]
+    fn escalation_leaves_a_command_that_has_already_gone_alone() {
+        let pid = 1_200_003;
+        let fwd = Forwarder::new(pid, None, record_sig, Some(Duration::from_millis(100)));
+        fwd.arm_escalation();
+        fwd.mark_gone();
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            sigs_to(pid).is_empty(),
+            "SIGKILL went to a pid that was already reaped"
+        );
+    }
+
+    #[test]
+    fn without_a_delay_nothing_is_ever_escalated() {
+        let pid = 1_200_004;
+        let fwd = Forwarder::new(pid, None, record_sig, None);
+        fwd.arm_escalation();
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(sigs_to(pid).is_empty());
+    }
+
     #[test]
     fn wait_for_exit_clears_the_pid_before_reaping() {
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id() as libc::pid_t;
-        let fwd = Forwarder::new(pid, None, record);
+        let fwd = Forwarder::new(pid, None, record, None);
         let status = wait_for_exit(&mut child, &fwd).unwrap();
         assert!(status.success());
         fwd.deliver(libc::SIGTERM, false);

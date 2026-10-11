@@ -7,8 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The WSL interop socket (`/run/WSL/*_interop`, and wherever `$WSL_INTEROP`
+  points) is hidden by default, like the other sockets that start things outside
+  the sandbox. Interop starts Windows programs, which are not bound by the
+  sandbox's network namespace. A connection to it now gets the decoy and is
+  reported. Checked on a WSL2 host that has the socket (the decoy answers
+  `403` for `/run/WSL/2_interop` and the `1_interop` symlink to it); not
+  checked: that a Windows program started through it really has network access
+  (there is no Windows drive on that host).
+
 ### Added
 
+- `--kill-after SECS`: SIGKILL the command SECS seconds after the first SIGTERM
+  or SIGHUP that reaches nullroute, if it is still running. Without the flag
+  nothing changes: nullroute forwards the signal once and waits for as long as
+  the command runs, so a command that ignores SIGTERM keeps it (and a CI job)
+  waiting; this is now said in the README. SIGINT and SIGQUIT are not
+  escalated. Checked with a command that traps TERM and has a background child:
+  killed after the delay, the child cleaned up, exit status 137; a command that
+  exits within the delay is left alone.
 - A `warning: fd N is a socket inherited from the caller (...)` line on stderr,
   for each socket (up to five, then a count) that nullroute starts with open and
   not close-on-exec. Such a socket is inherited by the command and keeps working
