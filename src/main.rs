@@ -76,8 +76,9 @@ enum Cmd {
         /// Also hide this Unix socket (repeatable), e.g. an X11 or Wayland
         /// display socket or a local proxy. Container-runtime sockets, the
         /// system and session D-Bus, the systemd user manager, snapd, SSH and
-        /// keyring agents ($SSH_AUTH_SOCK) and gpg-agent/dirmngr are hidden by
-        /// default (see --dry-run for the list on this machine).
+        /// keyring agents ($SSH_AUTH_SOCK), gpg-agent/dirmngr and the WSL
+        /// interop socket are hidden by default (see --dry-run for the list on
+        /// this machine).
         #[arg(long = "hide-socket", value_name = "PATH")]
         hide_sockets: Vec<std::path::PathBuf>,
 

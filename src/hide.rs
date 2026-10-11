@@ -19,8 +19,9 @@
 //!
 //! By default these are hidden (the ones that exist; see [`SocketEnv::default_sockets`]):
 //! container runtimes, the system D-Bus, the user's session D-Bus and systemd
-//! user manager, snapd, SSH/keyring agents (`$SSH_AUTH_SOCK`) and gpg-agent /
-//! dirmngr. `--hide-socket` adds more and `--allow-socket` keeps one visible.
+//! user manager, snapd, SSH/keyring agents (`$SSH_AUTH_SOCK`), gpg-agent /
+//! dirmngr and, under WSL, the interop socket. `--hide-socket` adds more and
+//! `--allow-socket` keeps one visible.
 //!
 //! Each of these is a service that lives outside the network namespace and
 //! will do things on the command's behalf. The system bus reaches
@@ -74,6 +75,8 @@ pub struct SocketEnv {
     pub ssh_auth_sock: Option<PathBuf>,
     /// `$DOCKER_HOST`.
     pub docker_host: Option<String>,
+    /// `$WSL_INTEROP`.
+    pub wsl_interop: Option<PathBuf>,
 }
 
 impl SocketEnv {
@@ -89,6 +92,7 @@ impl SocketEnv {
             dbus_system: var("DBUS_SYSTEM_BUS_ADDRESS").and_then(|v| v.into_string().ok()),
             ssh_auth_sock: var("SSH_AUTH_SOCK").map(PathBuf::from),
             docker_host: var("DOCKER_HOST").and_then(|v| v.into_string().ok()),
+            wsl_interop: var("WSL_INTEROP").map(PathBuf::from),
         }
     }
 
@@ -237,6 +241,17 @@ impl SocketEnv {
         add(snapd, SNAPD_REASON);
         add(agents, AGENT_REASON);
         add(gpg, GPG_REASON);
+        add(self.wsl_interop_sockets(Path::new("/run/WSL")), WSL_REASON);
+        v
+    }
+
+    /// The WSL interop sockets: `<dir>/<N>_interop` (`/run/WSL`; some are
+    /// symlinks to one another) and wherever `$WSL_INTEROP` points. A process
+    /// that can reach one can have WSL start a Windows program, which is not in
+    /// the sandbox's network namespace.
+    fn wsl_interop_sockets(&self, dir: &Path) -> Vec<PathBuf> {
+        let mut v = expand(&dir.join("*_interop"));
+        v.extend(self.wsl_interop.iter().cloned());
         v
     }
 
@@ -364,6 +379,8 @@ const AGENT_REASON: &str =
     "an SSH or keyring agent signs with your keys for anything the command can reach";
 const GPG_REASON: &str =
     "gpg-agent holds your keys and dirmngr looks keys up on the host's network";
+const WSL_REASON: &str =
+    "WSL interop starts Windows programs, which are not bound by the sandbox's network namespace";
 const EXPLICIT_REASON: &str = "hidden with --hide-socket";
 
 /// What to hide. [`Plan::prepare`] makes the decoys listen, in a private temp
@@ -737,6 +754,40 @@ mod tests {
             .unwrap()
             .map(|p| p.blocked_targets().map(Path::to_path_buf).collect())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn wsl_interop_sockets_are_found_by_directory_and_by_variable() {
+        let mut s = Session::new("wsl");
+        let run = s.root.join("run-wsl");
+        let a = s.sock(&run.join("2_interop"));
+        // WSL keeps a symlink per session pointing at the real socket.
+        std::os::unix::fs::symlink(&a, run.join("1_interop")).unwrap();
+        let named = s.sock(&s.root.join("elsewhere/wsl.sock"));
+        s.env.wsl_interop = Some(named.clone());
+        let got = s.env.wsl_interop_sockets(&run);
+        for want in [run.join("2_interop"), run.join("1_interop"), named] {
+            assert!(got.contains(&want), "{want:?} missing from {got:?}");
+        }
+        // Without the directory or the variable there is nothing to hide.
+        let none = SocketEnv::default().wsl_interop_sockets(&s.root.join("no-such-dir"));
+        assert!(none.is_empty(), "{none:?}");
+    }
+
+    #[test]
+    fn a_socket_named_by_wsl_interop_is_hidden_by_default() {
+        let mut s = Session::new("wslvar");
+        let sock = s.sock(&s.root.join("elsewhere/9_interop"));
+        s.env.wsl_interop = Some(sock.clone());
+        let got = blocked(&s.env);
+        assert!(got.contains(&sock), "{sock:?} not hidden; hidden: {got:?}");
+        assert!(
+            s.env
+                .default_sockets()
+                .iter()
+                .any(|(p, why)| p == &sock && *why == WSL_REASON),
+            "{sock:?} is not on the default list with the WSL reason"
+        );
     }
 
     #[test]

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The WSL interop socket (`/run/WSL/*_interop`, and wherever `$WSL_INTEROP`
+  points) is hidden by default, like the other sockets that start things outside
+  the sandbox. Interop starts Windows programs, which are not bound by the
+  sandbox's network namespace. A connection to it now gets the decoy and is
+  reported. Checked on a WSL2 host that has the socket (the decoy answers
+  `403` for `/run/WSL/2_interop` and the `1_interop` symlink to it); not
+  checked: that a Windows program started through it really has network access
+  (there is no Windows drive on that host).
+
 ### Added
 
 - `--kill-after SECS`: SIGKILL the command SECS seconds after the first SIGTERM
