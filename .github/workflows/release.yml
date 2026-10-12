@@ -171,6 +171,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: package
+          # Cache the registry only. The cache's cleanup of target/ walks
+          # target/package/<crate>-<version>/ (the unpacked crate) and fails
+          # with ENOENT errors there; this job gains little from a cached target/.
+          cache-targets: false
       - name: cargo package --locked (build and verify the .crate locally)
         run: cargo package --locked
       - name: Check the package contents
@@ -181,9 +185,10 @@ jobs:
           cat files.txt
           echo "::endgroup::"
 
-          # Allow-list: the manifest, lockfile, docs, licences, sources and tests.
+          # Allow-list: the manifest, lockfile, docs, licences, sources and tests (and
+          # the golden JSON files the report tests include).
           # Anything else (agent/editor files, CI config, notes, keys, ...) fails.
-          allowed='^(Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|\.cargo_vcs_info\.json|README\.md|CHANGELOG\.md|LICENSE-MIT|LICENSE-APACHE|src/[A-Za-z0-9_/]+\.rs|tests/[A-Za-z0-9_/]+\.rs)$'
+          allowed='^(Cargo\.toml|Cargo\.toml\.orig|Cargo\.lock|\.cargo_vcs_info\.json|README\.md|CHANGELOG\.md|LICENSE-MIT|LICENSE-APACHE|src/[A-Za-z0-9_/]+\.rs|tests/[A-Za-z0-9_/]+\.rs|tests/golden/[A-Za-z0-9_-]+\.json)$'
           unexpected=$(grep -Ev "$allowed" files.txt || true)
           if [ -n "$unexpected" ]; then
             echo "::error::unexpected files in the package:"
