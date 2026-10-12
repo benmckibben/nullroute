@@ -171,10 +171,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: package
-          # Cache the registry only. The cache's cleanup of target/ walks
-          # target/package/<crate>-<version>/ (the unpacked crate) and fails
-          # with ENOENT errors there; this job gains little from a cached target/.
-          cache-targets: false
       - name: cargo package --locked (build and verify the .crate locally)
         run: cargo package --locked
       - name: Check the package contents
@@ -217,6 +213,16 @@ jobs:
             exit 1
           fi
           echo "package contents OK: $(wc -l < files.txt) files, no unexpected paths or credential-looking strings"
+
+      # The cache action's post step treats any directory named "tests" under
+      # target/ as a trybuild workspace and tries to open tests/target and
+      # tests/trybuild in it, which don't exist in the unpacked crate that
+      # cargo package leaves in target/package/. It then logs four ENOENT
+      # errors although the job passes. Nothing needs target/package after the
+      # contents check, so remove it before the cache's post step runs.
+      - name: Remove the unpacked package (the cache cleanup trips over its tests/ directory)
+        if: always()
+        run: rm -rf target/package
 
   build:
     name: build (${{ matrix.target }})
