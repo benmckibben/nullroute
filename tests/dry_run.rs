@@ -10,7 +10,9 @@ fn nullroute(args: &[&str]) -> Output {
     // leak into nullroute's stderr as "inherited from the caller" warnings.
     unsafe {
         c.pre_exec(|| {
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }

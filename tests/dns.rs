@@ -66,7 +66,9 @@ fn nullroute_clean_fds(args: &[&str]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
     unsafe {
         c.pre_exec(|| {
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
