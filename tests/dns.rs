@@ -12,6 +12,8 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
 use std::thread;
 
+mod common;
+
 fn local_ip() -> Option<IpAddr> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").ok()?;
@@ -65,12 +67,7 @@ fn nullroute(args: &[&str]) -> Output {
 fn nullroute_clean_fds(args: &[&str]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
     unsafe {
-        c.pre_exec(|| {
-            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        c.pre_exec(|| common::close_inherited_fds());
     }
     c.arg("run")
         .args(args)

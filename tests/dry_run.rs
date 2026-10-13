@@ -4,17 +4,14 @@
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
+mod common;
+
 fn nullroute(args: &[&str]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
     // Close inherited fds above 2 so the harness's own sockets don't
     // leak into nullroute's stderr as "inherited from the caller" warnings.
     unsafe {
-        c.pre_exec(|| {
-            if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        c.pre_exec(|| common::close_inherited_fds());
     }
     c.arg("run")
         .args(args)
