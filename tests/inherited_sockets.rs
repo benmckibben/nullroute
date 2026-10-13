@@ -4,6 +4,8 @@
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
 
+mod common;
+
 fn nullroute(prepare: impl FnMut() -> std::io::Result<()> + Send + Sync + 'static) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
     // The harness may hold descriptors of its own; start from none above fd 2
@@ -11,7 +13,7 @@ fn nullroute(prepare: impl FnMut() -> std::io::Result<()> + Send + Sync + 'stati
     let mut prepare = prepare;
     unsafe {
         c.pre_exec(move || {
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            common::close_inherited_fds()?;
             prepare()
         });
     }
@@ -108,7 +110,7 @@ fn dry_run_does_not_warn_because_nothing_is_run() {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
     unsafe {
         c.pre_exec(|| {
-            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            common::close_inherited_fds()?;
             let mut fds = [0; 2];
             libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr());
             libc::dup2(fds[0], 9);
