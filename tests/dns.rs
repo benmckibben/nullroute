@@ -62,7 +62,7 @@ fn nullroute(args: &[&str]) -> Output {
         .expect("failed to launch nullroute")
 }
 
-/// Like `nullroute` but closes every fd above 2 before exec.
+/// Like `nullroute` but marks every fd above 2 close-on-exec before exec.
 /// Use when the test asserts empty stderr and the runner may leak fds.
 fn nullroute_clean_fds(args: &[&str]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));

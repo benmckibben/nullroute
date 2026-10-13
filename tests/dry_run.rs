@@ -8,8 +8,8 @@ mod common;
 
 fn nullroute(args: &[&str]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
-    // Close inherited fds above 2 so the harness's own sockets don't
-    // leak into nullroute's stderr as "inherited from the caller" warnings.
+    // Mark inherited fds above 2 close-on-exec so the harness's own sockets
+    // don't leak into nullroute's stderr as "inherited from the caller" warnings.
     unsafe {
         c.pre_exec(|| common::close_inherited_fds());
     }
@@ -101,6 +101,18 @@ fn check_sandbox_probes_namespaces_and_leaves_nothing_behind() {
     // It only makes sense together with --dry-run.
     let o = nullroute(&["--check-sandbox", "--", "true"]);
     assert_eq!(o.status.code(), Some(2), "{o:?}");
+}
+
+#[test]
+fn a_failed_exec_is_still_an_io_error() {
+    // An immediate close_range would close std's exec-error pipe, and a
+    // missing binary would abort the child instead of returning ENOENT.
+    let mut c = Command::new("/definitely/not/a/nullroute-binary");
+    unsafe {
+        c.pre_exec(|| common::close_inherited_fds());
+    }
+    let err = c.output().expect_err("exec of a missing binary must fail");
+    assert_eq!(err.raw_os_error(), Some(libc::ENOENT), "{err}");
 }
 
 #[test]
