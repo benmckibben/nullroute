@@ -332,7 +332,13 @@ fn oversized_request_heads_get_431() {
         r#"
 import socket
 c = socket.socket(socket.AF_UNIX); c.settimeout(10); c.connect(SOCK)
-c.sendall(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n" + (b"X-Fill: " + b"a" * 1000 + b"\r\n") * 40 + b"\r\n")
+# The daemon may close the connection before sendall finishes sending all
+# the oversized headers. Catch the error and read whatever response has
+# already arrived.
+try:
+    c.sendall(b"GET /_ping HTTP/1.1\r\nHost: docker\r\n" + (b"X-Fill: " + b"a" * 1000 + b"\r\n") * 40 + b"\r\n")
+except (BrokenPipeError, ConnectionResetError):
+    pass
 buf = b""
 while b"\r\n" not in buf:
     chunk = c.recv(4096)
