@@ -1,11 +1,20 @@
 //! --dry-run must not say "fine" for a configuration the real run rejects, and
 //! setup failures must not be reported as the command failing to run.
 
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
 
 fn nullroute(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_nullroute"))
-        .arg("run")
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
+    // Close inherited fds above 2 so the harness's own sockets don't
+    // leak into nullroute's stderr as "inherited from the caller" warnings.
+    unsafe {
+        c.pre_exec(|| {
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            Ok(())
+        });
+    }
+    c.arg("run")
         .args(args)
         .stdin(Stdio::null())
         .output()

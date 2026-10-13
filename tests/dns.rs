@@ -8,6 +8,7 @@
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, UdpSocket};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Output};
 use std::thread;
 
@@ -54,6 +55,22 @@ fn closed_port(ip: IpAddr) -> u16 {
 fn nullroute(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_nullroute"))
         .arg("run")
+        .args(args)
+        .output()
+        .expect("failed to launch nullroute")
+}
+
+/// Like `nullroute` but closes every fd above 2 before exec.
+/// Use when the test asserts empty stderr and the runner may leak fds.
+fn nullroute_clean_fds(args: &[&str]) -> Output {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_nullroute"));
+    unsafe {
+        c.pre_exec(|| {
+            libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 0u32);
+            Ok(())
+        });
+    }
+    c.arg("run")
         .args(args)
         .output()
         .expect("failed to launch nullroute")
@@ -524,7 +541,7 @@ fn bare_strict_run_catches_a_swallowed_dns_lookup() {
 
 #[test]
 fn bare_run_without_lookups_is_clean_under_strict() {
-    let o = nullroute(&["--strict", "--", "true"]);
+    let o = nullroute_clean_fds(&["--strict", "--", "true"]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert_eq!(err(&o), "", "nothing to report: {o:?}");
 }
@@ -561,9 +578,9 @@ fn bare_run_resolv_conf_points_at_the_resolver_and_the_host_is_untouched() {
 fn port_53_still_bridges_in_a_bare_run() {
     // Without --allow names there is nothing for the sinkhole to say, so
     // bridging port 53 keeps working (the resolver steps aside).
-    let o = nullroute(&["--port", "53", "--dry-run", "--", "true"]);
+    let o = nullroute_clean_fds(&["--port", "53", "--dry-run", "--", "true"]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
-    let o = nullroute(&["--port", "53", "--", "true"]);
+    let o = nullroute_clean_fds(&["--port", "53", "--", "true"]);
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert_eq!(err(&o), "", "{o:?}");
 }
